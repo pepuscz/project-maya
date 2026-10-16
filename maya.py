@@ -81,6 +81,7 @@ VSTAMP = VBUILD / "MAYA-BUILD.json"
 MIN_CC = 60                                        # Pascal and newer (the GLM path; see arch_setting) ...
 VALIDATED_CC = 70                                  # ... Volta (V100) and newer validated, Pascal experimental (#212)
 MAX_GPUS = 16                                      # the layer split's parts at most (glm_model.hpp, kMaxParts)
+MAX_HELPERS = 3   # expert helpers beside the trunk GPU (GlmHelperSet::kMax in the engine)
 HIP_ARCHS = ("gfx1100", "gfx1201", "gfx1151")        # Maya also supports Strix Halo (unified memory)
 HIP_ARCHS_UNVALIDATED = ("gfx1030",)               # RDNA 2 (RX 6800 / 6900, Radeon PRO V620 / W6800), experimental: not
                                                    # validated on a card; no matrix cores, the portable kernels; compiled
@@ -664,13 +665,17 @@ def check_hip_pc(a, installed=False) -> dict:
             want = [int(x) for x in str(a.gpus).split(",") if x.strip()]
         except ValueError:
             fail(f"--gpus takes two GPU numbers as --check shows them, e.g. --gpus 0,1, not {a.gpus!r}")
-        if len(want) != 2 or want[0] == want[1]:
+        if a.expert_helper:
+            if not 2 <= len(want) <= 1 + MAX_HELPERS or len(set(want)) != len(want):
+                fail(f"--expert-helper takes the trunk GPU and one to {MAX_HELPERS} helpers: --gpus 0,1 or --gpus 0,1,2")
+        elif len(want) != 2 or want[0] == want[1]:
             fail("Maya's HIP port runs on one GPU or splits the model across two: --gpu 0, or --gpus 0,1")
         picked = [next((g for g in usable if g["index"] == i), None) for i in want]
         for i, g in zip(want, picked):
             if g is None:
                 fail(f"GPU {i} is not a supported AMD card")
-        # A mixed pair puts the discrete GPU first and the unified-memory APU last.
+        # A mixed pair puts the discrete GPU first and the unified-memory APU last (with --expert-helper: the largest
+        # discrete card keeps the trunk, the other discrete cards are the first helpers, the APU the last).
         chosen = sorted(picked, key=lambda g: (hip_unified_memory(g), -g["vram_gb"]))
     else:
         one = next((g for g in usable if g["index"] == a.gpu), None) if a.gpu is not None else max(
@@ -1939,8 +1944,8 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
         # the available prompt-memory budget; forcing 256 here severely slows HIP.
         hip_env = {"STRATA_GLM_RESERVE_MB": "3072", "STRATA_GLM_RAM_HEADROOM_GB": "16"}
         gpus = pc["gpus"]
-        if len(gpus) == 1:
-            hip_env["STRATA_GLM_SPLIT"] = "0"   # two cards: the engine picks the split (and drafts with MTP)
+        if len(gpus) == 1 or a.expert_helper:
+            hip_env["STRATA_GLM_SPLIT"] = "0"   # two cards without --expert-helper: the engine picks the split
         # Larger prompt sub-batches feed the matrix cores much better (7900 XT: ~250 -> ~410 tok/s); they need
         # a bigger prompt budget, borrowed from the expert pool only while a prompt runs.
         if any(hip_unified_memory(g) for g in gpus):
@@ -1963,6 +1968,12 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
         if tables:
             hip_env["STRATA_HIPBLASLT_TUNING"] = ":".join(tables)
         env = {**hip_env, **env}
+    if a.expert_helper and len(cfg["gpu"]) > 1:
+        # the first GPU keeps the trunk, attention, KV and MTP; every other one owns a complementary expert cache
+        # (docs/AMD_MAYA.md, "Experimental expert helper"); no layer split
+        env = {"STRATA_GLM_SPLIT": "0", "STRATA_GLM_EXPERT_HELPER": ",".join(str(i) for i in range(1, len(cfg["gpu"]))),
+               **env}
+        cfg["layer_split"] = "0"
     if env:
         cfg["env"] = env
     if a.host:
@@ -2426,6 +2437,8 @@ def after_server(rc: int, a) -> int:
                     ("--gpu", a.gpu), ("--gpus", a.gpus), ("--config", getattr(a, "config", None))):
         if v is not None:
             again += [flag, str(v)]
+    if getattr(a, "expert_helper", False):
+        again.append("--expert-helper")
     say()
     say("  Updated from the dashboard: starting the new version ...")
     sys.stdout.flush()
@@ -2856,6 +2869,10 @@ def main() -> int:
     ap.add_argument("--gpu", type=int, help="run on this one GPU (CUDA: nvidia-smi; HIP: KFD topology order, on Windows hipInfo's)")
     ap.add_argument("--gpus", help=f"split the model's layers across these GPUs (up to {MAX_GPUS}), e.g. 0,1 or "
                                    "0,1,2,3")
+    ap.add_argument("--expert-helper", action="store_true",
+                    help=f"with --gpus: the first GPU keeps the trunk, attention, context and MTP, every other one "
+                         f"(up to {MAX_HELPERS}, a unified-memory APU among them) owns a complementary expert cache "
+                         "instead of a layer split (STRATA_GLM_EXPERT_HELPER; docs/AMD_MAYA.md)")
     ap.add_argument("--context", type=int, help=f"context length in tokens (default {DEFAULT_CONTEXT})")
     ap.add_argument("--parallel", type=int, choices=range(1, 9), metavar="N",
                     help="answer up to N requests at once (1-8, default 1), kept in the config: on one GPU they are "

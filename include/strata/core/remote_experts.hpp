@@ -7,6 +7,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -27,8 +28,11 @@ public:
     bool insert(int key, const uint8_t* host, size_t bytes, size_t stride, std::string& err);
     bool replace(int out, int in, const uint8_t* host, std::string& err);
     struct Swap { uint32_t gain; int in, out; };
+    /// `foreign`: an owner map (0 = free, else a helper number) whose entries other than `self` are neither
+    /// candidates nor victims, so helpers sharing one model never trade each other's experts.
     std::vector<Swap> swaps(const std::vector<uint32_t>& usage, const std::vector<int>& primary,
-                            int experts_per_layer, int max_swaps) const;
+                            int experts_per_layer, int max_swaps,
+                            const std::vector<uint8_t>* foreign = nullptr, uint8_t self = 0) const;
     const std::vector<uint8_t>& owners() const { return owned_; }
     bool owns(int key) const { return !owned_.empty() && owned_[(size_t) key] != 0; }
     bool integrated() const { return integrated_; }
@@ -37,6 +41,12 @@ public:
     bool compute(int gu_type, int d_type, size_t down_off, float limit, int ne,
                  const int* keys, const float* weights, const float* x,
                  float* out, std::string& err);
+    /// Several helpers at once: launch() enqueues a route's experts on this helper's stream and returns at once;
+    /// finish() waits and leaves the weighted sum in result() (pinned host memory, n_embd floats).
+    bool launch(int gu_type, int d_type, size_t down_off, float limit, int ne,
+                const int* keys, const float* weights, const float* x, std::string& err);
+    bool finish(std::string& err);
+    const float* result() const { return res_h_; }
     void close();
     int device() const { return device_; }
 
@@ -53,8 +63,41 @@ private:
     cudaStream_t stream_ = nullptr;
     uint8_t* arena_ = nullptr;
     float *x_ = nullptr, *out_ = nullptr;
+    float* res_h_ = nullptr;     // pinned: finish() leaves the route's weighted sum here
+    uint8_t* stage_h_ = nullptr; // pinned: a launch's expert pointers and weights (the copies are asynchronous)
     void *xq_ = nullptr, *hq_ = nullptr;
     strata::kernels::glmf::MoeDev plan_;
+};
+
+/// Up to kMax GLM expert helpers sharing one model: disjoint ownership, one merged owner map (0 = unowned, else
+/// the helper's number from 1) that the primary uploads as its admission exclusion mask, and routes that run on
+/// every helper at once (launch each, then finish each).
+class GlmHelperSet {
+public:
+    static constexpr int kMax = 3;
+    GlmHelperSet() = default;
+    ~GlmHelperSet() { close(); }
+    GlmHelperSet(const GlmHelperSet&) = delete;
+    GlmHelperSet& operator=(const GlmHelperSet&) = delete;
+    bool open(const std::vector<int>& devices, int n_embd, int n_ff,
+              const std::vector<std::pair<void*, size_t>>& regions, std::string& err);
+    void reserve_keys(int keys) { owner_.assign((size_t) keys, 0); }
+    int count() const { return count_; }
+    int device() const { return count_ > 0 ? h_[0]->device() : -1; }   // -1: no helper
+    int device(int i) const { return i >= 0 && i < count_ ? h_[(size_t) i]->device() : -1; }
+    GlmExpertHelper& at(int i) { return *h_[(size_t) i]; }
+    const GlmExpertHelper& at(int i) const { return *h_[(size_t) i]; }
+    int owner(int key) const { return owner_.empty() ? 0 : owner_[(size_t) key]; }   // 0 none, else 1..count
+    bool owns(int key) const { return owner(key) != 0; }
+    const std::vector<uint8_t>& owners() const { return owner_; }
+    bool insert(int i, int key, const uint8_t* host, size_t bytes, size_t stride, std::string& err);
+    bool replace(int i, int out, int in, const uint8_t* host, std::string& err);
+    void close();
+
+private:
+    std::unique_ptr<GlmExpertHelper> h_[kMax];
+    int count_ = 0;
+    std::vector<uint8_t> owner_;
 };
 
 /// A static, profile-filled expert tier on another CUDA device. CUDA0 keeps all

@@ -1734,15 +1734,6 @@ bool Glm5Model::load_pack_place(const std::string& pack_dir, int64_t max_ctx, st
     // two-part split (default 1), STRATA_GLM_DEVS the devices of any split.
     const char* sp = getenv("STRATA_GLM_SPLIT");
     const std::string spec = sp != nullptr ? std::string(sp) : layer_split;
-    if (const char* h = getenv("STRATA_GLM_EXPERT_HELPER"); h != nullptr && h[0] != '\0') {
-        if ((!spec.empty() && spec != "0") || std::strspn(h, "0123456789") != std::strlen(h)) {
-            err = "GLM expert helper: give a helper device index, without a layer split";
-            return false;
-        }
-        double free_gib = 0;
-        if (!RemoteExperts::preflight(std::atoi(h), free_gib, err)) return false;
-        return load_pack(pack_dir, max_ctx, err);   // dense/state/MTP stay on device 0
-    }
     const auto ints = [](const std::string& s, std::vector<int>& out) {
         out.clear();
         std::stringstream ss(s);
@@ -1752,6 +1743,20 @@ bool Glm5Model::load_pack_place(const std::string& pack_dir, int64_t max_ctx, st
             else out.push_back(std::atoi(t.c_str()));
         return !out.empty();
     };
+    if (const char* h = getenv("STRATA_GLM_EXPERT_HELPER"); h != nullptr && h[0] != '\0') {
+        // =<dev>[,<dev>[,<dev>]]: one to three helper GPUs, each with its own complementary expert cache
+        std::vector<int> helpers;
+        if ((!spec.empty() && spec != "0") || !ints(h, helpers) || (int) helpers.size() > GlmHelperSet::kMax) {
+            err = "GLM expert helper: give one to " + std::to_string(GlmHelperSet::kMax) +
+                  " helper device indices (1 or 1,2), without a layer split";
+            return false;
+        }
+        for (int d : helpers) {
+            double free_gib = 0;
+            if (!RemoteExperts::preflight(d, free_gib, err)) return false;
+        }
+        return load_pack(pack_dir, max_ctx, err);   // dense/state/MTP stay on device 0
+    }
     if (spec == "0" || (sp != nullptr && spec != "auto" && spec.find(',') == std::string::npos && std::atoi(sp) == 0))
         return load_pack(pack_dir, max_ctx, err);
     int n_dev = 0;

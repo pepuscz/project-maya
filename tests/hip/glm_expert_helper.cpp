@@ -124,6 +124,27 @@ int main() {
         if (!helper.open(helper_device, E, FF, {{host, K * blob_bytes}}, err)) {
             std::fprintf(stderr, "%s\n", err.c_str()); return 1;
         }
+        // The set: the same experts, each owned by one of every helper GPU this host has (one here, up to three on
+        // a bigger one); a route launched on all of them at once must sum to the primary's single kernel run.
+        std::vector<int> set_devices;
+        for (int d = 1; d < std::min(devices, 1 + strata::core::GlmHelperSet::kMax); ++d) set_devices.push_back(d);
+        strata::core::GlmHelperSet set;
+        if (!set.open(set_devices, E, FF, {{host, K * blob_bytes}}, err)) {
+            std::fprintf(stderr, "%s\n", err.c_str()); return 1;
+        }
+        set.reserve_keys(32);
+        for (int h = 0; h < set.count(); ++h) if (!set.at(h).reserve(32, K * blob_bytes, err)) return 23;
+        for (int e = 0; e < K; ++e)
+            if (!set.insert(e % set.count(), e, host + size_t(e) * blob_bytes, blob_bytes, blob_bytes, err)) return 24;
+        if (set.insert(0, 0, host, blob_bytes, blob_bytes, err) || set.owner(0) != 1 || !set.owns(7) ||
+            set.owner(1) != 1 + 1 % set.count() || set.owns(8)) return 25;   // one owner per expert
+        if (set.count() > 1) {   // another helper's expert is neither a candidate nor a victim
+            std::vector<uint32_t> hot(32, 0);
+            hot[1] = 100;   // helper 2's, and hotter than everything helper 1 owns
+            std::vector<int> none(32, -1);
+            if (!set.at(0).swaps(hot, none, 16, 8, &set.owners(), 1).empty()) return 26;
+            if (set.at(0).swaps(hot, none, 16, 8).empty()) return 26;   // (without the map it would be taken)
+        }
         // Seven residents plus an unowned candidate. No duplicate admission;
         // bytes, not expert count, cap the cache on a discrete helper.
         if (!helper.reserve(32, (K - 1) * blob_bytes, err)) return 8;
@@ -197,6 +218,38 @@ int main() {
             if (max_abs > 1e-4 || rel > 1e-6) return 5;
             CHECK(hipGetDevice(&current));
             if (current != 0) return 6;
+            // the set: the route split by ownership, every helper launched before any is waited for
+            std::vector<float> sum(E, 0.0f);
+            int launched[strata::core::GlmHelperSet::kMax] = {};
+            for (int h = 0; h < set.count(); ++h) {
+                int kn = 0, keys_h[K];
+                float w_h[K];
+                for (int j = 0; j < ne; ++j)
+                    if (set.owner(keys[j]) == h + 1) { keys_h[kn] = keys[j]; w_h[kn++] = weights[j]; }
+                if (kn == 0) continue;
+                if (!set.at(h).launch(gu_type, d_type, gu_bytes, 8.0f, kn, keys_h, w_h, x.data(), err)) {
+                    std::fprintf(stderr, "%s\n", err.c_str()); return 27;
+                }
+                launched[h] = kn;
+            }
+            for (int h = 0; h < set.count(); ++h) {
+                if (!launched[h]) continue;
+                if (!set.at(h).finish(err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 28; }
+                for (int i = 0; i < E; ++i) sum[(size_t) i] += set.at(h).result()[i];
+            }
+            double set_diff2 = 0, set_max = 0;
+            for (int i = 0; i < E; ++i) {
+                if (!std::isfinite(sum[(size_t) i])) return 29;
+                const double diff = double(sum[(size_t) i]) - reference[i];
+                set_diff2 += diff * diff;
+                set_max = std::max(set_max, std::abs(diff));
+            }
+            const double set_rel = std::sqrt(set_diff2 / std::max(ref2, 1e-30));
+            std::printf("GLM helper set of %d: types %d/%d, experts %d, max_abs %.3g rel_L2 %.3g\n",
+                        set.count(), gu_type, d_type, ne, set_max, set_rel);
+            if (set_max > 1e-4 || set_rel > 1e-6) return 29;
+            CHECK(hipGetDevice(&current));
+            if (current != 0) return 6;
         }
         // An unpinned staging source models a disk read: now replace the bytes
         // in the helper's slot and compare against expert 1 on the primary.
@@ -214,9 +267,18 @@ int main() {
         const int evicted = 7;
         if (helper.compute(gu_type, d_type, gu_bytes, 8.0f, 1, &evicted, weights, x.data(), actual.data(), err)) return 7;
         helper.close();
+        // the set's replacement: helper 1 gives expert 0 up for a disk-read candidate (key 9); the map follows
+        if (!set.replace(0, 0, 9, staging.data(), err) || set.owner(0) != 0 || set.owner(9) != 1) return 30;
+        if (set.count() > 1 && set.replace(0, 1, 10, staging.data(), err)) return 30;   // not helper 1's to give up
+        const int nine = 9;
+        if (!set.at(0).compute(gu_type, d_type, gu_bytes, 8.0f, 1, &nine, weights, x.data(), actual.data(), err)) return 31;
+        for (int i = 0; i < E; ++i)
+            if (!std::isfinite(actual[i]) || std::fabs(actual[i] - reference[i]) > 1e-4f) return 32;
+        set.close();
+        if (set.count() != 0 || set.device() != -1 || set.owns(9)) return 33;
         CHECK(hipFree(plan.cpu_flag)); CHECK(hipFree(plan.plan_w)); CHECK(hipFree(plan.plan_ptr));
         CHECK(hipFree(dhq)); CHECK(hipFree(dxq)); CHECK(hipFree(dout)); CHECK(hipFree(dx)); CHECK(hipFree(dev_blobs));
         CHECK(hipHostFree(host));
     }
-    std::puts("GLM expert helper ownership, adaptation and parity passed");
+    std::puts("GLM expert helper ownership, adaptation, parity and the helper set passed");
 }
