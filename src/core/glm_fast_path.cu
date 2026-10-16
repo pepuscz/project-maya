@@ -1752,53 +1752,84 @@ bool Glm5Model::fast_setup_finish(std::string& err) {
     return true;
 }
 
-// ---------------------------------------------------------------- the CPU lane
+// ---------------------------------------------------------------- the expert helpers
+// STRATA_GLM_EXPERT_HELPER=<dev>[,<dev>[,<dev>]]: up to three helper GPUs own disjoint complementary expert caches.
+// Discrete helpers come first and take the hottest unowned experts up to their VRAM; a unified-memory helper takes
+// what the pinned RAM tier holds after them (aliased, no copy).  One owner map covers them all, so the primary's
+// admission, prefetch and promotions exclude every helper-owned expert with the existing nonzero check.
 bool Glm5Model::fast_helper_setup(std::string& err) {
     FastState* F = fast_;
     if (n_parts_ != 1 || exl3_ || g_.n_embd > 4096 || g_.n_exp_used > 8) {
         err = "GLM expert helper: use one trunk GPU and native GGUF experts (up to 8 per route)";
         return false;
     }
+    std::vector<int> devices;
+    {
+        std::stringstream ss(getenv("STRATA_GLM_EXPERT_HELPER"));
+        std::string t;
+        while (std::getline(ss, t, ',')) {
+            if (t.empty() || t.find_first_not_of("0123456789 ") != std::string::npos) {
+                err = "GLM expert helper: STRATA_GLM_EXPERT_HELPER takes device indices, e.g. 1 or 1,2";
+                return false;
+            }
+            devices.push_back(std::atoi(t.c_str()));
+        }
+    }
+    for (int d : devices)
+        if (d == dev_) { err = "GLM expert helper: the trunk GPU cannot be its own helper"; return false; }
     std::vector<std::pair<void*, size_t>> regions;
     for (const auto& r : F->rc) regions.push_back({r.base, (size_t) r.n * r.stride});
-    const int device = std::atoi(getenv("STRATA_GLM_EXPERT_HELPER"));
-    if (device == dev_ || !F->helper.open(device, g_.n_embd, g_.n_ff_exp, regions, err)) return false;
+    if (!F->helper.open(devices, g_.n_embd, g_.n_ff_exp, regions, err)) return false;
+    F->helper.reserve_keys(F->n_keys);
+    // the candidates, hottest first: every supported layer's experts outside the primary's VRAM slots
     std::vector<int> ranked;
-    size_t requested = 0;
     for (int il = l0_; il < lt_; ++il) {
         const auto& ly = F->L[(size_t) il];
         if (!ly.moe || !gf::moe_supported(ly.gu_type) || !gf::moe_supported(ly.d_type)) continue;
-        const int c = F->layer_rc[(size_t) il];
-        if (c < 0) continue;
-        const auto& R = F->rc[(size_t) c];
+        if (F->layer_rc[(size_t) il] < 0) continue;
         for (int e = 0; e < g_.n_expert; ++e) {
             const int key = il * g_.n_expert + e;
-            if (F->slot_of[(size_t) key] >= 0) continue;
-            const int rs = F->ram_of[(size_t) key];
-            if (F->helper.integrated() && (rs < 0 || R.st[(size_t) rs] != FastState::kRHold)) continue;
-            ranked.push_back(key);
-            requested += R.stride;
+            if (F->slot_of[(size_t) key] < 0) ranked.push_back(key);
         }
     }
-    if (!F->helper.reserve(F->n_keys, requested, err)) return false;
     std::stable_sort(ranked.begin(), ranked.end(), [&](int a, int b) { return F->usage[(size_t) a] > F->usage[(size_t) b]; });
-    int resident = 0;
-    for (int key : ranked) {
-        const int il = key / g_.n_expert, e = key % g_.n_expert;
-        auto& R = F->rc[(size_t) F->layer_rc[(size_t) il]];
-        if (R.stride > F->helper.available()) continue;
-        const int rs = F->ram_of[(size_t) key];
-        const uint8_t* host = rs >= 0 ? R.base + (size_t) rs * R.stride : F->stage[0];
-        if (rs < 0) for (int role = 0; role < 3; ++role) fast_read_part(il, e, role, F->stage[0], 0, 1);
-        if (!F->helper.insert(key, host, F->L[(size_t) il].blob, R.stride, err)) return false;
-        if (F->helper.integrated()) R.st[(size_t) rs] = FastState::kRHelper;
-        ++resident;
+    // fill order: discrete helpers first (their VRAM is the scarce tier), unified-memory helpers last
+    std::vector<int> order;
+    for (int pass = 0; pass < 2; ++pass)
+        for (int i = 0; i < F->helper.count(); ++i)
+            if (F->helper.at(i).integrated() == (pass == 1)) order.push_back(i);
+    int resident[GlmHelperSet::kMax] = {};
+    for (int i : order) {
+        auto& H = F->helper.at(i);
+        const auto eligible = [&](int key) {
+            if (F->helper.owns(key)) return false;
+            if (!H.integrated()) return true;
+            const int rs = F->ram_of[(size_t) key];   // a UMA helper aliases the RAM tier: its held entries only
+            return rs >= 0 &&
+                   F->rc[(size_t) F->layer_rc[(size_t) (key / g_.n_expert)]].st[(size_t) rs] == FastState::kRHold;
+        };
+        size_t requested = 0;
+        for (int key : ranked)
+            if (eligible(key)) requested += F->rc[(size_t) F->layer_rc[(size_t) (key / g_.n_expert)]].stride;
+        if (!H.reserve(F->n_keys, requested, err)) return false;
+        for (int key : ranked) {
+            if (!eligible(key)) continue;
+            const int il = key / g_.n_expert, e = key % g_.n_expert;
+            auto& R = F->rc[(size_t) F->layer_rc[(size_t) il]];
+            if (R.stride > H.available()) continue;
+            const int rs = F->ram_of[(size_t) key];
+            const uint8_t* host = rs >= 0 ? R.base + (size_t) rs * R.stride : F->stage[0];
+            if (rs < 0) for (int role = 0; role < 3; ++role) fast_read_part(il, e, role, F->stage[0], 0, 1);
+            if (!F->helper.insert(i, key, host, F->L[(size_t) il].blob, R.stride, err)) return false;
+            if (H.integrated()) R.st[(size_t) rs] = FastState::kRHelper;
+            ++resident[i];
+        }
     }
     if (!glmfast::cuda_ok(cudaMalloc((void**) &F->helper_owned_d, (size_t) F->n_keys), "GLM helper ownership", err) ||
         !glmfast::cuda_ok(cudaMemcpy(F->helper_owned_d, F->helper.owners().data(), (size_t) F->n_keys,
                                     cudaMemcpyHostToDevice), "GLM helper ownership upload", err)) return false;
     F->md.helper_owned = F->helper_owned_d;
-    win_lanes_stop();   // verify-window requests use the helper too, not the optional CPU window lanes
+    win_lanes_stop();   // verify-window requests use the helpers too, not the optional CPU window lanes
     if (F->cpu_ans_h == nullptr) {
         void* hp = nullptr;
         if (!glmfast::cuda_ok(cudaHostAlloc(&hp, sizeof(gf::CpuAnswer), cudaHostAllocMapped | cudaHostAllocPortable),
@@ -1821,11 +1852,14 @@ bool Glm5Model::fast_helper_setup(std::string& err) {
         }
     }
     F->cpu_retime = false;
-    F->cal_key.clear();   // the CPU's decode timing must not re-plan the GPU helper's lane
-    std::fprintf(stderr, "glm helper: CUDA%d owns %d complementary experts in %.2f GiB of %s; "
-                         "CUDA%d keeps all trunk layers and MTP; prefill unchanged\n",
-                 device, resident, (double) F->helper.used() / 1073741824.0,
-                 F->helper.integrated() ? "mapped RAM (no extra weight copy)" : "VRAM (auto, 512 MiB headroom)", dev_);
+    F->cal_key.clear();   // the CPU's decode timing must not re-plan the GPU helpers' lane
+    for (int i = 0; i < F->helper.count(); ++i) {
+        const auto& H = F->helper.at(i);
+        std::fprintf(stderr, "glm helper: CUDA%d owns %d complementary experts in %.2f GiB of %s\n", H.device(),
+                     resident[i], (double) H.used() / 1073741824.0,
+                     H.integrated() ? "mapped RAM (no extra weight copy)" : "VRAM (auto, 512 MiB headroom)");
+    }
+    std::fprintf(stderr, "glm helper: CUDA%d keeps all trunk layers and MTP; prefill unchanged\n", dev_);
     return true;
 }
 
@@ -1841,34 +1875,41 @@ bool Glm5Model::fast_helper_adapt(std::string& err) {
         const auto& R = F->rc[(size_t) F->layer_rc[key / g_.n_expert]];
         if (R.st[(size_t) rs] != FastState::kRHold && R.st[(size_t) rs] != FastState::kRHelper) primary[key] = 0;
     }
-    const auto swaps = F->helper.swaps(F->cnt, primary, g_.n_expert, 8);
-    for (const auto& s : swaps) {
-        const int il = s.in / g_.n_expert;
-        auto& R = F->rc[(size_t) F->layer_rc[(size_t) il]];
-        const int rs = F->ram_of[(size_t) s.in];
-        const uint8_t* src = rs >= 0 ? R.base + (size_t) rs * R.stride : F->stage[0];
-        if (rs < 0) for (int role = 0; role < 3; ++role) fast_read_part(il, s.in % g_.n_expert, role, F->stage[0], 0, 1);
-        if (!F->helper.replace(s.out, s.in, src, err)) return false;
-        if (F->helper.integrated()) {
-            const int dst = F->ram_of[(size_t) s.out];
-            if (rs >= 0) {
-                R.st[(size_t) dst] = FastState::kRHold;
-                R.st[(size_t) rs] = FastState::kRHelper;
-            } else {
-                R.key[(size_t) dst] = s.in;
-                R.tick[(size_t) dst] = F->clock;
-                F->ram_of[(size_t) s.out] = -1;
-                F->ram_of[(size_t) s.in] = dst;
-                const unsigned long long zero = 0, ptr = (unsigned long long) (R.base + (size_t) dst * R.stride);
-                if (!glmfast::cuda_ok(cudaMemcpy(F->tab + F->rtab_key(s.out), &zero, sizeof(zero), cudaMemcpyHostToDevice),
-                                     "helper old RAM entry", err) ||
-                    !glmfast::cuda_ok(cudaMemcpy(F->tab + F->rtab_key(s.in), &ptr, sizeof(ptr), cudaMemcpyHostToDevice),
-                                     "helper new RAM entry", err)) return false;
+    bool changed = false;
+    for (int i = 0; i < F->helper.count(); ++i) {
+        auto& H = F->helper.at(i);
+        // the other helpers' experts are neither candidates nor victims (the owner map is live: helper i sees what
+        // the helpers before it took this round)
+        const auto swaps = H.swaps(F->cnt, primary, g_.n_expert, 8, &F->helper.owners(), (uint8_t) (i + 1));
+        for (const auto& s : swaps) {
+            const int il = s.in / g_.n_expert;
+            auto& R = F->rc[(size_t) F->layer_rc[(size_t) il]];
+            const int rs = F->ram_of[(size_t) s.in];
+            const uint8_t* src = rs >= 0 ? R.base + (size_t) rs * R.stride : F->stage[0];
+            if (rs < 0) for (int role = 0; role < 3; ++role) fast_read_part(il, s.in % g_.n_expert, role, F->stage[0], 0, 1);
+            if (!F->helper.replace(i, s.out, s.in, src, err)) return false;
+            if (H.integrated()) {
+                const int dst = F->ram_of[(size_t) s.out];
+                if (rs >= 0) {
+                    R.st[(size_t) dst] = FastState::kRHold;
+                    R.st[(size_t) rs] = FastState::kRHelper;
+                } else {
+                    R.key[(size_t) dst] = s.in;
+                    R.tick[(size_t) dst] = F->clock;
+                    F->ram_of[(size_t) s.out] = -1;
+                    F->ram_of[(size_t) s.in] = dst;
+                    const unsigned long long zero = 0, ptr = (unsigned long long) (R.base + (size_t) dst * R.stride);
+                    if (!glmfast::cuda_ok(cudaMemcpy(F->tab + F->rtab_key(s.out), &zero, sizeof(zero), cudaMemcpyHostToDevice),
+                                         "helper old RAM entry", err) ||
+                        !glmfast::cuda_ok(cudaMemcpy(F->tab + F->rtab_key(s.in), &ptr, sizeof(ptr), cudaMemcpyHostToDevice),
+                                         "helper new RAM entry", err)) return false;
+                }
             }
+            ++F->helper_swaps;
+            changed = true;
         }
-        ++F->helper_swaps;
     }
-    return swaps.empty() || glmfast::cuda_ok(cudaMemcpy(F->helper_owned_d, F->helper.owners().data(),
+    return !changed || glmfast::cuda_ok(cudaMemcpy(F->helper_owned_d, F->helper.owners().data(),
                          (size_t) F->n_keys, cudaMemcpyHostToDevice), "helper adapted ownership", err);
 }
 
@@ -3479,9 +3520,15 @@ void Glm5Model::fast_destroy() {
     win_lanes_stop();   // (after the service thread: it hands them their routes)
     F->cpu_pool.reset();
     if (F->helper.device() >= 0) {
-        std::fprintf(stderr, "glm helper: CUDA%d computed %llu experts in %llu routes, %.1f ms, %llu cache swaps\n", F->helper.device(),
+        std::string who;
+        for (int i = 0; i < F->helper.count(); ++i) who += (i ? "+CUDA" : "CUDA") + std::to_string(F->helper.device(i));
+        std::fprintf(stderr, "glm helper: %s computed %llu experts in %llu routes, %.1f ms, %llu cache swaps\n", who.c_str(),
                      (unsigned long long) F->helper_experts.load(), (unsigned long long) F->helper_routes.load(),
                      (double) F->helper_us.load() / 1000.0, (unsigned long long) F->helper_swaps);
+        if (F->helper.count() > 1)
+            for (int i = 0; i < F->helper.count(); ++i)
+                std::fprintf(stderr, "glm helper: CUDA%d computed %llu experts\n", F->helper.device(i),
+                             (unsigned long long) F->helper_dev_experts[i].load());
         F->helper.close();
     }
     if (F->helper_owned_d) cudaFree(F->helper_owned_d);
@@ -4193,13 +4240,14 @@ void Glm5Model::fast_service() {
             int ne = 0;
             const uint8_t* blob[8];
             float w[8];
-            int hn = 0, helper_keys[8];
+            int hn = 0, helper_keys[8], helper_of[8];
             float helper_w[8];
             for (int i = 0; i < g.n_exp_used; ++i)
                 if ((cm >> i) & 1u) {
                     const int key = rq->layer * g.n_expert + rq->ids[i];
-                    if (F->helper.owns(key)) {
+                    if (const int o = F->helper.owner(key); o != 0) {
                         helper_keys[hn] = key;
+                        helper_of[hn] = o - 1;
                         helper_w[hn++] = rq->w[i];
                     } else {
                         blob[ne] = (const uint8_t*) rq->cpu_src[i];
@@ -4212,12 +4260,19 @@ void Glm5Model::fast_service() {
             if (F->helper.device() >= 0) {
                 const auto& ly = F->L[(size_t) rq->layer];
                 std::fill_n(ans->part, g.n_embd, 0.0f);
-                if (F->helper_failed.load(std::memory_order_acquire) || (hn > 0 &&
-                    !F->helper.compute(ly.gu_type, ly.d_type, ly.down_off, g.swiglu_exp, hn, helper_keys, helper_w,
-                                       rq->x, ans->part, F->helper_error))) {
-                    // Retire the request so the main GPU can finish and report the error, not spin forever.
-                    std::fill_n(ans->part, g.n_embd, 0.0f);
-                    F->helper_failed.store(true, std::memory_order_release);
+                // every helper launches its share of the route and the CPU computes its fallback meanwhile; then each
+                // helper's weighted sum is added - the devices work at once
+                bool ok = !F->helper_failed.load(std::memory_order_acquire);
+                int launched[GlmHelperSet::kMax] = {};
+                for (int h = 0; ok && h < F->helper.count(); ++h) {
+                    int kn = 0, keys_h[8];
+                    float w_h[8];
+                    for (int j = 0; j < hn; ++j)
+                        if (helper_of[j] == h) { keys_h[kn] = helper_keys[j]; w_h[kn++] = helper_w[j]; }
+                    if (kn == 0) continue;
+                    ok = F->helper.at(h).launch(ly.gu_type, ly.d_type, ly.down_off, g.swiglu_exp, kn, keys_h, w_h,
+                                                rq->x, F->helper_error);
+                    if (ok) launched[h] = kn;
                 }
                 // Quantize on the CPU only when this route actually has CPU fallback.
                 if (ne > 0) {
@@ -4229,6 +4284,19 @@ void Glm5Model::fast_service() {
                     F->cpu_routes.fetch_add(1, std::memory_order_relaxed);
                     F->cpu_us.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
                                            std::chrono::steady_clock::now() - cpu_t0).count(), std::memory_order_relaxed);
+                }
+                for (int h = 0; h < F->helper.count(); ++h) {
+                    if (launched[h] == 0) continue;
+                    auto& H = F->helper.at(h);
+                    if (!H.finish(F->helper_error)) { ok = false; continue; }
+                    F->helper_dev_experts[h].fetch_add((uint64_t) launched[h], std::memory_order_relaxed);
+                    const float* r = H.result();
+                    for (int j = 0; j < g.n_embd; ++j) ans->part[j] += r[j];
+                }
+                if (!ok) {
+                    // Retire the request so the main GPU can finish and report the error, not spin forever.
+                    std::fill_n(ans->part, g.n_embd, 0.0f);
+                    F->helper_failed.store(true, std::memory_order_release);
                 }
                 F->helper_experts.fetch_add((uint64_t) hn, std::memory_order_relaxed);
                 F->helper_routes.fetch_add(hn > 0, std::memory_order_relaxed);

@@ -103,6 +103,10 @@ bool GlmExpertHelper::open(int device, int n_embd, int n_ff,
     };
     x_ = (float*) take((size_t) n_embd * sizeof(float));
     out_ = (float*) take((size_t) n_embd * sizeof(float));
+    if (!check(cudaHostAlloc((void**) &res_h_, (size_t) n_embd * sizeof(float), cudaHostAllocPortable),
+               "helper result", err, device) ||
+        !check(cudaHostAlloc((void**) &stage_h_, 8 * sizeof(unsigned long long) + 8 * sizeof(float), cudaHostAllocPortable),
+               "helper staging", err, device)) return false;
     xq_ = take((size_t) n_embd / 32 * 36);
     hq_ = take((size_t) 8 * n_ff / 32 * 36);
     plan_.plan_ptr = (unsigned long long*) take(8 * sizeof(unsigned long long));
@@ -189,7 +193,8 @@ bool GlmExpertHelper::replace(int out, int in, const uint8_t* host, std::string&
 // with a hotter unowned expert of the SAME layer. Pending primary admissions
 // are included in `primary` by the caller before this idle-boundary operation.
 std::vector<GlmExpertHelper::Swap> GlmExpertHelper::swaps(const std::vector<uint32_t>& usage,
-        const std::vector<int>& primary, int ne, int max_swaps) const {
+        const std::vector<int>& primary, int ne, int max_swaps,
+        const std::vector<uint8_t>* foreign, uint8_t self) const {
     std::vector<Swap> result;
     for (size_t base = 0; base < owned_.size(); base += ne) {
         std::vector<std::pair<uint32_t, int>> candidates, victims;
@@ -197,8 +202,10 @@ std::vector<GlmExpertHelper::Swap> GlmExpertHelper::swaps(const std::vector<uint
         for (int e = 0; e < ne; ++e) {
             const int key = (int) base + e;
             if (primary[(size_t) key] >= 0) primary_cold = std::min(primary_cold, usage[(size_t) key]);
+            const bool other = foreign != nullptr && (*foreign)[(size_t) key] != 0 && (*foreign)[(size_t) key] != self;
             if (owns(key)) victims.emplace_back(usage[(size_t) key], key);
-            else if (primary[(size_t) key] < 0 && usage[(size_t) key] >= 2) candidates.emplace_back(usage[(size_t) key], key);
+            else if (!other && primary[(size_t) key] < 0 && usage[(size_t) key] >= 2)
+                candidates.emplace_back(usage[(size_t) key], key);
         }
         std::sort(candidates.begin(), candidates.end(), [](auto a, auto b) { return a.first > b.first; });
         std::sort(victims.begin(), victims.end());
@@ -212,20 +219,23 @@ std::vector<GlmExpertHelper::Swap> GlmExpertHelper::swaps(const std::vector<uint
     return result;
 }
 
-bool GlmExpertHelper::compute(int gu_type, int d_type, size_t down_off, float limit, int ne,
-                              const int* keys, const float* weights, const float* x,
-                              float* out, std::string& err) {
+bool GlmExpertHelper::launch(int gu_type, int d_type, size_t down_off, float limit, int ne,
+                             const int* keys, const float* weights, const float* x, std::string& err) {
     namespace gf = strata::kernels::glmf;
     if (device_ < 0 || ne < 1 || ne > 8 || !gf::moe_supported(gu_type) || !gf::moe_supported(d_type)) {
         err = "GLM expert helper: unsupported expert types or route width";
         return false;
     }
-    unsigned long long ptr[8] = {};
+    // the pointers and weights go through this helper's pinned staging (free again once finish() has run), the
+    // activations straight from the caller's buffer (the decode ring's entry outlives the route)
+    auto* ptr = (unsigned long long*) stage_h_;
+    auto* w = (float*) (stage_h_ + 8 * sizeof(unsigned long long));
     for (int i = 0; i < ne; ++i) {
         if (keys[i] < 0 || (size_t) keys[i] >= slots_.size() || !owns(keys[i])) {
             err = "GLM expert helper: expert not owned by helper"; return false;
         }
         ptr[i] = (unsigned long long) slots_[(size_t) keys[i]].device;
+        w[i] = weights[i];
     }
     DeviceScope scope(device_);
     if (!scope.ok) { err = scope.error(device_); return false; }
@@ -233,14 +243,28 @@ bool GlmExpertHelper::compute(int gu_type, int d_type, size_t down_off, float li
                "helper input", err, device_) ||
         !check(cudaMemcpyAsync(plan_.plan_ptr, ptr, (size_t) ne * sizeof(ptr[0]), cudaMemcpyHostToDevice, stream_),
                "helper pointers", err, device_) ||
-        !check(cudaMemcpyAsync(plan_.plan_w, weights, (size_t) ne * sizeof(float), cudaMemcpyHostToDevice, stream_),
+        !check(cudaMemcpyAsync(plan_.plan_w, w, (size_t) ne * sizeof(float), cudaMemcpyHostToDevice, stream_),
                "helper weights", err, device_)) return false;
     gf::quantize_q8_1(x_, xq_, n_embd_, stream_);
     gf::moe_gate_up(gu_type, plan_, ne, n_embd_, n_ff_, limit, xq_, hq_, nullptr, 0, nullptr, 0, nullptr, stream_);
     gf::moe_down(d_type, plan_, ne, n_embd_, n_ff_, down_off, hq_, nullptr, out_, stream_);
-    return check(cudaMemcpyAsync(out, out_, (size_t) n_embd_ * sizeof(float), cudaMemcpyDeviceToHost, stream_),
-                 "helper result", err, device_) &&
-           check(cudaStreamSynchronize(stream_), "helper finish", err, device_);
+    return check(cudaMemcpyAsync(res_h_, out_, (size_t) n_embd_ * sizeof(float), cudaMemcpyDeviceToHost, stream_),
+                 "helper result", err, device_);
+}
+
+bool GlmExpertHelper::finish(std::string& err) {
+    if (device_ < 0) { err = "GLM expert helper: not open"; return false; }
+    DeviceScope scope(device_);
+    if (!scope.ok) { err = scope.error(device_); return false; }
+    return check(cudaStreamSynchronize(stream_), "helper finish", err, device_);
+}
+
+bool GlmExpertHelper::compute(int gu_type, int d_type, size_t down_off, float limit, int ne,
+                              const int* keys, const float* weights, const float* x,
+                              float* out, std::string& err) {
+    if (!launch(gu_type, d_type, down_off, limit, ne, keys, weights, x, err) || !finish(err)) return false;
+    std::memcpy(out, res_h_, (size_t) n_embd_ * sizeof(float));
+    return true;
 }
 
 void GlmExpertHelper::close() {
@@ -250,17 +274,65 @@ void GlmExpertHelper::close() {
         if (stream_) cudaStreamSynchronize(stream_);
         if (arena_) cudaFree(arena_);
         if (pool_) cudaFree(pool_);
+        if (res_h_) cudaFreeHost(res_h_);
+        if (stage_h_) cudaFreeHost(stage_h_);
         if (stream_) cudaStreamDestroy(stream_);
     }
     device_ = -1;
     arena_ = nullptr;
     pool_ = nullptr;
+    res_h_ = nullptr;
+    stage_h_ = nullptr;
     capacity_ = used_ = 0;
     stream_ = nullptr;
     regions_.clear();
     slots_.clear();
     owned_.clear();
     plan_ = {};
+}
+
+bool GlmHelperSet::open(const std::vector<int>& devices, int n_embd, int n_ff,
+                        const std::vector<std::pair<void*, size_t>>& regions, std::string& err) {
+    close();
+    if (devices.empty() || (int) devices.size() > kMax) {
+        err = "GLM expert helper: one to " + std::to_string(kMax) + " helper devices";
+        return false;
+    }
+    for (size_t i = 0; i < devices.size(); ++i)
+        for (size_t j = 0; j < i; ++j)
+            if (devices[i] == devices[j]) { err = "GLM expert helper: a helper device is listed twice"; return false; }
+    for (int d : devices) {
+        auto h = std::make_unique<GlmExpertHelper>();
+        if (!h->open(d, n_embd, n_ff, regions, err)) { close(); return false; }
+        h_[(size_t) count_++] = std::move(h);
+    }
+    return true;
+}
+
+bool GlmHelperSet::insert(int i, int key, const uint8_t* host, size_t bytes, size_t stride, std::string& err) {
+    if (i < 0 || i >= count_ || key < 0 || (size_t) key >= owner_.size() || owner_[(size_t) key] != 0) {
+        err = "GLM expert helper: invalid set insertion"; return false;
+    }
+    if (!h_[(size_t) i]->insert(key, host, bytes, stride, err)) return false;
+    owner_[(size_t) key] = (uint8_t) (i + 1);
+    return true;
+}
+
+bool GlmHelperSet::replace(int i, int out, int in, const uint8_t* host, std::string& err) {
+    if (i < 0 || i >= count_ || in < 0 || (size_t) in >= owner_.size() || owner_[(size_t) in] != 0 ||
+        out < 0 || (size_t) out >= owner_.size() || owner_[(size_t) out] != (uint8_t) (i + 1)) {
+        err = "GLM expert helper: invalid set replacement"; return false;
+    }
+    if (!h_[(size_t) i]->replace(out, in, host, err)) return false;
+    owner_[(size_t) out] = 0;
+    owner_[(size_t) in] = (uint8_t) (i + 1);
+    return true;
+}
+
+void GlmHelperSet::close() {
+    for (int i = 0; i < count_; ++i) h_[(size_t) i].reset();
+    count_ = 0;
+    owner_.clear();
 }
 
 RemoteExperts::~RemoteExperts() { close(); }

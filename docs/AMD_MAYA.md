@@ -153,6 +153,21 @@ Keep the normal pack, context, headroom and MTP settings. Do not combine the hel
 nonzero `STRATA_GLM_SPLIT`. Unset `STRATA_GLM_EXPERT_HELPER` to restore the existing behavior. This experimental
 path does not claim general multi-GPU support or a speedup; measure it on the target hardware.
 
+#### Several helpers
+
+`STRATA_GLM_EXPERT_HELPER=1,2` (up to three indices) gives GPU 0 two or three helpers with disjoint expert caches:
+one owner map covers them all, so the primary's exclusions are unchanged. Discrete helpers are filled first, hottest
+unowned experts up to their VRAM; a unified-memory helper takes what the pinned RAM tier holds after them (a discrete
+helper's experts keep their RAM-tier copy). A route's experts go to their owners at once: every helper launches its
+share on its own stream and the CPU computes any fallback meanwhile, then the helpers' vectors are summed. Idle-boundary
+replacement runs per helper and never trades another helper's experts. The engine logs one `glm helper: CUDA<n> owns`
+line per helper and, at exit, each helper's expert count.
+
+`maya.py --setup --backend hip --gpus 0,1,2 --expert-helper` writes this configuration: the largest discrete card keeps
+the trunk, the other discrete cards are the first helpers and the APU the last (`"layer_split": "0"`,
+`STRATA_GLM_SPLIT=0`, `STRATA_GLM_EXPERT_HELPER=1,2`). Measured so far: one helper (R9700 + 8060S). Two helpers, a
+second discrete card and the APU, are the target of this port and unmeasured until the hardware is in place.
+
 ## Strix Halo
 
 Ryzen AI Max+ 395 / Radeon 8060S (`gfx1151`) uses unified memory. Use the same

@@ -625,12 +625,13 @@ struct Glm5Model::FastState {
     //      weighted sum (cpu_ans_h) before its down combine.  cpu_plan: how many of f RAM-tier experts go to the host.
     //      A split of 3+ GPUs shares one pool across its parts (fast_cpu_lane_setup).
     std::shared_ptr<glmfast::Workers> cpu_pool;
-    GlmExpertHelper helper;   // opt-in, independent expert ownership on the secondary GPU
+    GlmHelperSet helper;   // opt-in, independent expert ownership on one to three helper GPUs (disjoint caches)
     uint8_t* helper_owned_d = nullptr;   // primary router excludes these experts from PCIe admission/prefetch
     uint64_t helper_swaps = 0;
     std::atomic<bool> helper_failed{false};
     std::string helper_error;
     std::atomic<uint64_t> helper_experts{0}, helper_routes{0}, helper_us{0};
+    std::atomic<uint64_t> helper_dev_experts[GlmHelperSet::kMax]{};   // ... of each helper, in set order
     // one GPU with a DFlash drafter, on a host of two NUMA nodes or more (STRATA_GLM_WIN_LANES, on): a batched verify
     // window's tokens' CPU-lane experts go to two lane threads, token t to lane t % 2 - lane 0 drives cpu_pool (then
     // pinned to the GPU's node), lane 1 a pool of its own on another node - so the window's tokens run on both
