@@ -665,7 +665,7 @@ def check_hip_pc(a, installed=False) -> dict:
             want = [int(x) for x in str(a.gpus).split(",") if x.strip()]
         except ValueError:
             fail(f"--gpus takes two GPU numbers as --check shows them, e.g. --gpus 0,1, not {a.gpus!r}")
-        if a.expert_helper:
+        if getattr(a, "expert_helper", False):
             if not 2 <= len(want) <= 1 + MAX_HELPERS or len(set(want)) != len(want):
                 fail(f"--expert-helper takes the trunk GPU and one to {MAX_HELPERS} helpers: --gpus 0,1 or --gpus 0,1,2")
         elif len(want) != 2 or want[0] == want[1]:
@@ -1940,7 +1940,7 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
         # the available prompt-memory budget; forcing 256 here severely slows HIP.
         hip_env = {"STRATA_GLM_RESERVE_MB": "3072", "STRATA_GLM_RAM_HEADROOM_GB": "16"}
         gpus = pc["gpus"]
-        if len(gpus) == 1 or a.expert_helper:
+        if len(gpus) == 1 or getattr(a, "expert_helper", False):
             hip_env["STRATA_GLM_SPLIT"] = "0"   # two cards without --expert-helper: the engine picks the split
         # Larger prompt sub-batches feed the matrix cores much better (7900 XT: ~250 -> ~410 tok/s); they need
         # a bigger prompt budget, borrowed from the expert pool only while a prompt runs.
@@ -1964,7 +1964,7 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
         if tables:
             hip_env["STRATA_HIPBLASLT_TUNING"] = ":".join(tables)
         env = {**hip_env, **env}
-    if a.expert_helper and len(cfg["gpu"]) > 1:
+    if getattr(a, "expert_helper", False) and len(cfg["gpu"]) > 1:
         # the first GPU keeps the trunk, attention, KV and MTP; every other one owns a complementary expert cache
         # (docs/AMD_MAYA.md, "Experimental expert helper"); no layer split
         env = {"STRATA_GLM_SPLIT": "0", "STRATA_GLM_EXPERT_HELPER": ",".join(str(i) for i in range(1, len(cfg["gpu"]))),
