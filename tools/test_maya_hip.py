@@ -143,6 +143,38 @@ class HipSetupTests(unittest.TestCase):
         self.a.gpu = 3
         self.assertEqual(maya.check_pc(self.a)["gpus"], [self.gpus[3]])
 
+    def test_expert_helper_takes_the_trunk_card_and_up_to_three_helpers(self):
+        # --gpus 0,1,3 --expert-helper: the largest discrete card keeps the trunk (first), the other discrete card is
+        # helper 1, the unified-memory APU the last helper; no layer split, STRATA_GLM_EXPERT_HELPER lists the helpers
+        self.gpus.append({"index": 3, "arch": "gfx1151", "vendor": "amd", "name": "Radeon 8060S", "vram_gb": 112})
+        self.a.gpu = None
+        self.a.gpus = "0,1,3"
+        with self.assertRaises(SystemExit):
+            maya.check_pc(self.a)                       # three GPUs split no layers
+        self.a.expert_helper = True
+        for order in ("0,1,3", "3,0,1"):
+            self.a.gpus = order
+            pc = maya.check_pc(self.a)
+            self.assertEqual(pc["gpus"], [self.gpus[1], self.gpus[0], self.gpus[3]])
+            p = maya.write_config(self.a, pc, {}, self.root / "pack", "test", 8192, self.root / "data", None)
+            cfg = json.loads(p.read_text())
+            self.assertEqual(cfg["gpu"], [1, 0, 3])
+            self.assertEqual(cfg["layer_split"], "0")
+            self.assertEqual(cfg["env"]["STRATA_GLM_SPLIT"], "0")
+            self.assertEqual(cfg["env"]["STRATA_GLM_EXPERT_HELPER"], "1,2")
+            self.assertEqual(cfg["env"]["STRATA_GLM_PARALLEL_LOAD"], "0")
+        self.a.gpus = "1,3"                             # one helper: the measured R9700 + 8060S layout
+        p = maya.write_config(self.a, maya.check_pc(self.a), {}, self.root / "pack", "test", 8192, self.root / "data", None)
+        self.assertEqual(json.loads(p.read_text())["env"]["STRATA_GLM_EXPERT_HELPER"], "1")
+        for bad in ("1", "1,1", "0,1,3,0"):            # the trunk alone, a card twice, more than three helpers
+            self.a.gpus = bad
+            with self.assertRaises(SystemExit):
+                maya.check_pc(self.a)
+        self.a.env = ["STRATA_GLM_EXPERT_HELPER=2,1"]   # an explicit setting still wins
+        self.a.gpus = "0,1,3"
+        p = maya.write_config(self.a, maya.check_pc(self.a), {}, self.root / "pack", "test", 8192, self.root / "data", None)
+        self.assertEqual(json.loads(p.read_text())["env"]["STRATA_GLM_EXPERT_HELPER"], "2,1")
+
     def test_strix_halo_defaults_use_system_ram_not_vram(self):
         self.gpus.append({"index": 3, "arch": "gfx1151", "vendor": "amd",
                           "name": "AMD Radeon (gfx1151)", "vram_gb": 0.5})
