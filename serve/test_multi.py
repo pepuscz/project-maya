@@ -12,7 +12,8 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from serve.server import FairLock, StrataEngine  # noqa: E402
+from serve.frontend import ChatTemplate  # noqa: E402
+from serve.server import ByteTokenizer, FairLock, Service, StrataEngine  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -76,6 +77,76 @@ class Engine(unittest.TestCase):
         self.assertIn("busy", str(cm.exception))
         for g in gens:
             g.close()
+
+
+class AnswerTokenizer(ByteTokenizer):
+    """The fake engine answers with ids from 1000 up: each is one letter here."""
+
+    def token_bytes(self, t):
+        return b"x"
+
+
+class OwnFigures(unittest.TestCase):
+    """A request's DONE figures are its own (timings, cached_tokens, the Monitor's history).  The requests decode in
+    lockstep, so their DONE lines come within a step of each other: here B's DONE is always read after A's and before
+    A reads its figures, which is when one shared value gave A the figures of B."""
+
+    def setUp(self):
+        self.engine = StrataEngine(str(ROOT / "serve/fake_multi_engine.py"), ["2"])
+        a_read, self.b_ended = threading.Event(), threading.Event()
+        parse = self.engine._parse_done
+
+        def in_order(line):
+            me = threading.current_thread().name
+            if me == "b":
+                a_read.wait(30)
+            parse(line)
+            if me == "a":
+                a_read.set()
+                self.b_ended.wait(30)
+        self.engine._parse_done = in_order
+
+    def tearDown(self):
+        self.engine.close()
+
+    def both(self, one):
+        """one(prompt) on thread a (5 tokens: its answer ends first) and on thread b (9 tokens) -> {name: result}."""
+        out = {}
+
+        def run(name, n):
+            try:
+                out[name] = one(list(range(n)))
+            finally:
+                if name == "b":
+                    self.b_ended.set()
+
+        ths = [threading.Thread(target=run, name=name, args=(name, n)) for name, n in (("a", 5), ("b", 9))]
+        [t.start() for t in ths]
+        [t.join(30) for t in ths]
+        return out
+
+    def test_a_request_reads_its_own_done_after_another_ended(self):
+        def one(ids):
+            list(self.engine.generate(ids, len(ids), {}, threading.Event()))
+            return dict(self.engine.last)
+
+        out = self.both(one)
+        self.assertEqual((out["a"]["generated"], out["a"]["reused"]), (5, 4))
+        self.assertEqual((out["b"]["generated"], out["b"]["reused"]), (9, 8))
+
+    def test_timings_and_cached_tokens_are_the_requests_own(self):
+        svc = Service(self.engine, AnswerTokenizer(), ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.fifo.set_capacity(2)
+
+        def one(ids):
+            return [x for kind, x in svc.run(ids, False, None, len(ids), {}, threading.Event()) if kind == "done"][0]
+
+        out = self.both(one)
+        for name, n in (("a", 5), ("b", 9)):
+            self.assertEqual((out[name]["completion_tokens"], out[name]["reused"]), (n, n - 1), name)
+            self.assertEqual(out[name]["timings"]["cache_n"], n - 1, name)
+        self.assertEqual(sorted((h["prompt_tokens"], h["reused"], h["engine_generated"]) for h in svc.history),
+                         [(5, 4, 5), (9, 8, 9)])
 
 
 class Places(unittest.TestCase):

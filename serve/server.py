@@ -636,6 +636,21 @@ class StrataEngine:
         self.__init__(*self.spawn)
         self.info = {**info, **self.info}
 
+    @property
+    def last(self) -> dict | None:
+        """The figures of the last DONE line (_parse_done).  With several conversations at once (multi) they are this
+        thread's request's: the requests decode in lockstep and their DONE lines come within a step of each other, so
+        one value for all gave a request the timings and cached_tokens of another (#310).  A request's lines are read
+        on the thread that runs it (_generate_multi), as pause() already relies on."""
+        return getattr(self._tls, "last", None) if self.multi else getattr(self, "_last", None)
+
+    @last.setter
+    def last(self, value):
+        if self.multi:
+            self._tls.last = value
+        else:
+            self._last = value
+
     def _parse_done(self, line):
         f = line.split()
         self.last = {"generated": int(f[1]), "prompt_tokens": int(f[2]), "prompt_ms": float(f[3]),
