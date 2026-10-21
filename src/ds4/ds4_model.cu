@@ -2349,10 +2349,6 @@ struct Model::Impl {
                 return false;
             }
             tp_uneven = std::strcmp(v, "1") == 0;
-            if (tp_uneven && std::getenv("DS4_FLOW_TP") != nullptr && std::atoi(std::getenv("DS4_FLOW_TP")) != 0) {
-                err = "DS4_TP_GGUF_UNEVEN: not with DS4_FLOW_TP (the flow takes even shares)";
-                return false;
-            }
         }
         if (pk.gguf && tp > 1) {
             int blk = 32;
@@ -3035,8 +3031,8 @@ struct Model::Impl {
                                 if (member(l, m).dev == (int) di) {
                                     // (a group's members: each its share of the down's blocks in every row)
                                     fl = fl && l.lay.fmt == gg::kFmtMXFP4 &&
-                                         (l.nm == 1 || (flow_tp && (g.ff / l.nm) %
-                                                        std::max(1, gg::type_block(gg::expert_type(l.lay, 2))) == 0));
+                                         (l.nm == 1 || (flow_tp && (tp_uneven || (g.ff / l.nm) %
+                                                        std::max(1, gg::type_block(gg::expert_type(l.lay, 2))) == 0)));
                                     n_exp_max = std::max(n_exp_max, l.n_exp);
                                 }
                     if (fl)   // (each part read unbuffered from its offset rounded down: a page more each)
@@ -3069,6 +3065,15 @@ struct Model::Impl {
                 bool all_flow = true;
                 for (const auto& cp : chunks) all_flow = all_flow && (cp == nullptr || cp->ring == nullptr || cp->flow);
                 if (all_flow && std::getenv("DS4_CHUNK_MIN") == nullptr) chunk_min = kFlowChunkMin;
+                if (tp_uneven && flow_tp) {   // (DS4_FLOW_TP with DS4_TP_GGUF_UNEVEN: the members that stream their parts)
+                    std::string on;
+                    for (size_t di = 0; di < chunks.size(); ++di)
+                        if (chunks[di] != nullptr && chunks[di]->flow)
+                            on += (on.empty() ? "CUDA" : ", CUDA") + std::to_string(devs[di].id);
+                    std::fprintf(stderr, "ds4: tensor-parallel members on the prompt path's flow: %s - each streams its own "
+                                         "part of the experts a prompt picks (DS4_FLOW_TP)\n",
+                                 on.empty() ? "none" : on.c_str());
+                }
             }
             for (Layer& l : L) {
                 if (l.mtp) continue;
@@ -3592,16 +3597,76 @@ struct Model::Impl {
     }
     size_t flow_stride() const { return flow_region(0) + flow_region(1) + flow_region(2); }
     static Chunk::Item& fit(Chunk& c, size_t i) { return c.items[i - c.base]; }
-    // what member m of l's group reads of matrix r of an expert: gate / up its rows [m n_ff / nm, ..) - one run, from
-    // this offset in the matrix, this long; the down the whole matrix (its part, the blocks [m n_ff / nm / 32, ..) of
-    // every row, is DMA'd out of it row by row); alone (nm 1) every matrix whole
+    // what member m of l's group reads of matrix r of an expert: gate / up its rows [ff0, ff0 + ffn) - one run, from
+    // this offset in the matrix, this long; the down the whole matrix (its part, the blocks of those columns in every
+    // row, is DMA'd out of it row by row - flow_copy); alone (nm 1) every matrix whole.  (An even split's members:
+    // ff0 = m n_ff / nm, ffn = n_ff / nm, as before; DS4_TP_GGUF_UNEVEN's: their own whole blocks)
     size_t mx_read_off(const Layer& l, int m, int r) const {
-        return r < 2 && l.nm > 1 ? (size_t) m * (size_t) (g.ff / l.nm) * gg::type_row_bytes(gg::expert_type(l.lay, r), g.dim)
-                                 : 0;
+        return r < 2 && l.nm > 1 ? (size_t) member(l, m).ff0 * gg::type_row_bytes(gg::expert_type(l.lay, r), g.dim) : 0;
     }
-    size_t mx_read_len(const Layer& l, int r) const {
-        return r < 2 && l.nm > 1 ? (size_t) (g.ff / l.nm) * gg::type_row_bytes(gg::expert_type(l.lay, r), g.dim)
+    size_t mx_read_len(const Layer& l, int m, int r) const {
+        return r < 2 && l.nm > 1 ? (size_t) member(l, m).ffn * gg::type_row_bytes(gg::expert_type(l.lay, r), g.dim)
                                  : mx_part_bytes(l, r);
+    }
+    // item it's reads into its staging sb (the jobs; their number): a copy's (the RAM tier's NH parts) each matrix
+    // whole, NH runs of rows side by side; otherwise each matrix's part member it.mi reads (mx_read_off / mx_read_len) -
+    // from the RAM tier's blob as it is (at sb), else the model's file, direct or buffered (from its offset rounded
+    // down: the part at sb + off % kDirectAlign, where flow_push points it.src)
+    int flow_jobs(const Chunk& c, Chunk::Item& it, uint8_t* sb, IoQueue::Job* jobs) const {
+        const Layer& l = L[(size_t) it.il];
+        const int cs = copy_mode && it.ram != nullptr ? l.ram[(size_t) it.e] : -1;   // (a copy's slot)
+        int nj = 0;
+        for (int r = 0; r < 3; ++r) {
+            if (cs >= 0) {   // a copy: each matrix's NH parts of rows, side by side into staging
+                const size_t nb = (size_t) (mx_n(r) / NH) * mx_row_b(l, r);
+                for (int X = 0; X < NH; ++X) {
+                    IoQueue::Job& j = jobs[nj++];
+                    j = IoQueue::Job{};
+                    j.len = nb;
+                    j.dst = sb + (size_t) X * nb;
+                    j.left = &it.left;
+                    j.bad = &it.bad;
+                    j.mem = ram_part[(size_t) cs][(size_t) X] + cp_lay[(size_t) l.il][(size_t) r];
+                }
+                sb += flow_region(r);
+                continue;
+            }
+            IoQueue::Job& j = jobs[nj++];
+            j = IoQueue::Job{};
+            const os::fd_t pf = pk.pfds.empty() ? os::kBadFd : pk.pfds[(size_t) l.mx_file[r]];
+            j.fd = pf != os::kBadFd ? pf : pk.fds[(size_t) l.mx_file[r]];
+            j.dfd = pk.dfds.empty() || c.buffered ? os::kBadFd : pk.dfds[(size_t) l.mx_file[r]];
+            j.off = l.mx_off[r] + (uint64_t) it.e * l.mx_stride[r] + mx_read_off(l, it.mi, r);
+            j.len = mx_read_len(l, it.mi, r);
+            j.dst = sb;
+            j.left = &it.left;
+            j.bad = &it.bad;
+            j.mem = it.ram != nullptr ? it.ram + l.lay.trellis[r] + mx_read_off(l, it.mi, r) : nullptr;
+            j.map = pk.at(l.mx_file[r], j.off);
+            j.keep = it.keep != nullptr ? it.keep + l.lay.trellis[r] : nullptr;
+            sb += flow_region(r);
+        }
+        return nj;
+    }
+    // an item's staged matrices into ring slot dst as member mi's part of the expert (laid out as its hlay): gate / up
+    // mx_read_len bytes - from src as the read left them (its rows only), or from whole staging (a copy's NH parts:
+    // every row) at the member's read offset in it; the down's blocks of the member's columns [ff0, ff0 + ffn) out of
+    // every row of the whole matrix (pitch: the whole row).  Alone (nm 1): each matrix whole, as staged
+    bool flow_copy(const Layer& l, int mi, const uint8_t* const* src, bool whole, uint8_t* dst, cudaStream_t s) const {
+        const Layer& x = member(l, mi);
+        const x3::ExpertLayout& lay = l.nm > 1 ? x.hlay : l.lay;
+        for (int p = 0; p < 2; ++p)
+            if (cudaMemcpyAsync(dst + lay.trellis[p], src[p] + (whole ? mx_read_off(l, mi, p) : 0), mx_read_len(l, mi, p),
+                                cudaMemcpyHostToDevice, s) != cudaSuccess)
+                return false;
+        if (l.nm > 1) {   // (the down's part: in each of its rows the member's blocks)
+            const int t2 = gg::expert_type(l.lay, 2);
+            const size_t dr = gg::type_row_bytes(t2, g.ff), dh = gg::type_row_bytes(t2, x.ffn),
+                         d0 = gg::type_row_bytes(t2, x.ff0);
+            return cudaMemcpy2DAsync(dst + lay.trellis[2], dh, src[2] + d0, dr, dh, (size_t) g.dim, cudaMemcpyHostToDevice,
+                                     s) == cudaSuccess;
+        }
+        return cudaMemcpyAsync(dst + lay.trellis[2], src[2], mx_part_bytes(l, 2), cudaMemcpyHostToDevice, s) == cudaSuccess;
     }
     // the device's member index in L0's group (0 alone)
     int flow_mi(const Chunk& c, const Layer& L0) const {
@@ -3796,39 +3861,7 @@ struct Model::Impl {
                     CK(q);
                 }
                 c.stage_item[(size_t) it.stage] = (int64_t) c.n_read;
-                const Layer& l = L[(size_t) it.il];
-                uint8_t* sb = c.stage + (size_t) it.stage * c.stage_stride;
-                const int cs = copy_mode && it.ram != nullptr ? l.ram[(size_t) it.e] : -1;   // (a copy's slot)
-                int nj = 0;
-                for (int r = 0; r < 3; ++r) {
-                    if (cs >= 0) {   // a copy: each matrix's NH parts of rows, side by side into staging
-                        const size_t nb = (size_t) (mx_n(r) / NH) * mx_row_b(l, r);
-                        for (int X = 0; X < NH; ++X) {
-                            IoQueue::Job& j = jobs[nj++];
-                            j = IoQueue::Job{};
-                            j.len = nb;
-                            j.dst = sb + (size_t) X * nb;
-                            j.left = &it.left;
-                            j.bad = &it.bad;
-                            j.mem = ram_part[(size_t) cs][(size_t) X] + cp_lay[(size_t) l.il][(size_t) r];
-                        }
-                        sb += flow_region(r);
-                        continue;
-                    }
-                    IoQueue::Job& j = jobs[nj++];
-                    const os::fd_t pf = pk.pfds.empty() ? os::kBadFd : pk.pfds[(size_t) l.mx_file[r]];
-                    j.fd = pf != os::kBadFd ? pf : pk.fds[(size_t) l.mx_file[r]];
-                    j.dfd = pk.dfds.empty() || c.buffered ? os::kBadFd : pk.dfds[(size_t) l.mx_file[r]];
-                    j.off = l.mx_off[r] + (uint64_t) it.e * l.mx_stride[r] + mx_read_off(l, it.mi, r);
-                    j.len = mx_read_len(l, r);
-                    j.dst = sb;
-                    j.left = &it.left;
-                    j.bad = &it.bad;
-                    j.mem = it.ram != nullptr ? it.ram + l.lay.trellis[r] + mx_read_off(l, it.mi, r) : nullptr;
-                    j.map = pk.at(l.mx_file[r], j.off);
-                    j.keep = it.keep != nullptr ? it.keep + l.lay.trellis[r] : nullptr;
-                    sb += flow_region(r);
-                }
+                const int nj = flow_jobs(c, it, c.stage + (size_t) it.stage * c.stage_stride, jobs);
                 c.io->push(jobs, nj);
             }
             ++c.n_read;
@@ -3852,20 +3885,16 @@ struct Model::Impl {
             const size_t r = c.n_dma % R;
             if (c.n_dma >= R) CK(cudaStreamWaitEvent(c.cs, c.ring_free[r], 0));
             const Layer& l = L[(size_t) it.il];
-            uint8_t* dst = c.ring + r * c.ring_stride;
-            const x3::ExpertLayout& lay = l.nm > 1 ? l.hlay : l.lay;
-            for (int p = 0; p < 2; ++p)
-                CK(cudaMemcpyAsync(dst + lay.trellis[p], it.src[p], mx_read_len(l, p), cudaMemcpyHostToDevice, c.cs));
-            if (l.nm > 1) {   // (the down's part: in each of its rows the member's blocks)
-                const int t2 = gg::expert_type(l.lay, 2);
-                const size_t dr = gg::type_row_bytes(t2, g.ff), dh = gg::type_row_bytes(t2, g.ff / l.nm);
-                CK(cudaMemcpy2DAsync(dst + lay.trellis[2], dh, it.src[2] + (size_t) it.mi * dh, dr, dh, (size_t) g.dim,
-                                     cudaMemcpyHostToDevice, c.cs));
-            } else
-                CK(cudaMemcpyAsync(dst + lay.trellis[2], it.src[2], mx_part_bytes(l, 2), cudaMemcpyHostToDevice, c.cs));
+            // (a copy's staging holds each matrix whole: the member's rows from its offset in it - the reads' own staging
+            //  holds them only)
+            if (!flow_copy(l, it.mi, it.src, copy_mode && it.ram != nullptr, c.ring + r * c.ring_stride, c.cs)) {
+                err = "the flow's copy of layer " + std::to_string(it.il) + " expert " + std::to_string(it.e) + ": " +
+                      cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
             CK(cudaEventRecord(c.ring_fill[r], c.cs));
             if (it.stage >= 0) CK(cudaEventRecord(c.stage_ev[(size_t) it.stage], c.cs));
-            c.stream_bytes += (double) unit(l);
+            c.stream_bytes += (double) unit(member(l, it.mi));
             ++c.n_dma;
         }
         return true;
@@ -3912,7 +3941,7 @@ struct Model::Impl {
             if (bc[n] > bc[0]) {
                 CK(cudaStreamWaitEvent(s, c.ring_fill[(i1 - 1) % R], 0));
                 CK(cudaMemcpyAsync(bcd, bc, (size_t) (n + 1) * 4, cudaMemcpyHostToDevice, s));
-                if (!run_set(d, c, L0, c.ring + (i0 % R) * c.ring_stride, 0, c.ring_stride, bcd, bc, 0, n, T, err))
+                if (!run_set(d, c, vx, c.ring + (i0 % R) * c.ring_stride, 0, c.ring_stride, bcd, bc, 0, n, T, err))
                     return false;
             }
             for (size_t i = i0; i < i1; ++i) CK(cudaEventRecord(c.ring_free[i % R], s));
@@ -3920,10 +3949,10 @@ struct Model::Impl {
             c.n_comp = i1;
             if (!flow_pump(c, err)) return false;
             const int v_to = (int) ((int64_t) L0.pv_n * (int64_t) (c.n_comp - lb) / (int64_t) std::max<size_t>(1, n_lay));
-            if (!run_vram(d, c, L0, L0, vx, b.data(), v_done, v_to, T, err)) return false;
+            if (!run_vram(d, c, L0, vx, vx, b.data(), v_done, v_to, T, err)) return false;
             v_done = v_to;
         }
-        if (!run_vram(d, c, L0, L0, vx, b.data(), v_done, L0.pv_n, T, err)) return false;
+        if (!run_vram(d, c, L0, vx, vx, b.data(), v_done, L0.pv_n, T, err)) return false;
         while (c.base < c.n_comp && c.items.size() > 4096) {   // (done with: read, copied and used)
             c.items.pop_front();
             ++c.base;
@@ -7251,6 +7280,94 @@ struct Model::Impl {
                   std::to_string(m) + "): a CUDA error";
         return ok;
     }
+    // DS4_TP_CHECK with the group's members on the flow (DS4_FLOW_TP): member m of layer l, one expert's blob staged on
+    // the host twice as the flow stages it - the member's read (its gate / up rows, the down whole) and a copy's (each
+    // matrix whole) - each through flow_copy into a device buffer between guard bytes, read back: both must be
+    // blob_to_half's part for the member byte for byte, every guard untouched.  On one stream, the readback before the
+    // end's event, its own host and device buffers kept until a clean end (none: tp_unknown)
+    bool tp_flow_member(const Layer& l, int m, std::string& err) {
+        const Layer& x = member(l, m);
+        Dev& d = devs[(size_t) x.dev];
+        auto fail = [&](const std::string& why) {
+            err = "TP check: flow copies (layer " + std::to_string(l.il) + " member " + std::to_string(m) + "): " + why;
+            return false;
+        };
+        if (cudaSetDevice(d.id) != cudaSuccess) {   // (before anything is made or enqueued)
+            (void) cudaGetLastError();
+            return fail("cudaSetDevice failed");
+        }
+        constexpr size_t kGuard = 256;
+        const size_t u = unit(x), blob = l.blob, dev_bytes = 2 * u + 4 * kGuard;
+        std::vector<uint8_t> whole(blob), want(u);
+        if (!read_mx(l, 0, whole.data())) return fail("expert 0 not read");
+        blob_to_half(l, whole.data(), m, want.data());
+        size_t part_b = 0;
+        for (int r = 0; r < 3; ++r) part_b += mx_read_len(l, m, r);
+        uint8_t *stage = nullptr, *back = nullptr, *dv = nullptr;   // (stage: the member's read, then the whole blob)
+        cudaEvent_t ev = nullptr;
+        if (cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) ev = nullptr;
+        bool ok = ev != nullptr;
+        if (ok && cudaMallocHost((void**) &stage, part_b + blob) != cudaSuccess) stage = nullptr, ok = false;
+        if (ok && cudaMallocHost((void**) &back, dev_bytes) != cudaSuccess) back = nullptr, ok = false;
+        if (ok && cudaMalloc((void**) &dv, dev_bytes) != cudaSuccess) dv = nullptr, ok = false;
+        const uint8_t *ps[3] = {}, *ws[3] = {};
+        if (ok) {
+            size_t o = 0;
+            for (int r = 0; r < 3; ++r) {
+                const size_t n = mx_read_len(l, m, r);
+                std::memcpy(stage + o, whole.data() + l.lay.trellis[r] + mx_read_off(l, m, r), n);
+                ps[r] = stage + o;
+                o += n;
+            }
+            std::memcpy(stage + part_b, whole.data(), blob);
+            for (int r = 0; r < 3; ++r) ws[r] = stage + part_b + l.lay.trellis[r];
+        }
+        bool submitted = false;   // (anything on the stream: its end waited for before any free)
+        if (ok) {
+            submitted = true;
+            ok = cudaMemsetAsync(dv, 0xA5, dev_bytes, d.st) == cudaSuccess && flow_copy(l, m, ps, false, dv + kGuard, d.st) &&
+                 flow_copy(l, m, ws, true, dv + u + 3 * kGuard, d.st) &&
+                 cudaMemcpyAsync(back, dv, dev_bytes, cudaMemcpyDeviceToHost, d.st) == cudaSuccess;   // (before the end)
+        }
+        if (submitted) {   // (its event, else - not recorded - the stream itself; only a clean end goes on)
+            const bool rec = cudaEventRecord(ev, d.st) == cudaSuccess;
+            const double t0 = now_ms();
+            cudaError_t q;
+            while ((q = rec ? cudaEventQuery(ev) : cudaStreamQuery(d.st)) == cudaErrorNotReady &&
+                   now_ms() - t0 < kHelperWaitMs)
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
+            if (q != cudaSuccess) tp_unknown(d.id, l.il, m, q == cudaErrorNotReady ? "no end in time" : "an error at its end");
+            ok = ok && rec;
+        }
+        size_t bad_part = 0, bad_whole = 0, bad_guard = 0;
+        if (ok) {
+            for (size_t i = 0; i < u; ++i) {
+                bad_part += back[kGuard + i] != want[i];
+                bad_whole += back[u + 3 * kGuard + i] != want[i];
+            }
+            for (size_t i = 0; i < kGuard; ++i)
+                bad_guard += (back[i] != 0xA5) + (back[kGuard + u + i] != 0xA5) + (back[u + 2 * kGuard + i] != 0xA5) +
+                             (back[2 * u + 3 * kGuard + i] != 0xA5);
+        } else
+            (void) cudaGetLastError();
+        if (dv != nullptr) cudaFree(dv);
+        if (back != nullptr) cudaFreeHost(back);
+        if (stage != nullptr) cudaFreeHost(stage);
+        if (ev != nullptr) cudaEventDestroy(ev);
+        if (!ok) return fail("a CUDA error");
+        std::string fmt;
+        for (int r = 0; r < 3; ++r) fmt += std::string(r ? "/" : "") + gg::type_name(gg::expert_type(l.lay, r));
+        if (bad_part + bad_whole + bad_guard > 0) {
+            std::fprintf(stderr, "ds4: TP check: flow copies %s (layer %d, member %d takes %d of %d) FAILED: %zu part bytes, "
+                                 "%zu whole-staging bytes, %zu guard bytes differ (DS4_FLOW_TP)\n",
+                         fmt.c_str(), l.il, m, x.ffn, g.ff, bad_part, bad_whole, bad_guard);
+            return fail("bytes differ");
+        }
+        std::fprintf(stderr, "ds4: TP check: flow copies %s (layer %d, member %d takes %d of %d): part and whole staging "
+                             "the member's blob byte for byte, guards intact (DS4_FLOW_TP)\n",
+                     fmt.c_str(), l.il, m, x.ffn, g.ff);
+        return true;
+    }
     // a TP check's work without a clean end: what it may still read is the model's - the layer's weights, the expert
     // slots, the device's stream - and a failed load's teardown frees all of it, so there is none: the line, then the
     // process ends at once (exit 3: the device's state unknown - whoever runs the engine loads nothing more on these
@@ -7354,6 +7471,25 @@ struct Model::Impl {
         if (want.empty()) {
             err = "TP check: no split layer to check";
             return false;
+        }
+        bool flow = false;   // (DS4_FLOW_TP: a split layer's member on the flow)
+        for (const Layer& l : L)
+            if (split(l))
+                for (int m = 0; m < l.nm; ++m) {
+                    const int di = member(l, m).dev;
+                    flow = flow || ((size_t) di < chunks.size() && chunks[(size_t) di] != nullptr && chunks[(size_t) di]->flow);
+                }
+        if (flow) {   // (each format and rotation, each member: the first split layer of the key)
+            int n = 0;
+            for (const std::string& key : want)
+                for (const Layer& l : L) {
+                    if (!split(l) || format(l) + " " + std::to_string(l.il % l.nm) != key) continue;
+                    for (int m = 0; m < l.nm; ++m, ++n)
+                        if (!tp_flow_member(l, m, err)) return false;
+                    break;
+                }
+            std::fprintf(stderr, "ds4: TP check: the flow's copies passed (%d of the formats', rotations' and members' "
+                                 "copies) (DS4_FLOW_TP)\n", n);
         }
         std::fprintf(stderr, "ds4: TP check passed (%zu expert formats and rotations, all the split layers have) "
                              "(DS4_TP_CHECK)\n", seen.size());
