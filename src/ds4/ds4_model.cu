@@ -4979,6 +4979,25 @@ struct Model::Impl {
         }
         return out;
     }
+    // the CPU lane's workers' idle spin before they sleep on their pool's condition variable, us: by default 20 ms,
+    // through a token's layers; DS4_LANE_SPIN_US=<us> another - a whole number 0 .. 1000000, its digits only (no sign,
+    // no spaces), else the default (bad: set, not such a number).  A spin keeps every worker's core busy between the
+    // layers that hand the lane experts - on a die the CPU shares with a GPU (an APU) that heat and power can clock
+    // down the lane and the GPU; a short spin sleeps them, a layer then wakes them.  No output changes: every row is
+    // one job's sum, whichever thread runs it, whenever it wakes
+    static int lane_spin_us(bool* bad = nullptr) {
+        const char* v = std::getenv("DS4_LANE_SPIN_US");
+        const size_t len = v == nullptr ? 0 : std::strlen(v);
+        bool ok = len >= 1 && len <= 7;
+        long n = 0;
+        for (size_t i = 0; ok && i < len; ++i) {
+            ok = v[i] >= '0' && v[i] <= '9';
+            n = n * 10 + (v[i] - '0');
+        }
+        ok = ok && n <= 1000000;
+        if (bad != nullptr) *bad = v != nullptr && !ok;
+        return ok ? (int) n : 20000;
+    }
     std::vector<std::unique_ptr<Pool>> pools_for(const LaneCfg& c) const {
         std::vector<std::unique_ptr<Pool>> out;
         const int svc = !cores.empty() && !cores[0].empty() ? cores[0][0] : -1;
@@ -4987,7 +5006,7 @@ struct Model::Impl {
             if (X == 0) v.erase(std::remove(v.begin(), v.end(), svc), v.end());   // (the service thread's)
             int nw = (int) v.size();
             if (o.cpu_threads > 0) nw = std::max(X == 0 ? 0 : 1, std::min(nw, o.cpu_threads / NH - (X == 0 ? 1 : 0)));
-            out.push_back(std::make_unique<Pool>(nw, v, 20000));   // spin through a token's layers (20 ms)
+            out.push_back(std::make_unique<Pool>(nw, v, lane_spin_us()));
         }
         return out;
     }
@@ -5001,6 +5020,14 @@ struct Model::Impl {
                 if (cfgs[i].name == v) pick = i;
         lane_name = cfgs[pick].name;
         pools = pools_for(cfgs[pick]);
+        bool spin_bad = false;
+        const int spin = lane_spin_us(&spin_bad);
+        if (spin_bad)
+            std::fprintf(stderr, "ds4: CPU lane: DS4_LANE_SPIN_US=%s is not a whole number of us 0 .. 1000000 - "
+                                 "ignored, its workers spin %d us idle\n", std::getenv("DS4_LANE_SPIN_US"), spin);
+        else if (std::getenv("DS4_LANE_SPIN_US") != nullptr)
+            std::fprintf(stderr, "ds4: CPU lane: its workers spin %d us idle before they sleep (DS4_LANE_SPIN_US)\n",
+                         spin);
         (void) gg::mx_tier();   // (measured here, not on the first token)
         if (o.verbose) {
             int nthr = 0;
