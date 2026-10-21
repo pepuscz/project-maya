@@ -7135,7 +7135,12 @@ struct Model::Impl {
         const Layer& xm = member(l, m);
         Dev& d = devs[(size_t) xm.dev];
         const int D = g.dim, FF = xm.ffn;
-        cudaSetDevice(d.id);
+        if (cudaSetDevice(d.id) != cudaSuccess) {   // (before anything is made or enqueued: an ordinary failure)
+            (void) cudaGetLastError();
+            err = "TP check: CUDA" + std::to_string(d.id) + " (layer " + std::to_string(l.il) + " member " +
+                  std::to_string(m) + "): cudaSetDevice failed";
+            return false;
+        }
         struct In {   // (the uploads' sources, freed after a clean end only)
             std::vector<float> x;
             unsigned long long p[kPicks] = {};
@@ -7289,10 +7294,10 @@ struct Model::Impl {
             if (!shared_host(l, x, want_s, err)) return false;
             auto compare = [&](const std::vector<float>& want, const std::vector<float>& got, double& worst_rel) {
                 double mx = 0, worst = 0;
-                bool finite = true;
+                bool finite = true;   // (both sides: a reference's NaN or Inf would pass any std::max bound unseen)
                 for (int j = 0; j < D; ++j) mx = std::max(mx, (double) std::fabs(want[(size_t) j]));
                 for (int j = 0; j < D; ++j) {
-                    finite = finite && std::isfinite(got[(size_t) j]);
+                    finite = finite && std::isfinite(got[(size_t) j]) && std::isfinite(want[(size_t) j]);
                     worst = std::max(worst, std::fabs((double) want[(size_t) j] - (double) got[(size_t) j]));
                 }
                 worst_rel = mx > 0 ? worst / mx : worst;
