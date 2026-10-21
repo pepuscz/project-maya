@@ -644,6 +644,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                      s.experts ? 100.0 * (double) s.cpu_experts / (double) s.experts : 0.0);
         if (d_off > 0) std::fprintf(stderr, "maya ds4 serve: drafts %lld of %lld kept; %s\n", d_acc, d_off,
                                     per_position(s_dec, s).c_str());
+        if (s.rc_maps + s.rc_fails + s.rc_abandoned + s.rc_hits > 0 || std::getenv("DS4_HELPER_RECENT") != nullptr)
+            std::fprintf(stderr, "maya ds4 serve: helper recent slots: %lld picks served, %lld mapped, %lld let go, "
+                                 "%lld fills not done, %lld left unmapped (this request)\n",
+                         (long long) (s.rc_hits - s_dec.rc_hits), (long long) (s.rc_maps - s_dec.rc_maps),
+                         (long long) (s.rc_evicts - s_dec.rc_evicts), (long long) (s.rc_fails - s_dec.rc_fails),
+                         (long long) (s.rc_abandoned - s_dec.rc_abandoned));
         prof_line(s_dec, s);   // DS4_PROF: this request's decode (the CLI's line, a request at a time)
         m.save_profile();
     }
