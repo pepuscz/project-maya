@@ -631,6 +631,7 @@ struct Chunk {
         const uint8_t* src[3] = {nullptr, nullptr, nullptr};   // where its gate / up / down (its parts) lie once read
         const uint8_t* ram = nullptr;                  // its RAM-tier blob, copied into staging (not pinned there)
         uint8_t* keep = nullptr;                       // (layer-major) its layer-cache slot: what is read kept there
+        bool cache = false;                            // (DS4_FLOW_KEEP_GB) its file reads through the page cache
         int64_t after = -1;                            // (layer-major) the items up to this one read first
         std::atomic<int> left{0};                      // parts still being read
         std::atomic<bool> bad{false};
@@ -655,6 +656,9 @@ struct Chunk {
     uint64_t n_batch = 0;
     double wait_ms = 0;                      // the compute waiting for a read
     uint64_t it_file = 0, it_ram = 0, it_spec = 0, it_spec_unused = 0;
+    // (DS4_FLOW_KEEP_GB) a run's items read through the page cache for the decode: how many, their experts' whole
+    // bytes (each member of a group the same experts), the bytes this device's reads of them asked for
+    uint64_t keep_n = 0, keep_whole = 0, keep_read = 0;
     uint64_t io_d0 = 0, io_b0 = 0;           // io's unbuffered / buffered bytes when the run started
     bool buffered = false;                   // the run's reads all through the page cache (a short run: run_dev_chunks)
     // layer-major (a run of several chunks, every layer on this device): the layers one after another, each through
@@ -989,6 +993,7 @@ struct Model::Impl {
     unsigned mk_seq = 0;
     int d_dev = 0;                    // the drafter's first block's device
     std::vector<int> draft_vram;      // DS4_DRAFT_VRAM: each block's VRAM experts at most (draft_caps; empty: all)
+    uint64_t keep_layer = 0;          // DS4_FLOW_KEEP_GB: a layer's bytes a prompt's last chunk keeps (flow_keep; 0: off)
     bool spec_win = false;            // the window being run is a draft's verification (layer() keeps backups)
     float* h_taps = nullptr;          // pinned [kWin][targets][dim]: the last window's taps
     cudaEvent_t ev_seed = nullptr;    // the drafter's seeding read h_taps: the next window's taps wait for it
@@ -3643,7 +3648,7 @@ struct Model::Impl {
             j = IoQueue::Job{};
             const os::fd_t pf = pk.pfds.empty() ? os::kBadFd : pk.pfds[(size_t) l.mx_file[r]];
             j.fd = pf != os::kBadFd ? pf : pk.fds[(size_t) l.mx_file[r]];
-            j.dfd = pk.dfds.empty() || c.buffered ? os::kBadFd : pk.dfds[(size_t) l.mx_file[r]];
+            j.dfd = pk.dfds.empty() || c.buffered || it.cache ? os::kBadFd : pk.dfds[(size_t) l.mx_file[r]];
             j.off = l.mx_off[r] + (uint64_t) it.e * l.mx_stride[r] + mx_read_off(l, it.mi, r);
             j.len = mx_read_len(l, it.mi, r);
             j.dst = sb;
@@ -3705,7 +3710,7 @@ struct Model::Impl {
             if (member(L0, m).dev == c.dev) return m;
         return 0;
     }
-    void flow_push(Chunk& c, const Layer& l, int mi, int k, int e, int v) {
+    void flow_push(Chunk& c, const Layer& l, int mi, int k, int e, int v, bool cache = false) {
         c.items.emplace_back();
         Chunk::Item& it = c.items.back();
         it.il = l.il;
@@ -3713,6 +3718,7 @@ struct Model::Impl {
         it.k = k;
         it.e = e;
         it.v = v;
+        it.cache = cache;
         const bool in_ram = !l.ram.empty() && l.ram[(size_t) e] >= 0;
         if (in_ram && ram_pinned) {   // (DMA'd from where it lies)
             const uint8_t* p = ram_slots[(size_t) l.ram[(size_t) e]];
@@ -3817,10 +3823,54 @@ struct Model::Impl {
             const int v = fit(c, i).v;
             if (b[(size_t) v + 1] == b[(size_t) v]) ++c.it_spec_unused;
         }
+        const std::vector<char> keep = flow_keep_pick(c, k, l, vs, b);
         for (int e : l.host_list) {   // (index order: their virtual slots ascending)
             const int v = vs[e];
-            if (v >= l.pv_n + c.n_spec && b[(size_t) v + 1] > b[(size_t) v]) flow_push(c, l, mi, k, e, v);
+            if (v < l.pv_n + c.n_spec || b[(size_t) v + 1] <= b[(size_t) v]) continue;
+            const bool kept = !keep.empty() && keep[(size_t) e] != 0;
+            flow_push(c, l, mi, k, e, v, kept);
+            if (!kept) continue;
+            ++c.keep_n;
+            c.keep_whole += keep_whole(l);
+            for (int r = 0; r < 3; ++r) c.keep_read += mx_read_len(l, mi, r);
         }
+    }
+    // (DS4_FLOW_KEEP_GB) which of chunk k's routed rest of layer l - flow_rest's items, after the likely ones flow_spec
+    // queued (and may have read already: never those) - are read through the page cache, so the decode after the prompt
+    // finds them there: on the run's last chunk, when its reads go past the cache (more than one GPU, and the layer's
+    // gate, up and down files each an unbuffered descriptor - one that open_direct could not open reads through the
+    // cache already: nothing to keep there), those the decode would read from the files (not the helper's, not the RAM
+    // tier's), the most picked by the chunk's rows first (ties: the lower expert), whole experts while the layer's share
+    // (keep_layer) lasts.  Each member of a group decides the same from the same routing.  Empty: none
+    std::vector<char> flow_keep_pick(const Chunk& c, int k, const Layer& l, const int* vs, const std::vector<int>& b) const {
+        std::vector<char> keep;
+        if (keep_layer == 0 || l.mtp || k + 1 != (int) c.fl_T.size() || c.buffered || pk.dfds.empty() || c.lc != nullptr)
+            return keep;
+        for (int r = 0; r < 3; ++r)
+            if ((size_t) l.mx_file[r] >= pk.dfds.size() || pk.dfds[(size_t) l.mx_file[r]] == os::kBadFd) return keep;
+        std::vector<std::pair<int, int>> cand;   // (rows that picked it, expert)
+        for (int e : l.host_list) {
+            const int v = vs[e], n = b[(size_t) v + 1] - b[(size_t) v];
+            if (v < l.pv_n + c.n_spec || n <= 0 || helper_owned(l, e) || (!l.ram.empty() && l.ram[(size_t) e] >= 0))
+                continue;
+            cand.push_back({n, e});
+        }
+        std::sort(cand.begin(), cand.end(), [](const std::pair<int, int>& x, const std::pair<int, int>& y) {
+            return x.first != y.first ? x.first > y.first : x.second < y.second;
+        });
+        keep.assign((size_t) l.n_exp, 0);
+        const uint64_t whole = keep_whole(l);
+        uint64_t used = 0;
+        for (const auto& x : cand) {
+            if (used + whole > keep_layer) break;
+            keep[(size_t) x.second] = 1;
+            used += whole;
+        }
+        return keep;
+    }
+    // an expert's bytes in the model's files (its gate, up and down): what the page cache holds of it once kept
+    uint64_t keep_whole(const Layer& l) const {
+        return (uint64_t) mx_part_bytes(l, 0) + (uint64_t) mx_part_bytes(l, 1) + (uint64_t) mx_part_bytes(l, 2);
     }
     // the next (chunk, layer) of the device after (k, il) in the run's order that streams experts (false: none) - a
     // long prompt's skip leaves out its early chunks' layers from Run::yoco on (kv_only there: no experts)
@@ -4400,6 +4450,35 @@ struct Model::Impl {
         }
         return true;
     }
+    // DS4_FLOW_KEEP_GB=x, GB (a decimal number, 0 .. 1024; unset or 0: off - every read as before): on more than one GPU
+    // the flow reads past the page cache (DS4_FLOW_BUFFERED), so the CPU lane's experts a prompt read are gone again when
+    // its decode reads them; with x a prompt's last chunk reads its most-picked ones through the cache instead
+    // (flow_keep_pick: x over the trunk's layers a layer, whole experts) - the same bytes into the same staging, only
+    // which pages stay in RAM after it differs.  A share is the most kept, not what stays: clean pages, the kernel's to
+    // take back.  Anything else: the load fails
+    bool flow_keep(std::string& err) {
+        keep_layer = 0;
+        const char* v = std::getenv("DS4_FLOW_KEEP_GB");
+        if (v == nullptr) return true;
+        int dots = 0, digits = 0;
+        bool ok = true;
+        for (const char* q = v; ok && *q != '\0'; ++q) {
+            if (*q == '.') ok = ++dots == 1;
+            else if (*q >= '0' && *q <= '9') ++digits;
+            else ok = false;
+        }
+        const double gb = ok && digits > 0 ? std::atof(v) : -1.0;
+        if (!(gb >= 0.0 && gb <= 1024.0)) {
+            err = std::string("DS4_FLOW_KEEP_GB=") + v + ": not a number of GB, 0 .. 1024";
+            return false;
+        }
+        keep_layer = (uint64_t) std::floor(gb * 1e9 / (double) g.nl);
+        if (keep_layer > 0)
+            std::fprintf(stderr, "ds4: DS4_FLOW_KEEP_GB %g: a prompt's last chunk reads its most-picked CPU-lane experts (after "
+                                 "its likely ones; not the helper's) through the page cache for the decode, %.3f GB a layer "
+                                 "at most\n", gb, (double) keep_layer / 1e9);
+        return true;
+    }
     // group gi's VRAM experts in budget, its tightest member's room (ucount's bytes a slot) less a mixed-precision
     // layer's (place_experts puts every one of those first): the drafter's experts first (every draft uses its blocks),
     // each block up to vram_cap; then every trunk layer the same share of its experts; then what the floors left, whole
@@ -4469,6 +4548,7 @@ struct Model::Impl {
             if (commit_charged(d)) room = commit_room();
         const double room0 = room;
         if (!draft_caps(err)) return false;
+        if (!flow_keep(err)) return false;
         // per group: what its tightest member has left (ucount: each member's bytes a slot), shared out (share_budget)
         for (size_t gi = 0; gi < groups.size(); ++gi) {
             double budget = 1e300;
@@ -9841,6 +9921,7 @@ struct Model::Impl {
             c.spec_k = c.spec_il = -1;
             c.wait_ms = 0;
             c.it_file = c.it_ram = c.it_spec = c.it_spec_unused = c.it_lc = 0;
+            c.keep_n = c.keep_whole = c.keep_read = 0;
             c.lc_il = -1;
             c.lc_used = 0;
             c.lc_first = c.lc_chk = 0;
@@ -10795,6 +10876,16 @@ struct Model::Impl {
                              (unsigned long long) c.it_spec_unused, c.wait_ms);
             }
         }
+        if (keep_layer > 0)   // (DS4_FLOW_KEEP_GB: what the run's last chunk kept, each device's own reads of it)
+            for (size_t di = 0; di < chunks.size(); ++di) {
+                const Chunk& c = *chunks[di];
+                if (!c.flow) continue;
+                std::fprintf(stderr,
+                             "ds4 prompt keep, CUDA%d: %d tokens, %llu experts of the last chunk read through the page "
+                             "cache for the decode (%.3f GB of whole experts; this device's reads of them %.3f GB)\n",
+                             devs[di].id, n, (unsigned long long) c.keep_n, (double) c.keep_whole / 1e9,
+                             (double) c.keep_read / 1e9);
+            }
         if (pm.on && run.T.size() == 1) {   // (the picks' spread for pick_path: the CPU-lane experts this run picked)
             bool tp = false;
             for (const Layer& l : L) tp = tp || l.nm > 1;
