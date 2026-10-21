@@ -3315,15 +3315,7 @@ struct Model::Impl {
                 c.ring_n = std::max(Chunk::kParts, (int) ((mb << 20) / stride) / Chunk::kParts * Chunk::kParts);
                 if (!dalloc(d, c.ring, (size_t) c.ring_n * stride, err)) return false;
             }
-            // (DS4_FLOW_TP with DS4_TP_GGUF_UNEVEN: the whole down of the device's largest split layer, the flow's copies
-            //  of a member's part through it - flow_copy)
-            const bool flow_tp = std::getenv("DS4_FLOW_TP") != nullptr && std::atoi(std::getenv("DS4_FLOW_TP")) != 0;
-            size_t down_b = 0;
-            if (tp_uneven && flow_tp && file_experts)
-                for (const Layer& l : L)
-                    if (!l.mtp && l.nm > 1 && l.lay.fmt == gg::kFmtMXFP4)
-                        for (int m = 0; m < l.nm; ++m)
-                            if (member(l, m).dev == (int) di) down_b = std::max(down_b, mx_part_bytes(l, 2));
+            const size_t down_b = flow_down_bytes((int) di);   // (the flow's down scratch, where it takes one)
             if (down_b > 0 && !dalloc(d, c.down, down_b, err)) return false;
             CK(cudaStreamCreateWithFlags(&c.cs, cudaStreamNonBlocking));
             for (int i = 0; i < Chunk::kParts; ++i) {
@@ -3660,11 +3652,25 @@ struct Model::Impl {
         }
         return nj;
     }
+    // (DS4_FLOW_TP with DS4_TP_GGUF_UNEVEN) the down scratch device di's flow copies a member's part through: the whole
+    // down of its largest split layer.  0 - no scratch - for one GPU's layers, a load without the flow for its groups,
+    // or an even split's members (DS4_FLOW_TP without the knob), whose down part keeps its 2D copy (flow_copy)
+    size_t flow_down_bytes(int di) const {
+        const bool flow_tp = std::getenv("DS4_FLOW_TP") != nullptr && std::atoi(std::getenv("DS4_FLOW_TP")) != 0;
+        size_t b = 0;
+        if (tp_uneven && flow_tp && file_experts)
+            for (const Layer& l : L)
+                if (!l.mtp && l.nm > 1 && l.lay.fmt == gg::kFmtMXFP4)
+                    for (int m = 0; m < l.nm; ++m)
+                        if (member(l, m).dev == di) b = std::max(b, mx_part_bytes(l, 2));
+        return b;
+    }
     // an item's staged matrices into ring slot dst as member mi's part of the expert (laid out as its hlay): gate / up
     // mx_read_len bytes - from src as the read left them (its rows only), or from whole staging (a copy's NH parts:
     // every row) at the member's read offset in it; the down whole in one copy into `down` (the device's scratch), then
     // its blocks of the member's columns [ff0, ff0 + ffn) of every row gathered into the slot on the same stream - a 2D
-    // copy of the rows instead costs ~35 ms an expert against ~0.7 (192300Z: per-row transfers).  Alone (nm 1): each
+    // copy of the rows instead costs ~35 ms an expert against ~0.7 (192300Z: per-row transfers).  No scratch (an even
+    // split's members: flow_down_bytes): the member's rows of the down as a 2D copy, as before.  Alone (nm 1): each
     // matrix whole, as staged
     bool flow_copy(const Layer& l, int mi, const uint8_t* const* src, bool whole, uint8_t* dst, uint8_t* down,
                    cudaStream_t s) const {
@@ -3678,9 +3684,10 @@ struct Model::Impl {
             const int t2 = gg::expert_type(l.lay, 2);
             const size_t dr = gg::type_row_bytes(t2, g.ff), dh = gg::type_row_bytes(t2, x.ffn),
                          d0 = gg::type_row_bytes(t2, x.ff0);
-            if (down == nullptr ||
-                cudaMemcpyAsync(down, src[2], (size_t) g.dim * dr, cudaMemcpyHostToDevice, s) != cudaSuccess)
-                return false;
+            if (down == nullptr)
+                return cudaMemcpy2DAsync(dst + lay.trellis[2], dh, src[2] + d0, dr, dh, (size_t) g.dim,
+                                         cudaMemcpyHostToDevice, s) == cudaSuccess;
+            if (cudaMemcpyAsync(down, src[2], (size_t) g.dim * dr, cudaMemcpyHostToDevice, s) != cudaSuccess) return false;
             gather_cols(down, dr, d0, dh, g.dim, dst + lay.trellis[2], s);
             return cudaGetLastError() == cudaSuccess;
         }
