@@ -1074,6 +1074,10 @@ struct Model::Impl {
     cudaStream_t helper_st = nullptr;
     unsigned long long* helper_plan = nullptr;    // device [kWin][kPicks]: a request's picks it holds (0: not its)
     float *helper_w = nullptr, *helper_x = nullptr, *helper_h = nullptr;   // device: their weights, the tokens' x, h
+    // (a window of T > 1: its picks grouped by expert, each read once for its tokens - gg::win_experts' scratch)
+    float *helper_hw = nullptr, *helper_part = nullptr;                    // [kWin * kPicks][n_ff], [..][dim]
+    unsigned long long* helper_grp_ptr = nullptr;                          // [kWin * kPicks]
+    int *helper_grp_start = nullptr, *helper_grp_ent = nullptr, *helper_n_groups = nullptr;
     std::vector<void*> helper_allocs;             // (its device memory: the pool, its scratch, the layers' tables)
     unsigned* helper_flags = nullptr;             // host-mapped: [kRing] took, [kRing] answered (the seq), then quit
     float* helper_res = nullptr;                  // host-mapped [kRing][kWin][dim]: a token's weighted sum of its picks
@@ -6199,6 +6203,13 @@ struct Model::Impl {
         helper_x = (float*) dev((size_t) kWin * D * 4);
         helper_h = (float*) dev((size_t) kPicks * FF * 4);
         ok = ok && cudaMemset(helper_h, 0, (size_t) kPicks * FF * 4) == cudaSuccess;   // (a skipped pick's row: quantized too)
+        const size_t WE = (size_t) kWin * kPicks;
+        helper_hw = (float*) dev(WE * FF * 4);
+        helper_part = (float*) dev(WE * D * 4);
+        helper_grp_ptr = (unsigned long long*) dev(WE * 8);
+        helper_grp_start = (int*) dev((WE + 1) * 4);
+        helper_grp_ent = (int*) dev(WE * 4);
+        helper_n_groups = (int*) dev(4);
         void* m = nullptr;
         if (ok && !helper_fail("flags") &&
             cudaHostAlloc(&m, 4096 + (size_t) kRing * kWin * D * 4, cudaHostAllocMapped | cudaHostAllocPortable) ==
@@ -6329,7 +6340,10 @@ struct Model::Impl {
     // stream: it takes the request once the device publishes it, then the expert kernels a token at a time (its plan
     // rows, the CPU lane's weighted sum's form: no shared expert, no other part) into helper_res, then its flag.  The
     // current device is kept; a CUDA error: helper_dead (the service thread's wait ends, the CPU lane computes them)
-    void helper_enqueue(const Layer& l, int slot, unsigned sq, int T) {
+    // A window of T > 1 (a draft's verify) goes through gg::win_experts instead - its picks grouped by expert, each
+    // read once for its tokens, every token's sum the per-token kernels' bit for bit (WinArgs' contract; the load
+    // check compares the two) - unless `tokens` (the check's per-token run)
+    void helper_enqueue(const Layer& l, int slot, unsigned sq, int T, bool tokens = false) {
         int cur = 0;
         cudaGetDevice(&cur);
         const int e0 = gg::launch_errors();
@@ -6338,7 +6352,38 @@ struct Model::Impl {
             const size_t D = (size_t) g.dim;
             helper_take(reqs + slot, sq, l.k_exp, g.dim, l.helper_tab, l.n_exp, helper_plan, helper_w, helper_x,
                         helper_flags + slot, helper_flags + 2 * kRing, helper_st);
-            for (int t = 0; t < T; ++t) {
+            if (T > 1 && !tokens) {
+                gf::MoeWin mw;
+                mw.plan_ptr = helper_plan;
+                mw.T = T;
+                mw.k = l.k_exp;
+                mw.grp_ptr = helper_grp_ptr;
+                mw.grp_start = helper_grp_start;
+                mw.grp_ent = helper_grp_ent;
+                mw.n_groups = helper_n_groups;
+                gf::moe_win_group(mw, helper_st);
+                x3::WinArgs wa;
+                wa.grp_ptr = helper_grp_ptr;
+                wa.grp_start = helper_grp_start;
+                wa.grp_ent = helper_grp_ent;
+                wa.n_groups = helper_n_groups;
+                wa.plan_ptr = helper_plan;
+                wa.plan_w = helper_w;
+                wa.x = helper_x;
+                wa.x_stride = D;
+                wa.h = helper_hw;
+                wa.part = helper_part;
+                wa.out = helper_res + (size_t) slot * kWin * D;
+                wa.out_stride = D;
+                wa.lay = l.lay;
+                wa.T = T;
+                wa.k = l.k_exp;
+                wa.n_embd = g.dim;
+                wa.n_ff = g.ff;
+                wa.limit = g.lim;   // (no CPU part, no shared expert, no wait: the helper's sums alone)
+                ok = gg::win_experts(wa, helper_st);
+            }
+            for (int t = 0; ok && (T == 1 || tokens) && t < T; ++t) {
                 x3::MoeArgs ma;
                 ma.plan_ptr = helper_plan + (size_t) t * kPicks;
                 ma.plan_w = helper_w + (size_t) t * kPicks;
@@ -6350,9 +6395,11 @@ struct Model::Impl {
                 gg::moe_gate_up(ma, helper_x + (size_t) t * D, helper_h, helper_st);
                 gg::moe_down(ma, helper_h, nullptr, helper_res + ((size_t) slot * kWin + (size_t) t) * D, helper_st);
             }
-            signal_seq(helper_flags + kRing + slot, sq, helper_st);
-            const cudaError_t ce = cudaGetLastError();
-            ok = ce == cudaSuccess && gg::launch_errors() == e0;
+            // (its answer's flag only after every launch went in: a failed one leaves the flag down, so the service
+            //  thread's wait ends on helper_dead and the CPU lane computes the picks - never a stale sum)
+            ok = ok && cudaGetLastError() == cudaSuccess && gg::launch_errors() == e0;
+            if (ok) signal_seq(helper_flags + kRing + slot, sq, helper_st);
+            ok = ok && cudaGetLastError() == cudaSuccess;
         }
         cudaSetDevice(cur);
         if (ok) return;
@@ -6458,23 +6505,28 @@ struct Model::Impl {
             std::vector<int> own, other;   // (experts it holds; one it does not)
             for (int e = 0; e < l.n_exp; ++e) (helper_owned(l, e) ? own : other).push_back(e);
             if (own.empty()) continue;
-            // token 0: one pick of its own, weight 1, at plan position 0; token 1: two of its own at positions 1 and
-            // l.k_exp - 1 (0.6, 0.4), one it does not hold between them (its weight must not count)
-            const int T = 2, k = l.k_exp;
+            // a window of 4 tokens (decode's T = 1 runs H's per-token kernels; a draft's verify window the grouped
+            // ones): token 0 one pick of its own (weight 1, position 0); token 1 two of its own (positions 1 and k - 1,
+            // 0.6 / 0.4) and one it does not hold between them (its weight must not count); token 2 the experts of
+            // tokens 0 and 1 again (0.7, 0.3: groups of two); token 3 one more (0.9). Run grouped, then per token on
+            // the next seq of the same slot: the two bit for bit, the grouped sums against the CPU lane's
+            const int T = 4, k = l.k_exp;
+            auto own_at = [&](size_t i) { return own[std::min(i, own.size() - 1)]; };
             Req& r = reqs[slot];
             std::memset((void*) &r, 0, sizeof r);
             for (int t = 0; t < T; ++t)
                 for (int i = 0; i < kPicks; ++i) r.ids[t][i] = -1;
-            r.ids[0][0] = own[0];
-            r.w[0][0] = 1.0f;
-            r.ids[1][1] = own[own.size() > 1 ? 1 : 0];
-            r.w[1][1] = 0.6f;
-            r.ids[1][k - 1] = own[own.size() > 2 ? 2 : 0];
-            r.w[1][k - 1] = 0.4f;
-            if (!other.empty() && k > 3) {
-                r.ids[1][2] = other[0];
-                r.w[1][2] = 0.5f;
-            }
+            auto pick = [&](int t, int i, int e, float w) {
+                r.ids[t][i] = e;
+                r.w[t][i] = w;
+            };
+            pick(0, 0, own_at(0), 1.0f);
+            pick(1, 1, own_at(1), 0.6f);
+            pick(1, k - 1, own_at(2), 0.4f);
+            if (!other.empty() && k > 3) pick(1, 2, other[0], 0.5f);
+            pick(2, std::min(3, k - 1), own_at(0), 0.7f);
+            pick(2, 0, own_at(1), 0.3f);
+            pick(3, 2 % k, own_at(2), 0.9f);
             for (int t = 0; t < T; ++t) {
                 double ss = 0;
                 for (int i = 0; i < E; ++i) {
@@ -6484,18 +6536,29 @@ struct Model::Impl {
                 for (int i = 0; i < E; ++i) r.x[t][i] = (float) (r.x[t][i] / std::sqrt(ss / E));
             }
             r.T = T;
-            helper_flags[slot] = helper_flags[kRing + slot] = 0u;
-            std::atomic_thread_fence(std::memory_order_seq_cst);
-            *(volatile unsigned*) &r.seq = seq;   // (published as the device would: then the take may read it)
-            helper_enqueue(l, slot, seq, T);
-            const double t0 = now_ms();
-            while (*(volatile unsigned*) &helper_flags[kRing + slot] != seq && now_ms() - t0 < kHelperWaitMs &&
-                   !helper_dead.load())
-                std::this_thread::sleep_for(std::chrono::microseconds(50));
-            const bool answered = *(volatile unsigned*) &helper_flags[kRing + slot] == seq &&
-                                  *(volatile unsigned*) &helper_flags[slot] == seq;
-            std::atomic_thread_fence(std::memory_order_acquire);
-            // the CPU lane's sums of the same picks it holds
+            auto send = [&](unsigned sq, bool tokens) {   // (published as the device would: then the take may read it)
+                helper_flags[slot] = helper_flags[kRing + slot] = 0u;
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                *(volatile unsigned*) &r.seq = sq;
+                helper_enqueue(l, slot, sq, T, tokens);
+                const double t0 = now_ms();
+                while (*(volatile unsigned*) &helper_flags[kRing + slot] != sq && now_ms() - t0 < kHelperWaitMs &&
+                       !helper_dead.load())
+                    std::this_thread::sleep_for(std::chrono::microseconds(50));
+                const bool got = *(volatile unsigned*) &helper_flags[kRing + slot] == sq &&
+                                 *(volatile unsigned*) &helper_flags[slot] == sq;
+                std::atomic_thread_fence(std::memory_order_acquire);
+                return got;
+            };
+            const float* res = helper_res + (size_t) slot * kWin * (size_t) E;
+            bool answered = send(seq, false);
+            std::vector<float> grouped;   // (read only once its answer is in: a late kernel may still write the rows)
+            if (answered) grouped.assign(res, res + (size_t) T * E);
+            int64_t win_same = 0;
+            if (answered && (answered = send(seq + kRing, true)))
+                for (size_t j = 0; j < (size_t) T * E; ++j) win_same += std::memcmp(&grouped[j], &res[j], 4) == 0;
+            const bool win_ok = answered && win_same == (int64_t) T * E;
+            // the CPU lane's sums of the same picks it holds, against the grouped ones
             double worst = 0, worst_rel = 0;
             int64_t same = 0, outs = 0;
             bool finite = true;
@@ -6511,7 +6574,7 @@ struct Model::Impl {
                     cpu_experts(l, &r.x[t][0], ents, (size_t) kMaxDim);
                     for (int j = 0; j < E; ++j) want[(size_t) j] += r.w[t][i] * c_yd[(size_t) j];
                 }
-                const float* got = helper_res + ((size_t) slot * kWin + (size_t) t) * (size_t) E;
+                const float* got = grouped.data() + (size_t) t * E;
                 double mx = 0;
                 for (int j = 0; j < E; ++j) mx = std::max(mx, (double) std::fabs(want[(size_t) j]));
                 for (int j = 0; j < E; ++j) {
@@ -6523,13 +6586,17 @@ struct Model::Impl {
                     ++outs;
                 }
             }
-            const bool ok = answered && finite && worst_rel <= kHelperTol;
+            const bool ok = answered && finite && worst_rel <= kHelperTol && win_ok;
             all_ok = all_ok && ok;
-            std::fprintf(stderr, "ds4: helper check: %s (layer %d): CUDA%d vs the CPU lane, 2 tokens, 3 picks of its own "
-                                 "and %s: %s%lld of %lld outputs bit-identical, max |diff| %.3g (%.3g of the largest)\n",
-                         fmt.c_str(), l.il, helper_id, !other.empty() && k > 3 ? "one not" : "none other",
-                         ok ? "" : !answered ? "NO ANSWER - " : !finite ? "NOT FINITE - " : "TOO FAR - ", (long long) same,
-                         (long long) outs, worst, worst_rel);
+            std::fprintf(stderr, "ds4: helper check: %s (layer %d): CUDA%d vs the CPU lane, %d tokens, 6 picks of its "
+                                 "own and %s: %s%lld of %lld outputs bit-identical, max |diff| %.3g (%.3g of the largest)\n",
+                         fmt.c_str(), l.il, helper_id, T, !other.empty() && k > 3 ? "one not" : "none other",
+                         !answered ? "NO ANSWER - " : !finite ? "NOT FINITE - " : worst_rel > kHelperTol ? "TOO FAR - " : "",
+                         (long long) same, (long long) outs, worst, worst_rel);
+            std::fprintf(stderr, "ds4: helper check: %s (layer %d): CUDA%d's window of %d grouped against per token: "
+                                 "%s%lld of %lld outputs bit-identical\n",
+                         fmt.c_str(), l.il, helper_id, T, !answered ? "NO ANSWER - " : win_ok ? "" : "NOT IDENTICAL - ",
+                         (long long) win_same, (long long) T * E);
             // the slot as decode expects it, once the stream is done with it (unanswered: told to quit first, waited
             // for kHelperIdleMs; still busy - its take may still read the slot - the slot is left alone)
             if (!answered) *(volatile unsigned*) (helper_flags + 2 * kRing) = 1u;
