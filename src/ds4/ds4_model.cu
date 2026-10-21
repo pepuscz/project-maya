@@ -3670,10 +3670,12 @@ struct Model::Impl {
     // every row) at the member's read offset in it; the down whole in one copy into `down` (the device's scratch), then
     // its blocks of the member's columns [ff0, ff0 + ffn) of every row gathered into the slot on the same stream - a 2D
     // copy of the rows instead costs ~35 ms an expert against ~0.7 (192300Z: per-row transfers).  No scratch (an even
-    // split's members: flow_down_bytes): the member's rows of the down as a 2D copy, as before.  Alone (nm 1): each
+    // split's members: flow_down_bytes): the member's rows of the down as a 2D copy, as before - but an uneven split's
+    // member without one (a scratch flow_down_bytes did not give it) fails, nothing enqueued.  Alone (nm 1): each
     // matrix whole, as staged
     bool flow_copy(const Layer& l, int mi, const uint8_t* const* src, bool whole, uint8_t* dst, uint8_t* down,
                    cudaStream_t s) const {
+        if (l.nm > 1 && tp_uneven && down == nullptr) return false;
         const Layer& x = member(l, mi);
         const x3::ExpertLayout& lay = l.nm > 1 ? x.hlay : l.lay;
         for (int p = 0; p < 2; ++p)
@@ -3913,8 +3915,9 @@ struct Model::Impl {
             // (a copy's staging holds each matrix whole: the member's rows from its offset in it - the reads' own staging
             //  holds them only)
             if (!flow_copy(l, it.mi, it.src, copy_mode && it.ram != nullptr, c.ring + r * c.ring_stride, c.down, c.cs)) {
+                const cudaError_t e = cudaGetLastError();   // (none: the uneven split's member without its down scratch)
                 err = "the flow's copy of layer " + std::to_string(it.il) + " expert " + std::to_string(it.e) + ": " +
-                      cudaGetErrorString(cudaGetLastError());
+                      (e != cudaSuccess ? cudaGetErrorString(e) : "no down scratch for the uneven split's member");
                 return false;
             }
             CK(cudaEventRecord(c.ring_fill[r], c.cs));
@@ -7308,8 +7311,9 @@ struct Model::Impl {
     // DS4_TP_CHECK with the group's members on the flow (DS4_FLOW_TP): member m of layer l, one expert's blob staged on
     // the host twice as the flow stages it - the member's read (its gate / up rows, the down whole) and a copy's (each
     // matrix whole) - each through flow_copy into a device buffer between guard bytes, read back: both must be
-    // blob_to_half's part for the member byte for byte, every guard untouched.  On one stream, the readback before the
-    // end's event, its own host and device buffers kept until a clean end (none: tp_unknown)
+    // blob_to_half's part for the member byte for byte, every guard untouched - the down through a scratch of its own
+    // where the flow gives the device one (flow_down_bytes), else as the flow copies it without.  On one stream, the
+    // readback before the end's event, its own host and device buffers kept until a clean end (none: tp_unknown)
     bool tp_flow_member(const Layer& l, int m, std::string& err) {
         const Layer& x = member(l, m);
         Dev& d = devs[(size_t) x.dev];
@@ -7323,7 +7327,7 @@ struct Model::Impl {
         }
         constexpr size_t kGuard = 256;
         const size_t u = unit(x), blob = l.blob, dev_bytes = 2 * u + 4 * kGuard,   // (the slots, then the down's scratch)
-                     down_b = mx_part_bytes(l, 2);
+                     down_b = flow_down_bytes(x.dev) > 0 ? mx_part_bytes(l, 2) : 0;
         std::vector<uint8_t> whole(blob), want(u);
         if (!read_mx(l, 0, whole.data())) return fail("expert 0 not read");
         blob_to_half(l, whole.data(), m, want.data());
@@ -7352,8 +7356,8 @@ struct Model::Impl {
         if (ok) {
             submitted = true;
             ok = cudaMemsetAsync(dv, 0xA5, dev_bytes, d.st) == cudaSuccess &&
-                 flow_copy(l, m, ps, false, dv + kGuard, dv + dev_bytes, d.st) &&
-                 flow_copy(l, m, ws, true, dv + u + 3 * kGuard, dv + dev_bytes, d.st) &&
+                 flow_copy(l, m, ps, false, dv + kGuard, down_b > 0 ? dv + dev_bytes : nullptr, d.st) &&
+                 flow_copy(l, m, ws, true, dv + u + 3 * kGuard, down_b > 0 ? dv + dev_bytes : nullptr, d.st) &&
                  cudaMemcpyAsync(back, dv, dev_bytes, cudaMemcpyDeviceToHost, d.st) == cudaSuccess;   // (before the end)
         }
         if (submitted) {   // (its event, else - not recorded - the stream itself; only a clean end goes on)
