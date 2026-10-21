@@ -8814,16 +8814,31 @@ struct Model::Impl {
         }();
         return m;
     }
+    // DS4_YOCO_SPLIT=1: the skip on a layer split of several GPUs too, where the skipped layers (the yoco layer's
+    // successors) sit on the yoco layer's GPU and read only sources on it (a split whose last GPU holds layers ..20-39:
+    // XTX [0,4], XTX [5,10], APU [11,39]).  Every hand-off and source one GPU sends another is then before the yoco
+    // layer, which every chunk reaches as it does without the skip (its kv_only for the early ones); only that GPU
+    // leaves out the early chunks' later layers and their experts' reads.  Off: one GPU only, as before
+    static bool yoco_split() {
+        static const bool on = std::getenv("DS4_YOCO_SPLIT") != nullptr && std::atoi(std::getenv("DS4_YOCO_SPLIT")) != 0;
+        return on;
+    }
     int yoco_layer() const {
         if (yoco_mode() == 0 || chunk <= 0 || g.nl < 2 || (int) g.ratios.size() < g.nl) return -1;
         int yl = -1;
         for (int il = 0; il < g.nl && yl < 0; ++il)
             if (g.ratios[(size_t) il] == 1) yl = il;
         if (yl <= 0 || !L[(size_t) yl].kv_src) return -1;
+        const int yd = L[(size_t) yl].dev;
         for (int il = 0; il < g.nl; ++il) {
             const Layer& l = L[(size_t) il];
-            if (l.nm != 1 || l.dev != L[0].dev) return -1;
+            if (l.nm != 1 || (!yoco_split() && l.dev != L[0].dev)) return -1;
             if (il > yl && (g.ratios[(size_t) il] != 1 || l.kv_src)) return -1;
+            if (il > yl && yoco_split()) {   // (a skipped layer: on the yoco layer's GPU, its sources there too)
+                if (l.dev != yd) return -1;
+                for (int sidx : {l.src, l.ix_src ? l.ik_src : -1})
+                    if (sidx >= 0 && L[(size_t) srcs[(size_t) sidx].layer].dev != yd) return -1;
+            }
         }
         return yl;
     }
@@ -8848,8 +8863,16 @@ struct Model::Impl {
         // order).  The chunks stay as they are: the ones before the cut go through the layers before yoco and its
         // kv_only, the cut's chunk through those over all its rows and through the rest from the cut on (Run::r0, a
         // view of its buffers), the chunks after it through every layer - each layer's experts read as without the
-        // skip.  One GPU (DS4_YOCO=1; 0: off); not with every row's logits (tests)
+        // skip.  One GPU (DS4_YOCO=1; 0: off), several with DS4_YOCO_SPLIT=1 (yoco_split); not with every row's
+        // logits (tests)
         const int yl = logits_rows > kWin ? -1 : yoco_layer();
+        if (yl > 0 && devs.size() > 1) {
+            static bool said = false;
+            if (!said)
+                std::fprintf(stderr, "ds4: a long prompt's skip on %zu GPUs: layers %d-%d on CUDA%d (DS4_YOCO_SPLIT)\n",
+                             devs.size(), yl, g.nl - 1, devs[(size_t) L[(size_t) yl].dev].id);
+            said = true;
+        }
         // (DS4_YOCO_KEEP=<rows>: fewer - DeepSeek's own serving replays the last 128 tokens through those layers
         //  (DeepInfer's "SWA bounded replay"), which shifts the answers a little; at least one window)
         static const int keep_env = std::getenv("DS4_YOCO_KEEP") ? std::atoi(std::getenv("DS4_YOCO_KEEP")) : 0;
