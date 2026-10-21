@@ -1,42 +1,65 @@
-// src/ds4/ds4_main.cpp - strata-ds4: DeepSeek-V4.1-Flash on Maya.
+// src/ds4/ds4_main.cpp - maya-ds4: DeepSeek-V4.1-Flash on Maya.
 //
-//   strata-ds4 --pack <model>/maya-ds4 --ids 0,128803,... --n 16          greedy tokens after the ids
-//   strata-ds4 --pack ... --ids ... --dump-logits out.f32                every position's logits (the oracle's check)
-//   strata-ds4 --pack ... --serve                                       Maya's engine protocol on stdin / stdout
+//   maya-ds4 --pack <model>/maya-ds4 --ids 0,128803,... --n 16          greedy tokens after the ids
+//   maya-ds4 --pack ... --ids ... --dump-logits out.f32                every position's logits (the oracle's check)
+//   maya-ds4 --pack ... --serve                                       Maya's engine protocol on stdin / stdout
 //
 // --serve speaks what serve/server.py's StrataEngine expects: INFO lines, then `READY <context> stop`; per request
-// `GEN <max_new> [key=value ...] <id,id,...>` (temperature, top_p, top_k, min_p, seed; draft=greedy|sample: a sampled
-// request's drafts) answered by `T <id>` lines and `DONE <generated> <prompt> <prompt ms>
+// `GEN <max_new> [key=value ...] <id,id,...>` answered by `T <id>` lines and `DONE <generated> <prompt> <prompt ms>
 // <decode ms> <stop|length|cancel> <accepted> <offered> <reused> <hits> <lookups>` (the drafts; the decode's routed
-// experts in VRAM / all), with `STAT ...` lines (the live expert tiers) every 8 tokens before it, and `INFO` / `VRAM` lines
-// (per GPU: what each part holds) before READY; `STOP` ends a request early, `QUIT` the engine.  A prompt that
+// experts in VRAM / all); `STOP` ends a request early, `QUIT` the engine.  A prompt that
 // continues the state (the conversation so far) reuses it; one that only shares the last prompt's start goes back to
 // that prompt's end; anything else starts over.  `GENI <max_new> [keys] <file> <ids>` carries the prompt's pictures
 // (the file: see read_pics); the state is shared only where the same picture sits at the same place.
 #include "ds4_model.hpp"
+#include "strata/platform/env_alias.hpp"
 
 #include <cuda_profiler_api.h>
 
 #include <algorithm>
 #include <atomic>
-#include <cmath>
-#include <fstream>
 #include <chrono>
+#include <climits>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <fstream>
 #include <iostream>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
+#if defined(_WIN32)
+#include <io.h>
+#else
+#include <unistd.h>
+#include <cerrno>
+#endif
 
 namespace {
 
 double now_ms() {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// the bytes this process had the storage read for it (Linux's /proc/self/io; -1 where there is none): the Monitor's
+// disk reads a token, the experts read in place from the model's files included
+long long io_read_bytes() {
+#ifdef __linux__
+    std::FILE* f = std::fopen("/proc/self/io", "r");
+    if (f == nullptr) return -1;
+    char line[128];
+    long long v = -1;
+    while (std::fgets(line, sizeof line, f) != nullptr)
+        if (std::sscanf(line, "read_bytes: %lld", &v) == 1) break;
+    std::fclose(f);
+    return v;
+#else
+    return -1;
+#endif
 }
 
 std::vector<int> parse_ids(const std::string& s) {
@@ -55,16 +78,16 @@ std::vector<int> parse_ids(const std::string& s) {
 
 void usage() {
     std::fprintf(stderr,
-                 "strata-ds4 --pack <model>/maya-ds4 [--gpus 0,1,...] [--max-context N] [--reserve-mib N]\n"
+                 "maya-ds4 --pack <model>/maya-ds4 [--gpus 0,1,...] [--max-context N] [--reserve-mib N]\n"
                  "           [--vram-experts F] [--cpu-threads N] [--expert-profile FILE|none] [--no-expert-cache] [--verbose]\n"
-                 "           [--tp N] [--threads on|off] [--prefill-chunk N] [--prefill-keep exact|off|N]\n"
-                 "           [--dspark on|off|none] [--dspark-conf F]\n"
+                 "           [--tp N] [--threads on|off] [--prefill-chunk N] [--dspark on|off|none] [--dspark-conf F]\n"
                  "           [--vision on|off] [--mmap-experts on|off|auto]\n"
                  "           (--ids I,J,... [--images FILE] [--n N] [--dump-logits FILE] | --ppl FILE | --serve\n"
                  "           | --encode-image FILE.rgb --size WxH --dump-image OUT)\n");
 }
 
-// stdin lines on a thread, so a request can see STOP while it decodes
+// stdin lines on a thread, so a request can see STOP while it decodes.  read(2), not std::cin - glibc's exit()
+// flushes stdio and waits on stdin's lock, which getline holds while it waits for input (the GLM serve's pattern)
 struct Lines {
     std::mutex mu;
     std::condition_variable cv;
@@ -73,8 +96,32 @@ struct Lines {
     std::atomic<bool> stop{false};
     void start() {
         std::thread([this] {
-            std::string l;
-            while (std::getline(std::cin, l)) {
+            std::string l, buf;
+            char chunk[4096];
+            auto getline_fd = [&](std::string& out) -> bool {
+                for (;;) {
+                    const size_t nlpos = buf.find('\n');
+                    if (nlpos != std::string::npos) {
+                        out.assign(buf, 0, nlpos);
+                        buf.erase(0, nlpos + 1);
+                        return true;
+                    }
+#if defined(_WIN32)
+                    const int n = _read(0, chunk, (unsigned) sizeof chunk);
+#else
+                    const ssize_t n = ::read(0, chunk, sizeof chunk);
+                    if (n < 0 && errno == EINTR) continue;
+#endif
+                    if (n <= 0) {
+                        if (buf.empty()) return false;
+                        out.swap(buf);
+                        buf.clear();
+                        return true;
+                    }
+                    buf.append(chunk, (size_t) n);
+                }
+            };
+            while (getline_fd(l)) {
                 if (!l.empty() && l.back() == '\r') l.pop_back();
                 std::lock_guard<std::mutex> lk(mu);
                 if (l == "STOP" || l.rfind("STOP ", 0) == 0) {
@@ -101,104 +148,55 @@ struct Lines {
     }
 };
 
-// How many drafts a round verifies (DeepInfer's confidence-scheduled verification): the confidence head gives each
-// draft's chance to stand once those before it stood, their running product the chance it is reached and kept, so
-// verifying k drafts is worth 1 + the sum of the first k products in tokens; its cost the drafting plus the window of
-// k + 1, measured - the rounds' wall time by window size (a plain step: 1), a moving average a size.  DS4_DRAFT_COST=1:
-// the k with the most tokens a millisecond (opt-in: at 3.5 bits, --tp 9, the serve protocol's 12 answers 51.9 tok/s
-// against the floor's 53.0 - the CPU lane's noise in the times had it verify more, and keep fewer: 0.60 of the drafts
-// against 0.72 - and the times make a seed's tokens differ run to run); else, and until the times are in, the confidence
-// floor: the drafts up to the first below it.  DS4_DRAFT_STATS=1: the calibration (each confidence bucket's drafts tried
-// and kept) at the end.
-struct DraftPolicy {
-    static constexpr int kMax = 17;
-    double win_ms[kMax] = {};   // a window of T tokens: its round's time after the drafting
-    int win_n[kMax] = {};
-    double draft_ms = 0.0;
-    int draft_n = 0;
-    bool cost = std::getenv("DS4_DRAFT_COST") != nullptr && std::atoi(std::getenv("DS4_DRAFT_COST")) != 0;
-    long long tried[10] = {}, kept[10] = {};   // by the draft's confidence decile: reached, then stood
-    static void avg(double& a, int& n, double x) {
-        a = n == 0 ? x : a + (x - a) / (double) std::min(n + 1, 16);
-        ++n;
+// The drafts between two stats: each draft position (1st, 2nd, ..) - how often it was verified with every draft
+// before it kept, and how often it was kept then
+std::string per_position(const strata::ds4::Stats& s0, const strata::ds4::Stats& s1) {
+    std::string pp = "per position (kept / reached):";
+    for (int i = 0; i < 8; ++i) {
+        const long long r = s1.draft_reached[i] - s0.draft_reached[i], k = s1.draft_kept[i] - s0.draft_kept[i];
+        if (r <= 0) break;
+        char b[64];
+        std::snprintf(b, sizeof b, " %d: %lld/%lld %.0f%%", i + 1, k, r, 100.0 * (double) k / (double) r);
+        pp += b;
     }
-    // the window of T's time: its own average, else a line through the sizes measured (2 or more)
-    double est(int T) const {
-        if (win_n[T] > 0) return win_ms[T];
-        double sx = 0, sy = 0, sxx = 0, sxy = 0;
-        int n = 0;
-        for (int t = 1; t < kMax; ++t)
-            if (win_n[t] > 0) {
-                sx += t, sy += win_ms[t], sxx += (double) t * t, sxy += t * win_ms[t];
-                ++n;
-            }
-        if (n < 2) return -1.0;
-        const double b = (n * sxy - sx * sy) / std::max(1e-9, n * sxx - sx * sx), a = (sy - b * sx) / n;
-        return a + b * T;
-    }
-    int choose(const std::vector<float>& conf, int cap, float conf_min) const {
-        int floor_k = 0;
-        while (floor_k < cap && conf[(size_t) floor_k] >= conf_min) ++floor_k;
-        if (!cost || draft_n == 0 || win_n[1] == 0 || est(2) < 0) return floor_k;
-        double best = -1.0, cum = 1.0, e = 1.0;
-        int bk = 0;
-        for (int k = 0; k <= cap; ++k) {
-            if (k > 0) {
-                cum *= (double) conf[(size_t) k - 1];
-                e += cum;
-            }
-            const double t = draft_ms + est(k + 1);
-            if (t > 0 && e / t > best) {
-                best = e / t;
-                bk = k;
-            }
-        }
-        return bk;
-    }
-    void kept_stats(const std::vector<float>& conf, int offered, int acc) {
-        for (int i = 0; i < offered && i <= acc; ++i) {   // (draft i reached: those before it stood)
-            const int b = std::min(9, std::max(0, (int) (conf[(size_t) i] * 10.0f)));
-            ++tried[b];
-            kept[b] += i < acc;
-        }
-    }
-    void report() const {
-        std::fprintf(stderr, "dspark calibration (confidence decile: drafts reached, kept):");
-        for (int b = 0; b < 10; ++b)
-            if (tried[b] > 0) std::fprintf(stderr, " [%.1f %lld %.2f]", b / 10.0, tried[b], (double) kept[b] / (double) tried[b]);
-        std::fprintf(stderr, "\ndspark round times (window size: ms, rounds): draft %.2f (%d)", draft_ms, draft_n);
-        for (int t = 1; t < kMax; ++t)
-            if (win_n[t] > 0) std::fprintf(stderr, " %d: %.2f (%d)", t, win_ms[t], win_n[t]);
-        std::fprintf(stderr, "\n");
-    }
-};
-DraftPolicy draft_policy;
+    return pp;
+}
 
-// One round of decoding after `tok` (the token at pos(), not fed yet): with the drafter, its drafts (DraftPolicy's
-// count of them, at most `room` - 1), verified together; else a plain step.  `out` gets the tokens that follow tok
-// (the accepted drafts, then the trunk's next), the last of them the next round's tok.  counter: the draw index of the
-// token after tok (a sampled request's drafts are drawn through its chain - the same the verification gets)
+// The drafts' cut on the product of their confidences (DeepInfer's cumulative rule, GLM's spec_cum): a draft is
+// verified while the chance that it and every draft before it are kept stays at least this - a long window whose later
+// drafts are likely lost is not verified whole.  MAYA_DS4_DSPARK_CUM=F (STRATA_DS4_DSPARK_CUM), a request's dspark_cum
+// key; 0: off, only the floor on each draft's own confidence (dspark_conf).  0.5 by default: a Radeon 8065S, Maya-S,
+// greedy over code / chat / a list, two runs: decode 12.04 -> 12.82 tok/s (+6.5%), the same tokens
+float dspark_cum_default() {
+    static const float v = [] {
+        const char* e = std::getenv("STRATA_DS4_DSPARK_CUM");
+        return e != nullptr ? (float) std::atof(e) : 0.5f;
+    }();
+    return v;
+}
+
+// One round of decoding after `tok` (the token at pos(), not fed yet): with the drafter, its drafts while their
+// confidence holds (at most `room` - 1 of them), verified together; else a plain step.  `out` gets the tokens that follow
+// tok (the accepted drafts, then the trunk's next), the last of them the next round's tok.
 bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, float temperature, float top_p, int top_k,
            float min_p, unsigned long long seed, unsigned long long& counter, std::vector<int>& out, int& offered,
-           int& accepted, std::string& err) {
+           int& accepted, std::string& err, float cum_min = -1.0f) {
     out.clear();
     offered = accepted = 0;
-    DraftPolicy& dp = draft_policy;
-    double t0 = now_ms();
     if (spec && room > 1 && m.draft_block() > 0) {
         std::vector<int> drafts;
         std::vector<float> conf;
-        if (!m.draft(tok, temperature, top_p, top_k, min_p, seed, counter, drafts, conf, err)) return false;
-        const double td = now_ms();
-        DraftPolicy::avg(dp.draft_ms, dp.draft_n, td - t0);
-        t0 = td;
-        const int keep = dp.choose(conf, std::min((int) drafts.size(), room - 1), conf_min);
+        if (!m.draft(tok, drafts, conf, err, temperature, top_p, top_k, min_p, seed, counter)) return false;
+        int keep = 0;
+        if (cum_min < 0) cum_min = dspark_cum_default();
+        float cum = 1.0f;
+        while (keep < (int) drafts.size() && keep < room - 1 && conf[(size_t) keep] >= conf_min &&
+               (cum *= conf[(size_t) keep]) >= cum_min)
+            ++keep;
         if (keep > 0) {
             drafts.resize((size_t) keep);
             int acc = 0, next = -1;
             if (!m.verify(tok, drafts, temperature, top_p, top_k, min_p, seed, counter, acc, next, err)) return false;
-            DraftPolicy::avg(dp.win_ms[keep + 1], dp.win_n[keep + 1], now_ms() - t0);
-            dp.kept_stats(conf, keep, acc);
             counter += (unsigned long long) acc + 1;
             for (int i = 0; i < acc; ++i) out.push_back(drafts[(size_t) i]);
             out.push_back(next);
@@ -209,7 +207,6 @@ bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, 
     }
     if (!m.step(tok, true, err)) return false;
     out.push_back(m.sample(temperature, top_p, top_k, min_p, seed, counter++));
-    DraftPolicy::avg(dp.win_ms[1], dp.win_n[1], now_ms() - t0);
     return true;
 }
 
@@ -218,7 +215,13 @@ struct Req {
     float temperature = 0.0f, top_p = 1.0f, min_p = 0.0f;
     int top_k = 64;
     unsigned long long seed = 0;
-    int draft = -1;     // draft=greedy|sample: a sampled request's drafts (-1: the engine's default)
+    int spec = -1;          // spec=0|1: this request drafts or not (-1: as the engine was started)
+    float conf = -1.0f;     // dspark_conf=F: the drafts' confidence floor for this request (-1: the engine's)
+    float cum = -1.0f;      // dspark_cum=F: the cut on the product of the confidences (-1: the engine's, dspark_cum_default)
+    // the penalties (penalty_last_n / _repeat / _freq / _present, llama.cpp's): over the last pen_n tokens of the state
+    // (-1: the whole context, which the engine caps at its window; 0: none)
+    int pen_n = 0;
+    float pen_repeat = 1.0f, pen_freq = 0.0f, pen_present = 0.0f;
     std::string file;   // GENI: the pictures
     std::vector<int> ids;
 };
@@ -312,7 +315,14 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
         else if (k == "top_k") r.top_k = std::atoi(v.c_str());
         else if (k == "min_p") r.min_p = std::strtof(v.c_str(), nullptr);
         else if (k == "seed") r.seed = std::strtoull(v.c_str(), nullptr, 10);
-        else if (k == "draft") r.draft = v == "sample" ? 1 : v == "greedy" ? 0 : -1;
+        else if (k == "spec") r.spec = std::atoi(v.c_str()) != 0;
+        else if (k == "dspark_conf") r.conf = std::strtof(v.c_str(), nullptr);
+        else if (k == "dspark_cum" || k == "spec_cum") r.cum = std::strtof(v.c_str(), nullptr);
+        else if (k == "spec_min_p") r.conf = std::strtof(v.c_str(), nullptr);   // (the server's strata_tune names)
+        else if (k == "penalty_last_n") r.pen_n = std::atoi(v.c_str());
+        else if (k == "penalty_repeat") r.pen_repeat = std::strtof(v.c_str(), nullptr);
+        else if (k == "penalty_freq") r.pen_freq = std::strtof(v.c_str(), nullptr);
+        else if (k == "penalty_present") r.pen_present = std::strtof(v.c_str(), nullptr);
     }
     return !r.ids.empty() && (!geni || !r.file.empty());
 }
@@ -328,6 +338,15 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     std::string line;
     unsigned long long counter = 0;
     std::vector<Pic> held;   // the pictures the state holds (start, hash, span)
+    // (DS4_SERVE_DUMP=<prefix>, tests: request i's logits - the prompt's last row, then every decode step's rows - into
+    //  <prefix>.<i>.f32, to compare a request's logits byte for byte across processes and histories)
+    const char* dump_prefix = std::getenv("DS4_SERVE_DUMP");
+    int n_req = 0;
+    std::vector<float> dump_lg;
+    std::FILE* dump_f = nullptr;
+    auto dump_rows = [&]() {
+        if (dump_f != nullptr && m.logits(dump_lg)) std::fwrite(dump_lg.data(), 4, dump_lg.size(), dump_f);
+    };
     SpanCache spans;
     const int img_tok = m.image_token();
     while (in.next(line)) {
@@ -345,6 +364,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             std::fflush(stdout);
             continue;
         }
+        m.begin_request();   // (DISK_SKIP_AUTO: between requests only)
         const double t0 = now_ms();
         const strata::ds4::Stats s0 = m.stats();   // (the request's own CPU lane share)
         std::vector<Pic> pics;
@@ -426,7 +446,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         }
         // the prompt in windows (PP <read> <total> <ms> <tok/s> <reuse> every 64 tokens), a checkpoint before its last
         // token and one after it: the next turn re-renders this one, and shares its start up to one of them
-        const size_t last = r.ids.size() - 1;
+        const size_t total = r.ids.size();
         size_t done = from, next_pp = from + 64;
         m.set_progress([&](int64_t d) {   // (a run of chunks: each one through every layer)
             const double ms = now_ms() - t0;
@@ -434,11 +454,31 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                         ms > 0 ? 1000.0 * (double) (done + (size_t) d - from) / ms : 0.0, from);
             std::fflush(stdout);
         });
-        while (ok && done < last) {
-            const size_t n = std::min<size_t>((size_t) m.feed_unit(), last - done);
-            ok = m.feed(r.ids.data() + done, (int) n, 0, err);
+        // (DS4_LAST_WINDOW=1: the last token in a window of its own after the checkpoint, as before - for A/B runs)
+        static const bool last_window = std::getenv("DS4_LAST_WINDOW") != nullptr;
+        // a STOP while the prompt is read ends it there (the engine's run of chunks at a layer or chunk, windows between
+        // feeds) and goes back to the state before this prompt - kept here first, in checkpoint 1, which the prompt's
+        // own end overwrites as before - so the next request still shares the conversation up to it
+        if (from > 0 && from < total) m.checkpoint(1);
+        m.set_cancel([&in] { return in.stop.load(); });
+        bool stopped = false;
+        while (ok && done < total) {
+            if (in.stop.load()) {
+                stopped = true;
+                break;
+            }
+            const size_t n = std::min<size_t>((size_t) m.feed_unit(), total - done);
+            // (the prompt's end: the last token in the same run, the checkpoint before it kept on the way)
+            const bool fin = done + n == total;
+            if (fin && last_window) {
+                ok = (n < 2 || m.feed(r.ids.data() + done, (int) n - 1, 0, err));
+                if (ok) m.checkpoint(1);
+                ok = ok && m.feed(r.ids.data() + done + n - 1, 1, 1, err);
+            } else
+                ok = fin ? m.feed_mark(r.ids.data() + done, (int) n, 1, 1, err)
+                         : m.feed(r.ids.data() + done, (int) n, 0, err);
             done += n;
-            if (ok && (done >= next_pp || done == last)) {
+            if (ok && (done >= next_pp || done == total)) {
                 const double ms = now_ms() - t0;
                 std::printf("PP %zu %zu %.1f %.1f %zu\n", done, r.ids.size(), ms,
                             ms > 0 ? 1000.0 * (double) (done - from) / ms : 0.0, from);
@@ -446,11 +486,20 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 next_pp = done + 64;
             }
         }
-        if (ok) {
-            m.checkpoint(1);
-            ok = m.feed(r.ids.data() + last, 1, 1, err);
-        }
+        m.set_cancel(nullptr);
         m.set_images({});
+        if (stopped || (!ok && m.cancelled())) {
+            const bool back = from > 0 && m.restore((int64_t) from) && (size_t) m.pos() == from;
+            if (!back) {
+                m.reset();
+                held.clear();
+            }
+            std::fprintf(stderr, "maya ds4 serve: stopped while reading the prompt of %zu tokens, after %.0f ms%s\n",
+                         total, now_ms() - t0, back ? "; the conversation before it is kept" : "");
+            std::printf("DONE 0 %zu %.1f 0.0 cancel 0 0 %zu 0 0\n", r.ids.size(), now_ms() - t0, back ? from : (size_t) 0);
+            std::fflush(stdout);
+            continue;
+        }
         if (!ok) {
             std::fprintf(stderr, "ds4: %s\n", err.c_str());
             std::printf("ERR %s\n", err.c_str());
@@ -464,14 +513,64 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         m.checkpoint(0);
         const double t1 = now_ms();
         const strata::ds4::Stats sd = m.stats();   // (the decode's own counters: STAT lines, DONE's hit fields)
-        long long produced = 0, next_stat = 8;
+        long long produced = 0;
         const char* finish = "length";
         const long long limit = r.max_new > 0 ? r.max_new : m.max_context() - (long long) r.ids.size();
         long long d_off = 0, d_acc = 0;
         bool cool = false;
-        m.set_draft_sample(r.draft);
+        if (dump_prefix != nullptr) {
+            if (dump_f != nullptr) std::fclose(dump_f);
+            dump_f = std::fopen((std::string(dump_prefix) + "." + std::to_string(++n_req) + ".f32").c_str(), "wb");
+            dump_rows();
+        }
+        // this request's penalties (a repeat penalty of 0 or below, or a value that is not a number: neutral) for every
+        // pick of its answer, the drafts' verify included
+        m.set_penalties(r.pen_n < 0 ? INT_MAX : r.pen_n,
+                        std::isfinite(r.pen_repeat) && r.pen_repeat > 0.0f ? r.pen_repeat : 1.0f,
+                        std::isfinite(r.pen_freq) ? r.pen_freq : 0.0f, std::isfinite(r.pen_present) ? r.pen_present : 0.0f);
         int tok = m.sample(r.temperature, r.top_p, r.top_k, r.min_p, r.seed, counter++);
         std::vector<int> got;
+        // STAT for the Monitor every 8 tokens and at the end, over this answer so far: the GLM engine's keys (speed, the
+        // VRAM hit, promotions a token) and DeepSeek's own - experts a token on the CPU lane, MB a token the storage
+        // read (Linux), the n-gram memory's (Engram) read time a token, the drafts' acceptance
+        const strata::ds4::Stats s_dec = m.stats();
+        const long long io_dec = io_read_bytes();
+        auto stat_line = [&]() {
+            const strata::ds4::Stats& s = m.stats();
+            const double ms = now_ms() - t1;
+            const double fed = (double) std::max<int64_t>(1, s.tokens - s_dec.tokens);
+            const double ex = (double) (s.experts - s_dec.experts), cx = (double) (s.cpu_experts - s_dec.cpu_experts),
+                         sx = (double) (s.stream_experts - s_dec.stream_experts);
+            std::string out = "STAT";
+            char b[160];
+            std::snprintf(b, sizeof b, " tok_s=%.2f ms_tok=%.2f vram_hit=%.4f cpu=%.3f ram=%.3f promo=%.3f engram_ms=%.3f",
+                          ms > 0 ? 1000.0 * (double) produced / ms : 0.0, produced > 0 ? ms / (double) produced : 0.0,
+                          ex > 0 ? 1.0 - (cx + sx) / ex : 1.0, cx / fed, (double) (s.ram_experts - s_dec.ram_experts) / fed,
+                          (double) (s.swaps - s_dec.swaps) / fed, (s.engram_ms - s_dec.engram_ms) / fed);
+            out += b;
+            if (sx > 0) {   // (the PCIe lane: experts a token streamed to the GPU)
+                std::snprintf(b, sizeof b, " pcie=%.3f", sx / fed);
+                out += b;
+            }
+            const long long io = io_read_bytes();
+            if (io >= 0 && io_dec >= 0) {
+                std::snprintf(b, sizeof b, " disk_mb=%.3f", (double) (io - io_dec) / 1e6 / fed);
+                out += b;
+            }
+            if (d_off > 0) {
+                std::snprintf(b, sizeof b, " drafts=%.3f", (double) d_acc / (double) d_off);
+                out += b;
+            }
+            if (s.skipped > s_dec.skipped) {   // (STRATA_DS4_DISK_SKIP_W: experts left out a token)
+                std::snprintf(b, sizeof b, " skipped=%.3f", (double) (s.skipped - s_dec.skipped) / fed);
+                out += b;
+            }
+            if (s.skip_on >= 0) {   // (... _AUTO: skipping now)
+                std::snprintf(b, sizeof b, " skip_on=%d", s.skip_on);
+                out += b;
+            }
+            std::printf("%s\n", out.c_str());
+        };
         for (;;) {
             if (in.stop.load()) {
                 finish = "cancel";
@@ -479,20 +578,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             }
             std::printf("T %d\n", tok);
             ++produced;
-            if (produced >= next_stat) {   // the Monitor's live expert tiers (serve/server.py), every 8 tokens
-                next_stat = produced + 8;
-                const strata::ds4::Stats& sn = m.stats();
-                const strata::ds4::Tiers ti = m.tiers();
-                const double el = std::max(1e-9, (now_ms() - t1) / 1000.0), n = (double) produced;
-                const long long ex = sn.experts - sd.experts, cx = sn.cpu_experts - sd.cpu_experts;
-                // (ram_fetch: the CPU lane's experts a token - computed there, not pulled over PCIe; promo: the
-                //  cache's moves into VRAM a token)
-                std::printf("STAT tok_s=%.2f ms_tok=%.2f vram_hit=%.4f ram_fetch=%.3f disk=0.000 promo=%.3f "
-                            "vram_used=%lld vram_slots=%lld ram_used=%lld ram_slots=%lld ram_gb=%.1f vram_gb=%.1f\n",
-                            n / el, 1000.0 * el / n, ex > 0 ? 1.0 - (double) cx / (double) ex : 1.0, (double) cx / n,
-                            (double) (sn.swaps - sd.swaps) / n, (long long) ti.vram, (long long) ti.slots,
-                            (long long) ti.cpu, (long long) ti.cpu, ti.cpu_gb, ti.vram_gb);
-            }
+            if (produced % 8 == 0) stat_line();
             std::fflush(stdout);
             bool end = false;
             for (int e : eos) end = end || tok == e;
@@ -505,9 +591,11 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 const int room = (int) std::min<long long>(limit - produced, m.max_context() - m.pos());
                 int off = 0, acc = 0;
                 // a round whose drafts were all below the confidence floor: the next one does without the drafter
-                const bool try_spec = spec && !cool;
-                if (!round(m, tok, room, try_spec, conf_min, r.temperature, r.top_p, r.top_k, r.min_p, r.seed, counter, got,
-                           off, acc, err)) {
+                // (a request's spec / dspark_conf keys over the engine's: the speed calibration measures both ways)
+                const bool try_spec = (r.spec < 0 ? spec : r.spec != 0) && !cool;
+                if (!round(m, tok, room, try_spec, r.conf >= 0 ? r.conf : conf_min, r.temperature, r.top_p, r.top_k,
+                           r.min_p, r.seed, counter, got,
+                           off, acc, err, r.cum)) {
                     std::fprintf(stderr, "ds4: %s\n", err.c_str());
                     finish = "cancel";
                     break;
@@ -516,12 +604,15 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 d_acc += acc;
                 cool = try_spec && off == 0;
                 std::reverse(got.begin(), got.end());
+                dump_rows();
             }
             tok = got.back();
             got.pop_back();
         }
+        if (dump_f != nullptr) std::fflush(dump_f);
         // (a stop within accepted drafts leaves the state past it: the next prompt shares less with it, and goes back to
         //  the checkpoint at this prompt's end)
+        stat_line();
         const double t2 = now_ms();
         const strata::ds4::Stats& se = m.stats();   // (hits / lookups: the decode's routed experts in VRAM / all)
         std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu %lld %lld\n", produced, r.ids.size(), t1 - t0, t2 - t1,
@@ -537,6 +628,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                      t2 > t1 ? 1000.0 * (double) produced / (t2 - t1) : 0.0,
                      s.experts > s0.experts ? 100.0 * (double) (s.cpu_experts - s0.cpu_experts) / (double) (s.experts - s0.experts)
                                             : 0.0);
+        if (d_off > 0) std::fprintf(stderr, "maya ds4 serve: drafts %lld of %lld kept; %s\n", d_acc, d_off,
+                                    per_position(s_dec, s).c_str());
         m.save_profile();
     }
     m.save_profile();
@@ -546,11 +639,18 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
 }  // namespace
 
 int main(int argc, char** argv) {
+    strata::platform::env_aliases();   // (MAYA_* settings under their older names too)
     // cuBLAS gives the same bits run after run only with one stream active or with its workspace pinned (its notes on
     // reproducibility): the chunked prompt path's GEMMs run beside the copy and hc streams, and without this each
     // process could pick other kernels - a long prompt's logits differing from one start to the next.  Before any
     // cuBLAS handle; a setting the caller made stays
-    setenv("CUBLAS_WORKSPACE_CONFIG", ":4096:8", 0);
+    if (std::getenv("CUBLAS_WORKSPACE_CONFIG") == nullptr) {
+#if defined(_WIN32)
+        _putenv_s("CUBLAS_WORKSPACE_CONFIG", ":4096:8");
+#else
+        setenv("CUBLAS_WORKSPACE_CONFIG", ":4096:8", 0);
+#endif
+    }
     strata::ds4::Options o;
     std::string ids_s, dump, eos = "1", ppl;
     int n = 0, window = 16;
@@ -586,10 +686,6 @@ int main(int argc, char** argv) {
         } else if (a == "--dspark-conf") o.dspark_conf = (float) std::atof(val("--dspark-conf").c_str());
         else if (a == "--tp") o.tp = std::max(1, std::atoi(val("--tp").c_str()));
         else if (a == "--prefill-chunk") o.prefill_chunk = std::max(0, std::atoi(val("--prefill-chunk").c_str()));
-        else if (a == "--prefill-keep") {   // a long prompt's consumer layers over its tail: exact, off, or its last N rows
-            const std::string v = val("--prefill-keep");
-            o.prefill_keep = v == "exact" ? 0 : v == "off" ? -1 : std::max(1, std::atoi(v.c_str()));
-        }
         else if (a == "--threads") o.threads = val("--threads") != "off";
         else if (a == "--vision") o.vision = val("--vision") != "off";
         else if (a == "--mmap-experts") {
@@ -632,7 +728,7 @@ int main(int argc, char** argv) {
     strata::ds4::Model m;
     std::string err;
     if (!m.load(o, err)) {
-        std::fprintf(stderr, "strata-ds4: %s\n", err.c_str());
+        std::fprintf(stderr, "maya-ds4: %s\n", err.c_str());
         return 1;
     }
     if (!o.vision_only) std::fprintf(stderr, "%s", m.describe().c_str());
@@ -651,7 +747,7 @@ int main(int argc, char** argv) {
             m.reset();
             if (!m.feed(seq.data(), (int) seq.size(), (int) seq.size(), err) || !m.logits(lg) ||
                 lg.size() < (seq.size() - 1) * (size_t) V) {
-                std::fprintf(stderr, "strata-ds4: sequence %d: %s\n", k, err.empty() ? "no logits" : err.c_str());
+                std::fprintf(stderr, "maya-ds4: sequence %d: %s\n", k, err.empty() ? "no logits" : err.c_str());
                 return 1;
             }
             double s_nll = 0.0;
@@ -678,14 +774,14 @@ int main(int argc, char** argv) {
         const bool got = f != nullptr && !px.empty() && std::fread(px.data(), 1, px.size(), f) == px.size();
         if (f != nullptr) std::fclose(f);
         if (!got) {
-            std::fprintf(stderr, "strata-ds4: %s: expected %d x %d RGB bytes (--size WxH)\n", enc_rgb.c_str(), enc_w, enc_h);
+            std::fprintf(stderr, "maya-ds4: %s: expected %d x %d RGB bytes (--size WxH)\n", enc_rgb.c_str(), enc_w, enc_h);
             return 1;
         }
         std::vector<uint16_t> span;
         for (int k = 0; k < 2; ++k) {   // (the second: warm)
             const double te = now_ms();
             if (!m.encode_image(px.data(), enc_w, enc_h, span, err)) {
-                std::fprintf(stderr, "strata-ds4: %s\n", err.c_str());
+                std::fprintf(stderr, "maya-ds4: %s\n", err.c_str());
                 return 1;
             }
             std::fprintf(stderr, "vision: %d x %d pixels -> a span of %zu rows in %.0f ms\n", enc_w, enc_h,
@@ -701,7 +797,7 @@ int main(int argc, char** argv) {
     if (!ids_s.empty() && ids_s[0] == '@') {   // --ids @FILE: the ids from a file (a long prompt passes no argv limit)
         std::FILE* f = std::fopen(ids_s.c_str() + 1, "rb");
         if (f == nullptr) {
-            std::fprintf(stderr, "strata-ds4: cannot open %s\n", ids_s.c_str() + 1);
+            std::fprintf(stderr, "maya-ds4: cannot open %s\n", ids_s.c_str() + 1);
             return 1;
         }
         std::string all;
@@ -714,7 +810,7 @@ int main(int argc, char** argv) {
     if (!images.empty()) {   // --images: a GENI file's pictures, for the prompt's spans
         std::vector<Pic> pics;
         if (!read_pics(images, pics, err)) {
-            std::fprintf(stderr, "strata-ds4: %s\n", err.c_str());
+            std::fprintf(stderr, "maya-ds4: %s\n", err.c_str());
             return 1;
         }
         std::vector<strata::ds4::Image> imgs;
@@ -722,7 +818,7 @@ int main(int argc, char** argv) {
             auto rows = std::make_shared<std::vector<uint16_t>>();
             const double te = now_ms();
             if (!m.encode_image(q.rgb.data(), q.width, q.height, *rows, err)) {
-                std::fprintf(stderr, "strata-ds4: %s\n", err.c_str());
+                std::fprintf(stderr, "maya-ds4: %s\n", err.c_str());
                 return 1;
             }
             std::fprintf(stderr, "picture at %lld: %d x %d pixels, %zu tokens, %.0f ms\n", (long long) q.start, q.width,
@@ -734,28 +830,16 @@ int main(int argc, char** argv) {
     // DS4_BENCH_REPEAT=N: the prompt and the decode N times, the state reset between them and the expert cache kept
     // (the later passes measure a warmed cache, as a server's requests run)
     const int reps = std::max(1, std::getenv("DS4_BENCH_REPEAT") ? std::atoi(std::getenv("DS4_BENCH_REPEAT")) : 1);
-    // DS4_KEEP_PASSES=off,exact,140,...: pass i's --prefill-keep (cycled) - the settings side by side in one load
-    std::vector<std::string> keeps;
-    if (const char* kp = std::getenv("DS4_KEEP_PASSES"))
-        for (const char* q = kp; *q;) {
-            const char* e = std::strchr(q, ',');
-            keeps.emplace_back(q, e ? (size_t) (e - q) : std::strlen(q));
-            q = e ? e + 1 : q + std::strlen(q);
-        }
     for (int rep = 0; rep < reps; ++rep) {
     if (rep > 0) {
         m.reset();
         std::fprintf(stderr, "pass %d of %d\n", rep + 1, reps);
     }
-    if (!keeps.empty()) {
-        const std::string& v = keeps[(size_t) rep % keeps.size()];
-        m.set_prefill_keep(v == "exact" ? 0 : v == "off" ? -1 : std::max(1, std::atoi(v.c_str())));
-        std::fprintf(stderr, "pass %d: --prefill-keep %s\n", rep + 1, v.c_str());
-    }
     // (repeated: each pass's logits to a file of its own, <dump>.<pass> - a run's determinism, one load)
     const std::string dpath = reps > 1 ? dump + "." + std::to_string(rep) : dump;
     std::FILE* df = dump.empty() ? nullptr : std::fopen(dpath.c_str(), "wb");
     std::vector<float> lg;
+    m.begin_request();
     // DS4_PROFILE_PROMPT: the prompt alone in the capture (nsys --capture-range=cudaProfilerApi), the last pass
     const bool prof_prompt = std::getenv("DS4_PROFILE_PROMPT") != nullptr && rep == reps - 1;
     const strata::ds4::Stats sp = m.stats();
@@ -765,7 +849,7 @@ int main(int argc, char** argv) {
         const int T = (int) std::min<size_t>((size_t) window, ids.size() - a);
         const bool last = a + (size_t) T == ids.size();
         if (!m.feed(ids.data() + a, T, df != nullptr ? T : (last ? 1 : 0), err)) {
-            std::fprintf(stderr, "strata-ds4: %s\n", err.c_str());
+            std::fprintf(stderr, "maya-ds4: %s\n", err.c_str());
             return 1;
         }
         if (df != nullptr && m.logits(lg)) std::fwrite(lg.data(), 4, lg.size(), df);
@@ -786,6 +870,10 @@ int main(int argc, char** argv) {
         }
     }
     const strata::ds4::Stats s0 = m.stats();
+    if (s0.eg_rows > 0)
+        std::fprintf(stderr, "prompt's Engram rows: %lld, %.1f%% without a read (repeats and the row cache), %lld read\n",
+                     (long long) s0.eg_rows, 100.0 * (double) s0.eg_hits / (double) s0.eg_rows, (long long) s0.eg_reads);
+    const long long io0 = io_read_bytes();
     std::fprintf(stderr, "prompt's host time: layers %.0f ms, head wait %.0f, Engram waits %.0f, CPU lane %.0f\n",
                  s0.layer_ms - sp.layer_ms, s0.head_ms - sp.head_ms, s0.engram_ms - sp.engram_ms, s0.cpu_ms - sp.cpu_ms);
     const bool prof = std::getenv("DS4_PROFILE") != nullptr;   // (nsys --capture-range=cudaProfilerApi: the decode alone)
@@ -807,7 +895,7 @@ int main(int argc, char** argv) {
                 const bool try_spec = spec && !cool;
                 if (!round(m, tok, n - (int) out.size(), try_spec, o.dspark_conf, temp, 1.0f, temp > 0 ? 64 : 1, 0.0f,
                            cli_seed, counter, got, off, acc, err)) {
-                    std::fprintf(stderr, "strata-ds4: %s\n", err.c_str());
+                    std::fprintf(stderr, "maya-ds4: %s\n", err.c_str());
                     return 1;
                 }
                 d_off += off;
@@ -823,7 +911,6 @@ int main(int argc, char** argv) {
         if (df != nullptr && m.logits(lg)) std::fwrite(lg.data(), 4, lg.size(), df);
     }
     if (prof && rep == reps - 1) cudaProfilerStop();
-    if (spec && rounds > 0 && std::getenv("DS4_DRAFT_STATS") != nullptr) draft_policy.report();
     if (spec && rounds > 0) {
         const auto& s1 = m.stats();
         const double nv = (double) std::max<int64_t>(1, s1.drafts_rounds - s0.drafts_rounds);
@@ -831,19 +918,69 @@ int main(int argc, char** argv) {
                              "%.2f ms a round, verifying %.1f ms in all (%lld windows)\n",
                      rounds, d_off, d_acc, (double) out.size() / (double) rounds, (s1.draft_ms - s0.draft_ms) / nv,
                      s1.verify_ms - s0.verify_ms, (long long) (s1.drafts_offered > 0 ? 0 : 0));
+        std::fprintf(stderr, "dspark %s\n", per_position(s0, s1).c_str());
     }
     const double t2 = now_ms();
     const auto& s = m.stats();
     const double nt = std::max<double>(1.0, (double) (s.tokens - s0.tokens));
-    std::fprintf(stderr, "decode: %zu tokens in %.0f ms (%.2f tok/s); CPU lane: %lld of %lld experts; the cache moved %lld "
-                         "(%lld in all)\n", out.size(), t2 - t1,
+    std::fprintf(stderr, "decode: %zu tokens in %.0f ms (%.2f tok/s); CPU lane: %lld of %lld experts, streamed to the GPU: "
+                         "%lld; the cache moved %lld (%lld in all)\n", out.size(), t2 - t1,
                  out.size() > 1 ? 1000.0 * (double) (out.size() - 1) / (t2 - t1) : 0.0,
                  (long long) (s.cpu_experts - s0.cpu_experts), (long long) (s.experts - s0.experts),
-                 (long long) (s.swaps - s0.swaps), (long long) s.swaps);
+                 (long long) (s.stream_experts - s0.stream_experts), (long long) (s.swaps - s0.swaps),
+                 (long long) s.swaps);
     std::fprintf(stderr, "decode per token: layers %.2f ms (of it: routing waits %.2f, CPU lane %.2f, the rest host launches), "
                          "head wait %.2f, Engram reads %.2f\n",
                  (s.layer_ms - s0.layer_ms) / nt, (s.gpu_wait_ms - s0.gpu_wait_ms) / nt, (s.cpu_ms - s0.cpu_ms) / nt,
                  (s.head_ms - s0.head_ms) / nt, (s.engram_ms - s0.engram_ms) / nt);
+    if (s.eg_rows > s0.eg_rows) {   // the Engram rows: how many the row cache served, the reads' time behind the layers
+        const double rows = (double) (s.eg_rows - s0.eg_rows);
+        std::fprintf(stderr, "Engram per token: %.0f rows, %.1f%% without a read (the row cache holds %lld of %lld), "
+                             "%.1f read, the reads %.2f ms from asking to the last one (left to wait: %.2f)\n",
+                     rows / nt, 100.0 * (double) (s.eg_hits - s0.eg_hits) / rows, (long long) s.eg_cached,
+                     (long long) s.eg_cache_cap, (double) (s.eg_reads - s0.eg_reads) / nt, (s.eg_io_ms - s0.eg_io_ms) / nt,
+                     (s.engram_ms - s0.engram_ms) / nt);
+    }
+    const long long io1 = io_read_bytes();
+    if (io0 >= 0 && io1 >= 0)
+        std::fprintf(stderr, "decode reads from the disk: %.1f MB a token\n", (double) (io1 - io0) / 1e6 / nt);
+    if (s.skipped > s0.skipped)   // STRATA_DS4_DISK_SKIP_W
+        std::fprintf(stderr, "decode left out %.1f experts a token not in RAM (%.1f%% of the routed)\n",
+                     (double) (s.skipped - s0.skipped) / nt,
+                     100.0 * (double) (s.skipped - s0.skipped) / std::max<double>(1.0, (double) (s.experts - s0.experts)));
+    if (s.skip_on >= 0)
+        std::fprintf(stderr, "DISK_SKIP auto: %s at the end, %lld switches\n", s.skip_on ? "on" : "off",
+                     (long long) s.skip_switches);
+    if (s.ahead_picks > s0.ahead_picks) {   // lookahead
+        const double p = (double) (s.ahead_picks - s0.ahead_picks), c = (double) (s.ahead_cold - s0.ahead_cold);
+        std::fprintf(stderr, "lookahead: the guesses a layer before held %.1f%% of the picks (their top k %.1f%%, two layers "
+                             "before %.1f%%); file-read picks asked for early %.1f%% (%lld of %lld); %.1f experts asked "
+                             "for early a token\n",
+                     100.0 * (double) (s.ahead_hit - s0.ahead_hit) / p, 100.0 * (double) (s.ahead_hit_k - s0.ahead_hit_k) / p,
+                     100.0 * (double) (s.ahead_hit2 - s0.ahead_hit2) / p,
+                     c > 0 ? 100.0 * (double) (s.ahead_cold_hit - s0.ahead_cold_hit) / c : 0.0,
+                     (long long) (s.ahead_cold_hit - s0.ahead_cold_hit), (long long) (s.ahead_cold - s0.ahead_cold),
+                     (double) (s.ahead_pf - s0.ahead_pf) / nt);
+        std::string rk = "lookahead: picked by the guess's rank (1 ..):";
+        for (int i = 0; i < 16; ++i) {
+            const long long n = (long long) (s.ahead_rank_n[i] - s0.ahead_rank_n[i]);
+            if (n <= 0) break;
+            char b[24];
+            std::snprintf(b, sizeof b, " %.0f%%", 100.0 * (double) (s.ahead_rank_hit[i] - s0.ahead_rank_hit[i]) / (double) n);
+            rk += b;
+        }
+        std::fprintf(stderr, "%s\n", rk.c_str());
+    }
+    if (s.prof_tokens > s0.prof_tokens) {   // DS4_PROF
+        const double pt = (double) (s.prof_tokens - s0.prof_tokens);
+        double sum = 0;
+        for (int i = 0; i < 6; ++i) sum += (s.prof_ms[i] - s0.prof_ms[i]) / pt;
+        std::fprintf(stderr, "GPU per token (DS4_PROF): %.2f ms - between layers %.2f, attention %.2f, routing + shared "
+                             "expert %.2f, experts gate/up %.2f, waiting for the CPU lane %.2f, down + post %.2f\n", sum,
+                     (s.prof_ms[0] - s0.prof_ms[0]) / pt, (s.prof_ms[1] - s0.prof_ms[1]) / pt,
+                     (s.prof_ms[2] - s0.prof_ms[2]) / pt, (s.prof_ms[3] - s0.prof_ms[3]) / pt,
+                     (s.prof_ms[4] - s0.prof_ms[4]) / pt, (s.prof_ms[5] - s0.prof_ms[5]) / pt);
+    }
     if (df != nullptr) std::fclose(df);
     }
     m.save_profile();

@@ -1,7 +1,7 @@
-"""Tests for tools/calibrate_ds4.py without a GPU: stand-in engines whose decode and prompt speeds are functions of the
+"""Tests for tools/calibrate_ds4_tp.py without a GPU: stand-in engines whose decode and prompt speeds are functions of the
 --tp and --cpu-threads they were started with (each setting an engine start of its own, as strata-ds4's are).
 
-    python -m unittest tools.test_calibrate_ds4
+    python -m unittest tools.test_calibrate_ds4_tp
 """
 from __future__ import annotations
 
@@ -13,9 +13,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))
-import calibrate_ds4 as C4  # noqa: E402
+import calibrate_ds4_tp as C4  # noqa: E402
 
-NINE = [24.0] + [16.0] * 8               # an RTX 3090 and eight RTX 5060 Ti, in the engine's order
+NINE = [24.0] + [16.0] * 8               # a 24 GB GPU and eight 16 GB ones, in the engine's order
 
 
 class FakeEngine:

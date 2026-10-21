@@ -1,5 +1,5 @@
 {
- "_": "DeepSeek-V4.1-Flash-1017 at 3.5 bits for strata-ds4 (maya.py's DeepSeek setup): every file pinned to a revision, with its size and sha256. The EXL3 quant's repo has no Engram tables: they come from DeepSeek's base repo (they changed in the 1017 release - the older V4.1's must not be used). The repo's assets/ and encoding/ folders (its README's picture, DeepSeek's prompt-format reference) are not needed and not listed.",
+ "_": "DeepSeek-V4.1-Flash-1017 at 3.5 bits for maya-ds4 (maya.py's DeepSeek setup): every file pinned to a revision, with its size and sha256. The EXL3 quant's repo has no Engram tables: they come from DeepSeek's base repo (they changed in the 1017 release - the older V4.1's must not be used). The repo's assets/ and encoding/ folders (its README's picture, DeepSeek's prompt-format reference) are not needed and not listed.",
  "name": "DeepSeek-V4.1-Flash-1017",
  "repo": "LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-3.5bpw",
  "revision": "04a492fc3b4d25ddbab8f2d2f07f235ec77c9010",

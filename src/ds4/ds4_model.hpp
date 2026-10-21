@@ -24,7 +24,9 @@ struct Options {
     std::vector<int> gpus;            // empty: every visible GPU
     int64_t reserve_mib = 600;        // VRAM left free on each GPU
     double vram_experts = 1.0;        // the share of the expert budget to use (tests: less, so the CPU lane works)
-    int cpu_threads = 0;              // 0: the physical cores
+    // the CPU lane's threads: 0 a thread a physical core, or where the host offers it the performance cores or one
+    // NUMA node's cores when measured faster at load; n: at most n, a thread a core
+    int cpu_threads = 0;
     std::string profile;              // expert hit counts (read to place the hottest experts in VRAM, written back)
     bool expert_cache = true;         // experts move between VRAM and the CPU lane as they are used
     // the CPU lane's experts read in place from the model's files, the page cache keeping what fits, instead of
@@ -39,13 +41,9 @@ struct Options {
     bool threads = false;             // a host thread per GPU enqueues its layers (the hand-offs host-mapped)
     // prompts in chunks of this many tokens through each layer at once (threads): the GEMMs on the tensor cores, the
     // CPU lane's experts streamed to the GPUs a chunk at a time instead of computed on the host; 0: windows of 16;
-    // -1: 4096, or 8192 with the experts read in place (every chunk streams them all from the files)
+    // -1: 2048 on one GPU, 4096 on several, or 8192 with the experts read in place (every chunk streams them all from
+    // the files)
     int prefill_chunk = -1;
-    // a long prompt's consumer layers (YOCO: from the first layer of compress ratio 1 on, whose long-range KV and index
-    // keys are that layer's own, made from its input) over only the run's tail: 0 the exact tail, (window - 1) x the
-    // consumer layers + window rows - the state and the logits as with every row; N > 0 the last N rows (at least a
-    // window), their windows cut at the tail's start (DeepInfer's bounded replay: approximate); -1 every row
-    int prefill_keep = 0;
     bool vision = true;               // the vision tower (the checkpoint's vision.* / aligner.*), when it has one
     bool vision_only = false;         // (tests) load the vision tower alone: encode_image() and nothing else
     bool verbose = false;
@@ -60,18 +58,30 @@ struct Image {
 struct Stats {
     int64_t tokens = 0;
     int64_t experts = 0, cpu_experts = 0;   // routed experts run, and how many of them on the CPU lane
+    int64_t stream_experts = 0;             // ... and how many of the others streamed to the GPU (the PCIe lane)
     double cpu_ms = 0.0, gpu_wait_ms = 0.0;   // the CPU lane's time; the host's waits for the routing
     double layer_ms = 0.0, head_ms = 0.0, engram_ms = 0.0;   // the layers' host time in all; the head's wait; Engram reads
+    int64_t eg_rows = 0, eg_hits = 0, eg_reads = 0;   // Engram rows asked for, served without a read, read from the files
+    double eg_io_ms = 0.0;                            // the windows' Engram reads, issue to last done (mostly hidden)
+    int64_t eg_cached = 0, eg_cache_cap = 0;          // the row cache's rows held, its capacity
     int64_t swaps = 0;                // experts the cache moved into VRAM
+    int64_t skipped = 0;              // routed experts STRATA_DS4_DISK_SKIP_W left out (light, not in RAM)
+    int skip_on = -1;                 // DISK_SKIP_AUTO: 1 skipping, 0 off (warm), -1 not in use
+    int64_t skip_switches = 0;        // ... the times it switched
+    double skip_cold = 0.0;           // ... the cold share over its window (while skipping)
+    int64_t ram_experts = 0, ram_moves = 0;   // CPU-lane experts read from the RAM tier; experts moved into it
+    double prof_ms[6] = {};          // DS4_PROF: the GPU's time in decode by stage (between layers, attention, routing +
+    int64_t prof_tokens = 0;         // shared expert, experts' gate / up, the wait for the CPU lane, down + post)
+    // lookahead (decode windows of one): the picks of layers guessed a layer before (the next layer's gate on this
+    // layer's FFN input), of them in the guess's top k / in all its guesses / in the guess two layers before; the picks
+    // read from the files, of them prefetched early; experts prefetched early
+    int64_t ahead_picks = 0, ahead_hit_k = 0, ahead_hit = 0, ahead_hit2 = 0;
+    int64_t ahead_cold = 0, ahead_cold_hit = 0, ahead_pf = 0;
+    int64_t ahead_rank_n[16] = {}, ahead_rank_hit[16] = {};   // the next-layer guesses by rank, and how many were picked
     int64_t drafts_offered = 0, drafts_accepted = 0, drafts_rounds = 0;
+    // per draft position (the 1st .. 8th of a round): verified with all the drafts before it accepted, and accepted
+    int64_t draft_reached[8] = {}, draft_kept[8] = {};
     double draft_ms = 0.0, verify_ms = 0.0;   // the drafter's time, the verification windows' time
-};
-
-/// the routed experts' tiers now (the server's Monitor): in VRAM and the VRAM slots for them, on the CPU lane - the
-/// trunk's layers (the drafter's blocks apart); GB as whole experts
-struct Tiers {
-    int64_t vram = 0, slots = 0, cpu = 0;
-    double vram_gb = 0.0, cpu_gb = 0.0;
 };
 
 class Model {
@@ -85,19 +95,29 @@ public:
     /// Feeds n tokens (windows of up to 16, or a long run in chunks of prefill_chunk); the last `logits_rows` of them get
     /// logits (logits_rows > 16: only a run of one chunk or window).
     bool feed(const int* tokens, int n, int logits_rows, std::string& err);
+    /// feed() of a prompt's end that also keeps the state before its last token in checkpoint `slot` (a prompt's
+    /// last token then rides along in the run of chunks instead of a window of its own); the same as
+    /// feed(n - 1), checkpoint(slot), feed(1)
+    bool feed_mark(const int* tokens, int n, int logits_rows, int slot, std::string& err);
     /// The next token from the last feed's last logit row (greedy when temperature <= 0).
     int sample(float temperature, float top_p, int top_k, float min_p, uint64_t seed, uint64_t counter);
+    /// The request's repetition / frequency / presence penalties (llama.cpp's) for every pick after this - sample() and
+    /// verify() alike: over the last `last_n` tokens the state has consumed (at most 4096; a verify window's row counts
+    /// the drafts before it).  last_n 0 (or every penalty neutral): none, the picks exactly as without.
+    void set_penalties(int last_n, float repeat, float freq, float present);
     /// The last feed's logit rows on the host (rows x vocab floats).
     bool logits(std::vector<float>& out);
 
     /// The DSpark drafter (speculative decoding): its block size (0: not loaded), drafts for the positions after `y`
     /// (y: the token at pos(), not fed yet) with their confidences, and the verification of [y, drafts]: how many of the
-    /// drafts stand and the token after them (the state then holds y and the accepted drafts).  A sampled request
-    /// (temperature > 0) draws its drafts through its own chain (counter: the draw index of the token after y - the
-    /// same the verification gets) and verifies them by speculative sampling: the tokens distributed as plain draws.
+    /// drafts stand and the token after them (the state then holds y and the accepted drafts).  The drafts are the
+    /// drafter's argmax; a sampled request passes its chain (the same temperature / top_p / top_k / min_p / seed /
+    /// counter as its verify()) so that with DS4_DSPARK_SAMPLE=1 they are drawn from the drafter's distribution, as
+    /// DeepSeek's reference does.  verify() keeps a draft d with probability min(1, p(d) / q(d)) over the request's
+    /// chain - the speculative-sampling rule, so every token is still distributed as the model's own draw.
     int draft_block() const;
-    bool draft(int y, float temperature, float top_p, int top_k, float min_p, uint64_t seed, uint64_t counter,
-               std::vector<int>& drafts, std::vector<float>& conf, std::string& err);
+    bool draft(int y, std::vector<int>& drafts, std::vector<float>& conf, std::string& err, float temperature = 0.0f,
+               float top_p = 1.0f, int top_k = 0, float min_p = 0.0f, uint64_t seed = 0, uint64_t counter = 0);
     bool verify(int y, const std::vector<int>& drafts, float temperature, float top_p, int top_k, float min_p,
                 uint64_t seed, uint64_t counter, int& accepted, int& next, std::string& err);
 
@@ -106,6 +126,13 @@ public:
     int feed_unit() const;
     /// Called from feed() while a run of chunks goes through the layers, with the tokens done so far.
     void set_progress(std::function<void(int64_t)> f);
+    /// Asked while a run of chunks goes through the layers: true (a Stop) ends it early - one GPU after the layer it is
+    /// on, several at a chunk all of them reach - and feed() returns false with cancelled() true.  The state past the
+    /// prompt's start is then not usable: restore() a checkpoint kept before the feed, or reset().
+    void set_cancel(std::function<bool()> f);
+    bool cancelled() const;   // the last feed() / feed_mark() ended early on a Stop
+    /// A request starts (before its prompt): DISK_SKIP_AUTO may switch back on here, never mid-answer.
+    void begin_request();
     int64_t pos() const;
     int64_t max_context() const;
     int vocab() const;
@@ -129,14 +156,8 @@ public:
     /// the image bias, and take no part in the Engram n-grams); the rest the embedding table's.
     void set_images(std::vector<Image> images);
 
-    /// Options::prefill_keep from now on (tests: one load, several settings)
-    void set_prefill_keep(int keep);
-    /// A sampled request's drafts: drawn from the drafter's distribution (1), its argmax (0), the default (-1: the
-    /// argmax, DS4_DRAFT_SAMPLE=1 drawn)
-    void set_draft_sample(int on);
     void save_profile() const;
     const Stats& stats() const;
-    Tiers tiers() const;
     std::string describe() const;
     /// INFO / VRAM lines for the server's Monitor.
     std::vector<std::string> info_lines() const;

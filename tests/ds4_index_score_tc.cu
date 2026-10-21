@@ -1,5 +1,5 @@
 // tests/ds4_index_score_tc.cu - the indexer's scores on the tensor cores (index_score's tc kernel) against the CUDA
-// cores' kernel: packed FP4 keys (E2M1 codes, a power-of-two scale a 32) and FP4-quantized queries, a decode window's
+// cores' kernel: packed FP4 keys (kKvFp4p: E2M1 codes, a power-of-two scale a 32) and FP4-quantized queries, a decode window's
 // rows and a prompt slab's, the shared rows and the candidates' (each query its own blocks of positions), per-query
 // limits - the same -inf everywhere, the finite scores within FP32's rounding of each other (the products are exact,
 // their sums run in another order), and how many of each row's top 512 positions the two agree on.
@@ -26,7 +26,8 @@ int main() {
     std::mt19937 rng(11);
     std::uniform_int_distribution<int> code(0, 15), sexp(-6, 3), cbyte(121, 130);
     std::normal_distribution<float> nd;
-    const int HD = 128, H = 32, RB = HD / 2 + HD / 32, k = 512;
+    const int HD = 128, H = 32, k = 512;
+    const size_t RB = kv_row_bytes(kKvFp4p, HD);   // (the cache's rows: codes, scales, padded to 16)
     int fails = 0;
     struct Case { int n, T; bool cand; };
     for (Case cs : {Case{1000, 1, false}, Case{65536, 3, false}, Case{131072, 6, false}, Case{20000, 64, false},
@@ -85,7 +86,7 @@ int main() {
             cudaMemcpy(dc, cand.data(), cand.size() * 4, cudaMemcpyHostToDevice);
         }
         const Rows& r = cs.cand ? cl : lim;
-        index_score(dq, dw, nullptr, dk, H, HD, T, ncols, dc, cmax, cs.cand ? blk : 1, r, o1, ncols, nullptr, false);
+        index_score(dq, dw, dk, H, HD, T, ncols, dc, cmax, cs.cand ? blk : 1, r, o1, ncols, nullptr, kKvFp4p, false);
         cudaEvent_t a, b;
         cudaEventCreate(&a);
         cudaEventCreate(&b);
@@ -93,8 +94,8 @@ int main() {
         for (int tc = 0; tc < 2; ++tc) {
             cudaEventRecord(a);
             for (int it = 0; it < 20; ++it)
-                index_score(dq, dw, nullptr, dk, H, HD, T, ncols, dc, cmax, cs.cand ? blk : 1, r, tc ? o2 : o1, ncols,
-                            nullptr, tc == 1);
+                index_score(dq, dw, dk, H, HD, T, ncols, dc, cmax, cs.cand ? blk : 1, r, tc ? o2 : o1, ncols, nullptr,
+                            kKvFp4p, tc == 1);
             cudaEventRecord(b);
             cudaEventSynchronize(b);
             cudaEventElapsedTime(&ms[tc], a, b);
