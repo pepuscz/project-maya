@@ -2310,6 +2310,16 @@ struct Model::Impl {
             }
             CK(mem_info(&d.free0, &d.total));
         }
+        // (DS4_Q8_BATCH: its line now, at load; DS4_Q8_CHECK=1: the batched rounding checked on every device first)
+        if (pk.gguf) {
+            gg::q8_batch();
+            if (std::getenv("DS4_Q8_CHECK") != nullptr) {
+                std::vector<int> all = ids;
+                if (helper_id >= 0) all.push_back(helper_id);
+                for (int id : all)
+                    if (!gg::q8_batch_check(id, err)) return false;
+            }
+        }
         if (helper_id >= 0 && !helper_open(err)) return false;
         // the groups' width: o.tp, less while the experts' blocks do not split in it (a member takes n_ff / tp of each
         // expert: the down's inputs in whole blocks - a GGUF's 256-value types split n_ff 2304 in 1, 3 or 9 parts)
