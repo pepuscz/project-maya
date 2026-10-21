@@ -4012,6 +4012,7 @@ struct Model::Impl {
             // (a group's member: its share of the heads (wq_b columns, the sinks), of wo_a's groups and wo_b's rows,
             // of the shared expert's FFN; the rest whole)
             const int nm = l0.nm, na = g.heads / std::max(1, l.ahn), ha = l.ah0 / std::max(1, l.ahn);
+            const std::string& P = l.name;
             // (DS4_TP_GGUF_UNEVEN: the shared expert split at the member's own FFN range, as the routed experts -
             //  which needs it as wide as theirs)
             const int sr0 = nm > 1 && tp_uneven && l0.lay.fmt == gg::kFmtMXFP4 ? l.ff0 : -1;
@@ -4023,7 +4024,6 @@ struct Model::Impl {
                     return false;
                 }
             }
-            const std::string& P = l.name;
             const std::string A = P + "attn.";
             bool ok = mat(d, A + "wq_a", l.wq_a, err, acct) &&
                       (l.ahn == 0 || mat(d, A + "wq_b", l.wq_b, err, acct, ha, na, true)) &&
@@ -7125,15 +7125,30 @@ struct Model::Impl {
     }
     // member m of layer l's group: one token x through its parts as decode runs them - its VRAM part of the experts
     // `held` (weights w) by moe_gate_up / moe_down with its own layout and FF, its part of the shared expert by mv /
-    // swiglu / mv - on its stream, the end waited for (kHelperWaitMs; no end: false, its buffers kept)
+    // swiglu / mv - all on its stream: uploaded from the check's own host copies (not the caller's, not this frame's),
+    // both outputs read back on that stream into pinned memory before the end's event, the end waited for
+    // (kHelperWaitMs).  Only a clean end frees anything; an error before it then fails the load as any other.  No
+    // clean end - an error at the end, or none in time: the kernels may still read the model's memory (the layer's
+    // weights, its expert slots, the stream), which the failed load's teardown would free under them - tp_unknown
     bool tp_check_member(const Layer& l, int m, const std::vector<float>& x, const std::vector<int>& held,
                          const float* w, std::vector<float>& routed, std::vector<float>& shared, std::string& err) {
         const Layer& xm = member(l, m);
         Dev& d = devs[(size_t) xm.dev];
         const int D = g.dim, FF = xm.ffn;
         cudaSetDevice(d.id);
+        struct In {   // (the uploads' sources, freed after a clean end only)
+            std::vector<float> x;
+            unsigned long long p[kPicks] = {};
+            float w[kPicks] = {};
+        };
+        In* in = new In;
+        in->x = x;
+        for (size_t i = 0; i < held.size() && i < (size_t) kPicks; ++i) {
+            in->p[i] = (unsigned long long) (uintptr_t) sat(l, xm, l.slot[(size_t) held[i]], unit(xm));
+            in->w[i] = w[i];
+        }
         float *dx = nullptr, *dh = nullptr, *dout = nullptr, *dsg = nullptr, *dsu = nullptr, *dsh = nullptr,
-              *dsho = nullptr, *dw = nullptr;
+              *dsho = nullptr, *dw = nullptr, *back = nullptr;   // (back: pinned - dout's D, then dsho's)
         unsigned long long* dp = nullptr;
         std::vector<void*> bufs;
         auto take = [&](auto*& p, size_t n) {
@@ -7143,23 +7158,23 @@ struct Model::Impl {
             p = (std::remove_reference_t<decltype(p)>) v;
             return ok;
         };
-        bool ok = take(dx, (size_t) D * 4) && take(dh, (size_t) kPicks * FF * 4) && take(dout, (size_t) D * 4) &&
-                  take(dsg, (size_t) FF * 4) && take(dsu, (size_t) FF * 4) && take(dsh, (size_t) FF * 4) &&
-                  take(dsho, (size_t) D * 4) && take(dw, (size_t) kPicks * 4) && take(dp, (size_t) kPicks * 8);
-        unsigned long long hp[kPicks] = {};
-        float hw[kPicks] = {};
-        for (size_t i = 0; i < held.size() && i < (size_t) kPicks; ++i) {
-            hp[i] = (unsigned long long) (uintptr_t) sat(l, xm, l.slot[(size_t) held[i]], unit(xm));
-            hw[i] = w[i];
+        cudaEvent_t ev = nullptr;
+        if (cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) ev = nullptr;
+        bool ok = ev != nullptr && take(dx, (size_t) D * 4) && take(dh, (size_t) kPicks * FF * 4) &&
+                  take(dout, (size_t) D * 4) && take(dsg, (size_t) FF * 4) && take(dsu, (size_t) FF * 4) &&
+                  take(dsh, (size_t) FF * 4) && take(dsho, (size_t) D * 4) && take(dw, (size_t) kPicks * 4) &&
+                  take(dp, (size_t) kPicks * 8);
+        if (ok && cudaMallocHost((void**) &back, (size_t) 2 * D * 4) != cudaSuccess) {
+            back = nullptr;
+            ok = false;
         }
         const int e0 = gg::launch_errors();
-        cudaEvent_t ev = nullptr;
         bool submitted = false;   // (anything on the stream: its end waited for before any free)
         if (ok) {
             submitted = true;
-            ok = cudaMemcpyAsync(dx, x.data(), (size_t) D * 4, cudaMemcpyHostToDevice, d.st) == cudaSuccess &&
-                 cudaMemcpyAsync(dp, hp, sizeof hp, cudaMemcpyHostToDevice, d.st) == cudaSuccess &&
-                 cudaMemcpyAsync(dw, hw, sizeof hw, cudaMemcpyHostToDevice, d.st) == cudaSuccess;
+            ok = cudaMemcpyAsync(dx, in->x.data(), (size_t) D * 4, cudaMemcpyHostToDevice, d.st) == cudaSuccess &&
+                 cudaMemcpyAsync(dp, in->p, sizeof in->p, cudaMemcpyHostToDevice, d.st) == cudaSuccess &&
+                 cudaMemcpyAsync(dw, in->w, sizeof in->w, cudaMemcpyHostToDevice, d.st) == cudaSuccess;
             if (ok) {
                 x3::MoeArgs ma;
                 ma.plan_ptr = dp;
@@ -7175,48 +7190,71 @@ struct Model::Impl {
                 if (ok) swiglu(dsg, dsu, FF, g.lim, dsh, d.st);
                 ok = ok && mv(d, {job(xm.s2, dsh, dsho, 1, FF, D)}, err);
             }
-            ok = ok && cudaGetLastError() == cudaSuccess && gg::launch_errors() == e0;
+            ok = ok && cudaGetLastError() == cudaSuccess && gg::launch_errors() == e0 &&   // (the readback: before the end)
+                 cudaMemcpyAsync(back, dout, (size_t) D * 4, cudaMemcpyDeviceToHost, d.st) == cudaSuccess &&
+                 cudaMemcpyAsync(back + D, dsho, (size_t) D * 4, cudaMemcpyDeviceToHost, d.st) == cudaSuccess;
         }
-        bool done = !submitted;
-        if (submitted) {   // (its event, else - not recorded - the stream itself; only a clean end counts)
-            const bool rec = cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) == cudaSuccess &&
-                             cudaEventRecord(ev, d.st) == cudaSuccess;
+        if (submitted) {   // (its event, else - not recorded - the stream itself; only a clean end goes on)
+            const bool rec = cudaEventRecord(ev, d.st) == cudaSuccess;
             const double t0 = now_ms();
             cudaError_t q;
             while ((q = rec ? cudaEventQuery(ev) : cudaStreamQuery(d.st)) == cudaErrorNotReady &&
                    now_ms() - t0 < kHelperWaitMs)
                 std::this_thread::sleep_for(std::chrono::microseconds(100));
-            done = q == cudaSuccess;
-            ok = ok && rec && done;
+            if (q != cudaSuccess) tp_unknown(d.id, l.il, m, q == cudaErrorNotReady ? "no end in time" : "an error at its end");
+            ok = ok && rec;
         }
-        routed.assign((size_t) D, 0.0f);
-        shared.assign((size_t) D, 0.0f);
-        ok = ok && cudaMemcpy(routed.data(), dout, (size_t) D * 4, cudaMemcpyDeviceToHost) == cudaSuccess &&
-             cudaMemcpy(shared.data(), dsho, (size_t) D * 4, cudaMemcpyDeviceToHost) == cudaSuccess;
-        if (!ok) (void) cudaGetLastError();
-        if (done) {
-            for (void* v : bufs) cudaFree(v);
-            if (ev != nullptr) cudaEventDestroy(ev);
-        }
+        if (ok) {
+            routed.assign(back, back + D);
+            shared.assign(back + D, back + 2 * D);
+        } else
+            (void) cudaGetLastError();
+        for (void* v : bufs) cudaFree(v);
+        if (back != nullptr) cudaFreeHost(back);
+        if (ev != nullptr) cudaEventDestroy(ev);
+        delete in;
         if (!ok && err.empty())
             err = "TP check: CUDA" + std::to_string(d.id) + " (layer " + std::to_string(l.il) + " member " +
-                  std::to_string(m) + "): a CUDA error or no end in " + std::to_string((int) kHelperWaitMs) + " ms";
+                  std::to_string(m) + "): a CUDA error";
         return ok;
     }
+    // a TP check's work without a clean end: what it may still read is the model's - the layer's weights, the expert
+    // slots, the device's stream - and a failed load's teardown frees all of it, so there is none: the line, then the
+    // process ends at once (exit 3: the device's state unknown - whoever runs the engine loads nothing more on these
+    // GPUs and retries nothing until a clean device check)
+    static constexpr int kExitUnknown = 3;
+    [[noreturn]] static void tp_unknown(int dev, int il, int m, const char* why) {
+        std::fprintf(stderr, "ds4: TP check: CUDA%d (layer %d, member %d): %s - the device's state unknown; the process "
+                             "ends without teardown (exit %d)\n", dev, il, m, why, kExitUnknown);
+        std::fflush(stderr);
+        std::fflush(stdout);
+        std::_Exit(kExitUnknown);
+    }
     // DS4_TP_CHECK=1 (DS4_TP_GGUF_UNEVEN, at load, before any request): for each expert format and each rotation of the
-    // split layers (which member takes the odd block), one token through every member's parts (tp_check_member: three
-    // experts the layer holds in VRAM, weights 0.5 / 0.3 / 0.2, and the shared expert), the parts summed on the host in
-    // member order, against the whole: the CPU lane's sums of the same experts (cpu_experts) and the shared expert from
-    // the pack's whole matrices (shared_host). Off by more than kHelperTol of the largest output, not finite, a CUDA
-    // error or no end: the load fails
+    // split layers (which member takes the odd block) - every one they have - one token through every member's parts
+    // (tp_check_member: three experts the layer holds in VRAM, weights 0.5 / 0.3 / 0.2, and the shared expert), the
+    // parts summed on the host in member order, against the whole: the CPU lane's sums of the same experts
+    // (cpu_experts) and the shared expert from the pack's whole matrices (shared_host). Off by more than kHelperTol of
+    // the largest output, not finite, a CUDA error, or a format and rotation with no split layer holding three of its
+    // experts in VRAM (not checked - so no pass): the load fails
     bool tp_check(std::string& err) {
         const int D = g.dim;
         const float w[3] = {0.5f, 0.3f, 0.2f};
-        std::vector<std::string> seen;
-        for (const Layer& l : L) {
-            if (l.mtp || l.nm < 2 || l.lay.fmt != gg::kFmtMXFP4) continue;
+        auto split = [&](const Layer& l) { return !l.mtp && l.nm > 1 && l.lay.fmt == gg::kFmtMXFP4; };
+        auto format = [&](const Layer& l) {
             std::string fmt;
             for (int r = 0; r < 3; ++r) fmt += std::string(r ? "/" : "") + gg::type_name(gg::expert_type(l.lay, r));
+            return fmt;
+        };
+        std::vector<std::string> want, seen;   // (format + " " + rotation)
+        for (const Layer& l : L)
+            if (split(l)) {
+                const std::string key = format(l) + " " + std::to_string(l.il % l.nm);
+                if (std::find(want.begin(), want.end(), key) == want.end()) want.push_back(key);
+            }
+        for (const Layer& l : L) {
+            if (!split(l)) continue;
+            const std::string fmt = format(l);
             const std::string key = fmt + " " + std::to_string(l.il % l.nm);
             if (std::find(seen.begin(), seen.end(), key) != seen.end()) continue;
             std::vector<int> held;
@@ -7274,11 +7312,18 @@ struct Model::Impl {
                 return false;
             }
         }
-        if (seen.empty()) {
-            err = "TP check: no split layer with three experts in VRAM to check";
+        for (const std::string& key : want)
+            if (std::find(seen.begin(), seen.end(), key) == seen.end()) {
+                err = "TP check: " + key.substr(0, key.rfind(' ')) + ", rotation " + key.substr(key.rfind(' ') + 1) +
+                      ": no split layer holds three of its experts in VRAM - not checked";
+                return false;
+            }
+        if (want.empty()) {
+            err = "TP check: no split layer to check";
             return false;
         }
-        std::fprintf(stderr, "ds4: TP check passed (%zu expert formats and rotations) (DS4_TP_CHECK)\n", seen.size());
+        std::fprintf(stderr, "ds4: TP check passed (%zu expert formats and rotations, all the split layers have) "
+                             "(DS4_TP_CHECK)\n", seen.size());
         return true;
     }
 
