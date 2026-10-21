@@ -636,6 +636,8 @@ struct Chunk {
         std::atomic<bool> bad{false};
     };
     bool flow = false;
+    uint8_t* down = nullptr;                 // (DS4_FLOW_TP, an uneven group's member: one expert's whole down, DMA'd in
+                                             //  one copy, its member's columns then gathered into the ring slot)
     int dev = -1;                            // the device (index into devs) this chunk state belongs to
     std::unique_ptr<IoQueue> io;
     std::deque<Item> items;                  // items[0] is item `base`; the indices below are absolute
@@ -3313,6 +3315,16 @@ struct Model::Impl {
                 c.ring_n = std::max(Chunk::kParts, (int) ((mb << 20) / stride) / Chunk::kParts * Chunk::kParts);
                 if (!dalloc(d, c.ring, (size_t) c.ring_n * stride, err)) return false;
             }
+            // (DS4_FLOW_TP with DS4_TP_GGUF_UNEVEN: the whole down of the device's largest split layer, the flow's copies
+            //  of a member's part through it - flow_copy)
+            const bool flow_tp = std::getenv("DS4_FLOW_TP") != nullptr && std::atoi(std::getenv("DS4_FLOW_TP")) != 0;
+            size_t down_b = 0;
+            if (tp_uneven && flow_tp && file_experts)
+                for (const Layer& l : L)
+                    if (!l.mtp && l.nm > 1 && l.lay.fmt == gg::kFmtMXFP4)
+                        for (int m = 0; m < l.nm; ++m)
+                            if (member(l, m).dev == (int) di) down_b = std::max(down_b, mx_part_bytes(l, 2));
+            if (down_b > 0 && !dalloc(d, c.down, down_b, err)) return false;
             CK(cudaStreamCreateWithFlags(&c.cs, cudaStreamNonBlocking));
             for (int i = 0; i < Chunk::kParts; ++i) {
                 CK(cudaEventCreateWithFlags(&c.filled[i], cudaEventDisableTiming));
@@ -3650,9 +3662,12 @@ struct Model::Impl {
     }
     // an item's staged matrices into ring slot dst as member mi's part of the expert (laid out as its hlay): gate / up
     // mx_read_len bytes - from src as the read left them (its rows only), or from whole staging (a copy's NH parts:
-    // every row) at the member's read offset in it; the down's blocks of the member's columns [ff0, ff0 + ffn) out of
-    // every row of the whole matrix (pitch: the whole row).  Alone (nm 1): each matrix whole, as staged
-    bool flow_copy(const Layer& l, int mi, const uint8_t* const* src, bool whole, uint8_t* dst, cudaStream_t s) const {
+    // every row) at the member's read offset in it; the down whole in one copy into `down` (the device's scratch), then
+    // its blocks of the member's columns [ff0, ff0 + ffn) of every row gathered into the slot on the same stream - a 2D
+    // copy of the rows instead costs ~35 ms an expert against ~0.7 (192300Z: per-row transfers).  Alone (nm 1): each
+    // matrix whole, as staged
+    bool flow_copy(const Layer& l, int mi, const uint8_t* const* src, bool whole, uint8_t* dst, uint8_t* down,
+                   cudaStream_t s) const {
         const Layer& x = member(l, mi);
         const x3::ExpertLayout& lay = l.nm > 1 ? x.hlay : l.lay;
         for (int p = 0; p < 2; ++p)
@@ -3663,8 +3678,11 @@ struct Model::Impl {
             const int t2 = gg::expert_type(l.lay, 2);
             const size_t dr = gg::type_row_bytes(t2, g.ff), dh = gg::type_row_bytes(t2, x.ffn),
                          d0 = gg::type_row_bytes(t2, x.ff0);
-            return cudaMemcpy2DAsync(dst + lay.trellis[2], dh, src[2] + d0, dr, dh, (size_t) g.dim, cudaMemcpyHostToDevice,
-                                     s) == cudaSuccess;
+            if (down == nullptr ||
+                cudaMemcpyAsync(down, src[2], (size_t) g.dim * dr, cudaMemcpyHostToDevice, s) != cudaSuccess)
+                return false;
+            gather_cols(down, dr, d0, dh, g.dim, dst + lay.trellis[2], s);
+            return cudaGetLastError() == cudaSuccess;
         }
         return cudaMemcpyAsync(dst + lay.trellis[2], src[2], mx_part_bytes(l, 2), cudaMemcpyHostToDevice, s) == cudaSuccess;
     }
@@ -3887,7 +3905,7 @@ struct Model::Impl {
             const Layer& l = L[(size_t) it.il];
             // (a copy's staging holds each matrix whole: the member's rows from its offset in it - the reads' own staging
             //  holds them only)
-            if (!flow_copy(l, it.mi, it.src, copy_mode && it.ram != nullptr, c.ring + r * c.ring_stride, c.cs)) {
+            if (!flow_copy(l, it.mi, it.src, copy_mode && it.ram != nullptr, c.ring + r * c.ring_stride, c.down, c.cs)) {
                 err = "the flow's copy of layer " + std::to_string(it.il) + " expert " + std::to_string(it.e) + ": " +
                       cudaGetErrorString(cudaGetLastError());
                 return false;
@@ -7297,7 +7315,8 @@ struct Model::Impl {
             return fail("cudaSetDevice failed");
         }
         constexpr size_t kGuard = 256;
-        const size_t u = unit(x), blob = l.blob, dev_bytes = 2 * u + 4 * kGuard;
+        const size_t u = unit(x), blob = l.blob, dev_bytes = 2 * u + 4 * kGuard,   // (the slots, then the down's scratch)
+                     down_b = mx_part_bytes(l, 2);
         std::vector<uint8_t> whole(blob), want(u);
         if (!read_mx(l, 0, whole.data())) return fail("expert 0 not read");
         blob_to_half(l, whole.data(), m, want.data());
@@ -7309,7 +7328,7 @@ struct Model::Impl {
         bool ok = ev != nullptr;
         if (ok && cudaMallocHost((void**) &stage, part_b + blob) != cudaSuccess) stage = nullptr, ok = false;
         if (ok && cudaMallocHost((void**) &back, dev_bytes) != cudaSuccess) back = nullptr, ok = false;
-        if (ok && cudaMalloc((void**) &dv, dev_bytes) != cudaSuccess) dv = nullptr, ok = false;
+        if (ok && cudaMalloc((void**) &dv, dev_bytes + down_b) != cudaSuccess) dv = nullptr, ok = false;
         const uint8_t *ps[3] = {}, *ws[3] = {};
         if (ok) {
             size_t o = 0;
@@ -7325,8 +7344,9 @@ struct Model::Impl {
         bool submitted = false;   // (anything on the stream: its end waited for before any free)
         if (ok) {
             submitted = true;
-            ok = cudaMemsetAsync(dv, 0xA5, dev_bytes, d.st) == cudaSuccess && flow_copy(l, m, ps, false, dv + kGuard, d.st) &&
-                 flow_copy(l, m, ws, true, dv + u + 3 * kGuard, d.st) &&
+            ok = cudaMemsetAsync(dv, 0xA5, dev_bytes, d.st) == cudaSuccess &&
+                 flow_copy(l, m, ps, false, dv + kGuard, dv + dev_bytes, d.st) &&
+                 flow_copy(l, m, ws, true, dv + u + 3 * kGuard, dv + dev_bytes, d.st) &&
                  cudaMemcpyAsync(back, dv, dev_bytes, cudaMemcpyDeviceToHost, d.st) == cudaSuccess;   // (before the end)
         }
         if (submitted) {   // (its event, else - not recorded - the stream itself; only a clean end goes on)
