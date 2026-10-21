@@ -41,6 +41,7 @@ struct Pick {
     hipblasLtMatmulAlgo_t algo{};
 };
 struct Dev {
+    std::mutex mu;                   // (this device's state and its measuring - see gemm)
     bool tried = false, live = false;
     hipblasLtHandle_t h = nullptr;
     void* ws = nullptr;
@@ -48,7 +49,7 @@ struct Dev {
     std::map<Key, Pick> picks;
     std::map<Key, int> saved;        // the store's solution ids for this tag
 };
-std::mutex g_mu;
+std::mutex g_mu;                     // (the store's path and file only: no GPU wait under it)
 Dev g_dev[64];
 std::string g_store;                 // set_store's file ("": the picks this process makes only)
 
@@ -85,6 +86,7 @@ bool off() {
 
 // the store's lines for this device's tag: "<arch> <version> n k ldx ldy rows solution"
 void load_saved(Dev& d) {
+    std::lock_guard<std::mutex> lk(g_mu);
     if (g_store.empty()) return;
     std::ifstream f(g_store);
     std::string line;
@@ -109,8 +111,11 @@ bool gemm(void* stream, const uint16_t* W, int n, int k, const uint16_t* x, int 
     if (off() || t < kMinRows || n <= 0 || k <= 0 || ldx < k || ldy < n) return false;
     int dev = 0;
     if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= 64) return false;
-    std::lock_guard<std::mutex> lk(g_mu);
+    // (the device's own lock: a shape's measuring waits on its stream - behind a tensor-parallel group's all-reduce,
+    //  which waits on the other members' work; under one lock for every device a member that measures would hold
+    //  the others' threads before they enqueue that work, and neither end comes)
     Dev& d = g_dev[dev];
+    std::lock_guard<std::mutex> lk(d.mu);
     if (!d.tried) {
         d.tried = true;
         d.live = hipblasLtCreate(&d.h) == HIPBLAS_STATUS_SUCCESS && hipMalloc(&d.ws, kWorkspace) == hipSuccess;
@@ -196,10 +201,13 @@ bool gemm(void* stream, const uint16_t* W, int n, int k, const uint16_t* x, int 
             if (verbose)
                 std::fprintf(stderr, "ds4 gemm: hipBLASLt n %d k %d ldx %d ldy %d rows <= %d: %d candidates, %s %.3f ms\n",
                              n, k, ldx, ldy, key.tb, got, pick.ok ? "the fastest" : "none ran", pick.ok ? best / 2 : 0.0f);
-            if (pick.ok && !g_store.empty() && !d.tag.empty()) {   // (kept for the next start on this GPU kind)
-                std::ofstream f(g_store, std::ios::app);
-                f << d.tag << ' ' << n << ' ' << k << ' ' << ldx << ' ' << ldy << ' ' << key.tb << ' '
-                  << hipblaslt_ext::getIndexFromAlgo(pick.algo) << '\n';
+            if (pick.ok && !d.tag.empty()) {   // (kept for the next start on this GPU kind)
+                std::lock_guard<std::mutex> ls(g_mu);
+                if (!g_store.empty()) {
+                    std::ofstream f(g_store, std::ios::app);
+                    f << d.tag << ' ' << n << ' ' << k << ' ' << ldx << ' ' << ldy << ' ' << key.tb << ' '
+                      << hipblaslt_ext::getIndexFromAlgo(pick.algo) << '\n';
+                }
             }
         }
         it = d.picks.emplace(key, pick).first;
