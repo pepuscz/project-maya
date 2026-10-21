@@ -979,7 +979,8 @@ void test_experts_q(int D, int F, int tg, int td, cudaStream_t s) {
 const std::pair<int, int> kQPairs[] = {
     {gg::iq::kIQ2_XXS, gg::iq::kIQ3_XXS}, {gg::iq::kIQ2_S, gg::iq::kIQ3_S},  {gg::iq::kIQ3_XXS, gg::iq::kIQ3_S},
     {gg::iq::kIQ4_XS, gg::iq::kQ4_K},     {gg::iq::kQ2_K, gg::iq::kQ3_K},    {gg::iq::kQ4_K, gg::iq::kIQ4_XS},
-    {gg::iq::kQ3_K, gg::iq::kQ2_K},       {gg::iq::kIQ3_S, gg::iq::kIQ2_XXS}, {gg::iq::kIQ3_S, gg::iq::kIQ2_S}};
+    {gg::iq::kQ3_K, gg::iq::kQ2_K},       {gg::iq::kIQ3_S, gg::iq::kIQ2_XXS}, {gg::iq::kIQ3_S, gg::iq::kIQ2_S},
+    {gg::iq::kIQ1_S, gg::iq::kIQ2_XS},    {gg::iq::kIQ2_XS, gg::iq::kIQ1_S},  {gg::iq::kIQ1_S, gg::iq::kQ2_K}};
 
 // a token's 6 low-bit experts at full size: GB/s of the weights read
 void bench_q(cudaStream_t s) {
@@ -1912,7 +1913,7 @@ int main(int argc, char** argv) {
     test_engram_q6k(s);
     test_experts(512, 256, s);
     for (int t : {gg::iq::kIQ2_XXS, gg::iq::kIQ2_S, gg::iq::kIQ3_XXS, gg::iq::kIQ3_S, gg::iq::kIQ4_XS, gg::iq::kQ2_K,
-                  gg::iq::kQ3_K, gg::iq::kQ4_K})
+                  gg::iq::kQ3_K, gg::iq::kQ4_K, gg::iq::kIQ2_XS, gg::iq::kIQ1_S})
         test_mv_q(t, s);
     for (const auto& pr : kQPairs) test_experts_q(512, 256, pr.first, pr.second, s);
     test_lanes(s);

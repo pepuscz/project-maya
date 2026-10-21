@@ -50,6 +50,10 @@ constexpr int kWarps = 8, kThreads = kWarps * 32;
 template <int T>
 struct Ty;
 template <> struct Ty<kIQ2_XXS> { static constexpr int B = 66, TAB = 512, MIN = 0; };
+template <> struct Ty<kIQ2_XS> { static constexpr int B = 74, TAB = 1024, MIN = 0; };
+// IQ1_S: weight = d sc (grid + delta), grid -1..1 (iq1s_grid_gpu's nibbles: grid + 1), delta +-IQ1S_DELTA = +-1/8 - so
+// exactly d sc / 8 times an integer code 8 grid +- 1 (-9..9), and the dot stays an integer one
+template <> struct Ty<kIQ1_S> { static constexpr int B = 50, TAB = 2048, MIN = 0; };
 template <> struct Ty<kIQ2_S> { static constexpr int B = 82, TAB = 2048, MIN = 0; };
 template <> struct Ty<kIQ3_XXS> { static constexpr int B = 98, TAB = 256, MIN = 0; };
 template <> struct Ty<kIQ3_S> { static constexpr int B = 110, TAB = 512, MIN = 0; };
@@ -62,7 +66,8 @@ template <> struct Ty<kQ3_K> { static constexpr int B = 110, TAB = 0, MIN = 0; }
 constexpr int kMXFP4 = 39;
 template <> struct Ty<kMXFP4> { static constexpr int B = 17, TAB = 0, MIN = 0; };
 template <int T> constexpr int kQK = T == kMXFP4 ? 32 : 256;   // values a block
-static_assert(sizeof(block_iq2_xxs) == 66 && sizeof(block_iq2_s) == 82 && sizeof(block_iq3_xxs) == 98 &&
+static_assert(sizeof(block_iq2_xxs) == 66 && sizeof(block_iq2_xs) == 74 && sizeof(block_iq1_s) == 50 &&
+                  sizeof(block_iq2_s) == 82 && sizeof(block_iq3_xxs) == 98 &&
                   sizeof(block_iq3_s) == 110 && sizeof(block_iq4_xs) == 136 && sizeof(block_q4_K) == 144 &&
                   sizeof(block_q2_K) == 84 && sizeof(block_q3_K) == 110,
               "ggml's block sizes");
@@ -80,6 +85,8 @@ __device__ __forceinline__ void load_tab(uint32_t* tab) {
         }
     } else if constexpr (Ty<T>::TAB > 0) {
         const uint32_t* src = T == kIQ2_XXS  ? (const uint32_t*) iq2xxs_grid
+                              : T == kIQ2_XS  ? (const uint32_t*) iq2xs_grid
+                              : T == kIQ1_S   ? (const uint32_t*) iq1s_grid_gpu
                               : T == kIQ2_S   ? (const uint32_t*) iq2s_grid
                               : T == kIQ3_XXS ? (const uint32_t*) iq3xxs_grid
                                               : (const uint32_t*) iq3s_grid;
@@ -167,6 +174,33 @@ __device__ __forceinline__ void decode(const uint8_t* __restrict__ row, int kb, 
             s.q[2 * l + 1] = sgn4(g.y, sg >> 4);
         }
         s.s0 = s.s1 = 2 * (int) (a1 >> 28) + 1;
+        s.d = h2f(b) * 0.125f;
+    } else if constexpr (T == kIQ2_XS) {   // 4 x (9-bit grid index | 7 sign bits), a 4-bit scale a half
+        const uint8_t* q = b + 2 + 8 * ib;
+        const uint32_t sc = b[66 + ib];
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t v = *(const uint16_t*) (q + 2 * l);
+            const uint2 g = ((const uint2*) tab)[v & 511u];
+            const uint32_t sg = ksigns8(v >> 9);
+            s.q[2 * l] = sgn4(g.x, sg);
+            s.q[2 * l + 1] = sgn4(g.y, sg >> 4);
+        }
+        s.s0 = 2 * (int) (sc & 15) + 1;
+        s.s1 = 2 * (int) (sc >> 4) + 1;
+        s.d = h2f(b) * 0.125f;
+    } else if constexpr (T == kIQ1_S) {   // 4 x (8 bits of qs | 3 of qh) grid indices; qh: scale, the delta's sign
+        const uint32_t qs = ld2(b + 2 + 4 * ib), qh = *(const uint16_t*) (b + 34 + 2 * ib);
+        // a byte's code 8 (grid + 1) - (7 or 9) = 8 grid + 1 or - 1: each byte offset by 128 first, so no borrow
+        // crosses into the next, then the offset taken back
+        const uint32_t c = (qh & 0x8000u) ? 0x09090909u : 0x07070707u;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t g = tab[((qs >> (8 * l)) & 255u) | (((qh >> (3 * l)) & 7u) << 8)];
+            s.q[2 * l] = (int) (((((g & 0x0f0f0f0fu) << 3) | 0x80808080u) - c) ^ 0x80808080u);
+            s.q[2 * l + 1] = (int) (((((g >> 4) & 0x0f0f0f0fu) << 3 | 0x80808080u) - c) ^ 0x80808080u);
+        }
+        s.s0 = s.s1 = 2 * (int) ((qh >> 12) & 7u) + 1;
         s.d = h2f(b) * 0.125f;
     } else if constexpr (T == kIQ2_S) {
         const uint8_t* qs = b + 2;
@@ -298,6 +332,24 @@ __device__ __forceinline__ void deq8(const uint8_t* __restrict__ row, int kb, in
             const float gv = (float) ((j < 4 ? g.x >> (8 * j) : g.y >> (8 * (j - 4))) & 255u);
             w[j] = (sg >> j) & 1u ? -(dl * gv) : dl * gv;
         }
+    } else if constexpr (T == kIQ2_XS) {
+        const uint32_t v = *(const uint16_t*) (b + 2 + 8 * ib + 2 * p), sc = b[66 + ib];
+        const uint2 g = ((const uint2*) tab)[v & 511u];
+        const uint32_t sg = ksigns8(v >> 9);
+        const float dl = h2f(b) * (float) (2 * (int) (p < 2 ? sc & 15 : sc >> 4) + 1) * 0.125f;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const float gv = (float) ((j < 4 ? g.x >> (8 * j) : g.y >> (8 * (j - 4))) & 255u);
+            w[j] = (sg >> j) & 1u ? -(dl * gv) : dl * gv;
+        }
+    } else if constexpr (T == kIQ1_S) {
+        const uint32_t qh = *(const uint16_t*) (b + 34 + 2 * ib);
+        const uint32_t g = tab[b[2 + 4 * ib + p] | (((qh >> (3 * p)) & 7u) << 8)];
+        const float dl = h2f(b) * (float) (2 * (int) ((qh >> 12) & 7u) + 1) * 0.125f;
+        const int c = (qh & 0x8000u) ? 9 : 7;   // (the token path's codes: 8 (grid + 1) - c)
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+            w[j] = dl * (float) (8 * (int) ((j < 4 ? g >> (8 * j) : g >> (8 * (j - 4) + 4)) & 15u) - c);
     } else if constexpr (T == kIQ2_S) {
         const uint8_t* qs = b + 2;
         const uint32_t idx = qs[4 * ib + p] | ((((uint32_t) b[66 + ib]) << (8 - 2 * p)) & 0x300u);
@@ -847,6 +899,8 @@ bool tc_ok() {   // as ds4_gguf.cu's: sm_70 and later (AMD: RDNA 3 / 4), STRATA_
 #define DS4_IQ_SWITCH(t, F)          \
     switch (t) {                     \
         case kIQ2_XXS: F(kIQ2_XXS); break; \
+        case kIQ2_XS: F(kIQ2_XS); break;   \
+        case kIQ1_S: F(kIQ1_S); break;     \
         case kIQ2_S: F(kIQ2_S); break;     \
         case kIQ3_XXS: F(kIQ3_XXS); break; \
         case kIQ3_S: F(kIQ3_S); break;     \
@@ -972,6 +1026,8 @@ bool supported(int t) { return block_bytes(t) > 0; }
 int block_bytes(int t) {
     switch (t) {
         case kIQ2_XXS: return Ty<kIQ2_XXS>::B;
+        case kIQ2_XS: return Ty<kIQ2_XS>::B;
+        case kIQ1_S: return Ty<kIQ1_S>::B;
         case kIQ2_S: return Ty<kIQ2_S>::B;
         case kIQ3_XXS: return Ty<kIQ3_XXS>::B;
         case kIQ3_S: return Ty<kIQ3_S>::B;
@@ -986,6 +1042,8 @@ int block_bytes(int t) {
 const char* name(int t) {
     switch (t) {
         case kIQ2_XXS: return "IQ2_XXS";
+        case kIQ2_XS: return "IQ2_XS";
+        case kIQ1_S: return "IQ1_S";
         case kIQ2_S: return "IQ2_S";
         case kIQ3_XXS: return "IQ3_XXS";
         case kIQ3_S: return "IQ3_S";
