@@ -2349,10 +2349,6 @@ struct Model::Impl {
                 return false;
             }
             tp_uneven = std::strcmp(v, "1") == 0;
-            if (tp_uneven && helper_id >= 0) {
-                err = "DS4_TP_GGUF_UNEVEN: not with DS4_HELPER yet (its layers' picks would all go to the CPU lane)";
-                return false;
-            }
             if (tp_uneven && std::getenv("DS4_FLOW_TP") != nullptr && std::atoi(std::getenv("DS4_FLOW_TP")) != 0) {
                 err = "DS4_TP_GGUF_UNEVEN: not with DS4_FLOW_TP (the flow takes even shares)";
                 return false;
@@ -6353,6 +6349,13 @@ struct Model::Impl {
 
     // ---- the helper GPU (DS4_HELPER; the state's note by helper_id)
     static bool helper_owned(const Layer& l, int e) { return !l.helper.empty() && l.helper[(size_t) e] != nullptr; }
+    // a layer whose CPU-lane picks the helper may take: a GGUF's trunk layer of one GPU - or, with DS4_TP_GGUF_UNEVEN, of a
+    // tensor-parallel group. A group's helper state (its pool's experts, the table, the recent slots) is member 0's, the
+    // Layer the routing is published from and the service thread answers; its whole-expert sums join the lead's CPU part,
+    // added once before the MoE all-reduce, and never in any member's vram_tab
+    bool helper_layer(const Layer& l) const {
+        return !l.mtp && (l.nm == 1 || tp_uneven) && l.lay.fmt == gg::kFmtMXFP4;
+    }
     // DS4_HELPER_FAIL=flags|pool (tests): that allocation fails as a real one would - the load's error and the teardown
     // of what was made before it
     static bool helper_fail(const char* what) {
@@ -6511,7 +6514,7 @@ struct Model::Impl {
         };
         std::vector<Cand> c;
         for (const Layer& l : L) {
-            if (l.mtp || l.nm != 1 || l.lay.fmt != gg::kFmtMXFP4) continue;
+            if (!helper_layer(l)) continue;
             const uint32_t* p = prof.data() + (size_t) l.il * g.n_exp;
             double sum = 0;
             for (int e = 0; e < l.n_exp; ++e) sum += p[e];
@@ -6524,7 +6527,7 @@ struct Model::Impl {
         size_t rc_bytes = 0;
         if (rc_want > 0)
             for (const Layer& l : L)
-                if (!l.mtp && l.nm == 1 && l.lay.fmt == gg::kFmtMXFP4) rc_bytes += align256(l.blob) * (size_t) rc_want;
+                if (helper_layer(l)) rc_bytes += align256(l.blob) * (size_t) rc_want;
         if (rc_bytes >= helper_cap) {
             err = "DS4_HELPER_RECENT=" + std::to_string(rc_want) + ": its slots (" + std::to_string(rc_bytes >> 20) +
                   " MiB) do not fit DS4_HELPER_GB (" + std::to_string(helper_cap >> 20) + " MiB)";
@@ -6554,7 +6557,7 @@ struct Model::Impl {
         if (ok && rc_bytes > 0) {   // (the recent slots: after the profile's, each layer's rc_want blobs in a row)
             size_t off = helper_prof;
             for (Layer& l : L) {
-                if (l.mtp || l.nm != 1 || l.lay.fmt != gg::kFmtMXFP4) continue;
+                if (!helper_layer(l)) continue;
                 if (l.helper.empty()) l.helper.assign((size_t) l.n_exp, nullptr);
                 l.rc_n = rc_want;
                 l.rc_base = helper_pool + off;
@@ -6598,7 +6601,27 @@ struct Model::Impl {
                   std::to_string(helper_id);
             return false;
         }
+        int tp_layers = 0, tp_experts = 0;
+        for (const Layer& l : L) {
+            for (int m = 1; m < l.nm; ++m) {   // (a group's members other than 0: none of the helper's state)
+                const Layer& x = member(l, m);
+                if (!x.helper.empty() || x.helper_tab != nullptr || x.rc_n != 0) {
+                    err = "DS4_HELPER: layer " + std::to_string(l.il) + " member " + std::to_string(m) +
+                          " holds helper state (only member 0 may)";
+                    return false;
+                }
+            }
+            if (l.nm > 1 && !l.helper.empty()) {
+                ++tp_layers;
+                for (int e = 0; e < l.n_exp; ++e) tp_experts += l.helper[(size_t) e] != nullptr;
+            }
+        }
         st.helper_held = helper_n;
+        if (tp_uneven)
+            std::fprintf(stderr,
+                         "ds4: helper CUDA%d: %d of its layers tensor-parallel, %d of its experts theirs - each pick's whole "
+                         "expert added once, on the group's lead before the all-reduce (DS4_TP_GGUF_UNEVEN)\n",
+                         helper_id, tp_layers, tp_experts);
         std::fprintf(stderr,
                      "ds4: helper CUDA%d holds %d experts (%.1f of %.1f GB): %.1f%% of the routing the layer devices' "
                      "VRAM leaves over, by the profile (each layer's share)\n",
@@ -6743,7 +6766,7 @@ struct Model::Impl {
         if (rc_want <= 0 || helper_id < 0) return 0;
         uint64_t maxb = 0, mirrors = 0;
         for (const Layer& l : L)
-            if (!l.mtp && l.nm == 1 && l.lay.fmt == gg::kFmtMXFP4) {
+            if (helper_layer(l)) {
                 maxb = std::max<uint64_t>(maxb, l.blob);
                 mirrors += (uint64_t) l.n_exp * 8;
             }
