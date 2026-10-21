@@ -10596,7 +10596,7 @@ struct Model::Impl {
                 for (int i = 0; i < l.k_exp; ++i) {
                     const int e = l.last_picks[(size_t) t * kPicks + i];
                     if (e < 0 || e >= l.n_exp || seen[(size_t) l.il * 1024 + e] || l.slot[(size_t) e] >= 0 ||
-                        (!l.ram.empty() && l.ram[(size_t) e] >= 0))
+                        (!l.ram.empty() && l.ram[(size_t) e] >= 0) || helper_owned(l, e))
                         continue;
                     seen[(size_t) l.il * 1024 + e] = 1;
                     w.push_back({l.il, e});
