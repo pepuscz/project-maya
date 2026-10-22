@@ -96,6 +96,11 @@ public:
     Model();
     ~Model();
     bool load(const Options& o, std::string& err);
+    /// DS4_WARM_STATS=1 (a diagnostic): whether it is on; warm_snapshot(when, req, wall_ms): one stderr line of the
+    /// load's read-ahead list's sampled residency (ds4_model.cu), `req` the request (0: the load's own), `wall_ms` into
+    /// it - the ms it took (0 when off).  load() prints the load's own once.
+    bool warm_stats() const;
+    double warm_snapshot(const char* when, long long req, double wall_ms) const;
 
     /// Feeds `token` at position pos(); with logits, the next token's logits are left on the head's device.
     bool step(int token, bool logits, std::string& err);

@@ -353,6 +353,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     //  <prefix>.<i>.f32, to compare a request's logits byte for byte across processes and histories)
     const char* dump_prefix = std::getenv("DS4_SERVE_DUMP");
     int n_req = 0;
+    long long warm_req = 0;   // (DS4_WARM_STATS: the requests whose prompt it sampled - each line's request number)
     std::vector<float> dump_lg;
     std::FILE* dump_f = nullptr;
     auto dump_rows = [&]() {
@@ -522,6 +523,9 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         held = std::move(pics);
         m.checkpoint(0);
         const double t1 = now_ms();
+        // (DS4_WARM_STATS: the snapshot after the prompt, outside both timers - the prompt's ends at t1, the decode's
+        //  starts after it at t1d; its own ms and the request's wall time in its line.  Off: t1d is t1)
+        const double t1d = m.warm_stats() ? (m.warm_snapshot("after the prompt", ++warm_req, t1 - t0), now_ms()) : t1;
         long long produced = 0;
         const char* finish = "length";
         const long long limit = r.max_new > 0 ? r.max_new : m.max_context() - (long long) r.ids.size();
@@ -546,7 +550,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         const long long io_dec = io_read_bytes();
         auto stat_line = [&]() {
             const strata::ds4::Stats& s = m.stats();
-            const double ms = now_ms() - t1;
+            const double ms = now_ms() - t1d;
             const double fed = (double) std::max<int64_t>(1, s.tokens - s_dec.tokens);
             const double ex = (double) (s.experts - s_dec.experts), cx = (double) (s.cpu_experts - s_dec.cpu_experts),
                          sx = (double) (s.stream_experts - s_dec.stream_experts),
@@ -631,16 +635,17 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         //  the checkpoint at this prompt's end)
         stat_line();
         const double t2 = now_ms();
-        std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu 0 0\n", produced, r.ids.size(), t1 - t0, t2 - t1, finish,
+        std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu 0 0\n", produced, r.ids.size(), t1 - t0, t2 - t1d, finish,
                     d_acc, d_off, from);
         std::fflush(stdout);
+        if (m.warm_stats()) m.warm_snapshot("after the decode", warm_req, now_ms() - t0);   // (after DONE: no timer)
         const auto& s = m.stats();
         std::fprintf(stderr,
                      "maya ds4 serve: prompt %zu tokens = %zu reused + %zu read in %.0f ms (%.1f tok/s), %lld generated "
                      "in %.0f ms (%.2f tok/s); CPU lane %.1f%% of the experts\n",
                      r.ids.size(), from, r.ids.size() - from, t1 - t0,
-                     t1 > t0 ? 1000.0 * (double) (r.ids.size() - from) / (t1 - t0) : 0.0, produced, t2 - t1,
-                     t2 > t1 ? 1000.0 * (double) produced / (t2 - t1) : 0.0,
+                     t1 > t0 ? 1000.0 * (double) (r.ids.size() - from) / (t1 - t0) : 0.0, produced, t2 - t1d,
+                     t2 > t1d ? 1000.0 * (double) produced / (t2 - t1d) : 0.0,
                      s.experts ? 100.0 * (double) s.cpu_experts / (double) s.experts : 0.0);
         if (d_off > 0) std::fprintf(stderr, "maya ds4 serve: drafts %lld of %lld kept; %s\n", d_acc, d_off,
                                     per_position(s_dec, s).c_str());

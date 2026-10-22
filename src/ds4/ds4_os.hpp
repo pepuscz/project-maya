@@ -285,6 +285,39 @@ inline bool resident_sampled(const void* p, size_t bytes, int samples = 8) {
     return true;
 #endif
 }
+/// (DS4_WARM_STATS, a diagnostic) resident_sampled's samples with a failure told apart: 1 every sampled page resident,
+/// 0 one not, -1 a mincore call failed (and elsewhere than Linux: not measured).  Never reads, touches or advises the
+/// range.
+inline int resident_sampled_checked(const void* p, size_t bytes, int samples = 8) {
+#if defined(_WIN32)
+    (void) p, (void) bytes, (void) samples;
+    return -1;
+#else
+    if (bytes == 0) return 1;
+    const uintptr_t pg = 4096, a = (uintptr_t) p, span = bytes - 1;
+    samples = std::max(1, std::min(samples, 16));
+    int r = 1;
+    for (int i = 0; i < samples; ++i) {
+        unsigned char v = 0;
+        const uintptr_t at = (a + (samples > 1 ? span / (samples - 1) * i : 0)) & ~(pg - 1);
+        if (mincore((void*) at, pg, &v) != 0) return -1;
+        if (!(v & 1)) r = 0;
+    }
+    return r;
+#endif
+}
+/// (DS4_WARM_STATS) whether this process owns the open file fd - Linux's mincore reports a file's pages truthfully only
+/// to its owner (or one that may write it): 1 owned, 0 not, -1 fstat failed (and elsewhere than Linux: not measured)
+inline int owned_by_me(fd_t fd) {
+#if defined(_WIN32)
+    (void) fd;
+    return -1;
+#else
+    struct stat st {};
+    if (fstat((int) fd, &st) != 0) return -1;
+    return st.st_uid == geteuid() ? 1 : 0;
+#endif
+}
 /// prefetch() of the ranges that do not look resident (resident_sampled) - on Windows, where PrefetchVirtualMemory walks
 /// every page of a resident range (0.34 ms a 6.3 MB expert matrix on a Strix Halo); Linux's madvise(WILLNEED) on cached
 /// pages costs ~1 us a matrix (a Core i5-12600T), less than the residency check (2.5 us): every range there

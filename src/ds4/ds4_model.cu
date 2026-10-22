@@ -1056,6 +1056,11 @@ struct Model::Impl {
     // another (route_pair), publish as before - checked at load (route_fuse_check).  The load refuses it with
     // DS4_AHEAD other than 1; every other case (no guess, the other members, windows, the drafter) keeps the old path
     bool route_fuse = false;
+    // DS4_WARM_STATS=1 (a diagnostic): the load's read-ahead list - the CPU lane's experts, the most-routed first, the
+    // order the load read them in - and how many of it it read (warm_list, warm_read), kept for warm_snapshot
+    bool warm_stats_on = false;
+    std::vector<std::pair<int, int>> warm_list;
+    size_t warm_read = 0;
     // (DS4_ROUTE_FUSE) whether a decoded token's router stage on this lead fuses: every bound gemv_f32_pair and
     // route_pair refuse, checked before anything is enqueued - an incompatible layer or next layer takes the old path
     static bool route_fusable(const Layer& l, const Layer* nx, int m, int D) {
@@ -2386,6 +2391,13 @@ struct Model::Impl {
             if (hc_fuse)
                 std::fprintf(stderr, "ds4: a decoded token's HC split and norm in one launch, its attention input "
                                      "rounded to int8 there, the layer's pre copy by its FFN split (DS4_HC_FUSE)\n");
+        }
+        if (const char* v = std::getenv("DS4_WARM_STATS")) {
+            if (std::strcmp(v, "1") != 0 && std::strcmp(v, "0") != 0) {
+                err = std::string("DS4_WARM_STATS=") + v + ": 1 or 0";
+                return false;
+            }
+            warm_stats_on = std::strcmp(v, "1") == 0;
         }
         if (const char* v = std::getenv("DS4_ROUTE_FUSE")) {
             if (std::strcmp(v, "1") != 0 && std::strcmp(v, "0") != 0) {
@@ -5042,6 +5054,11 @@ struct Model::Impl {
                 for (size_t i; (i = wi.fetch_add(1)) < nw;) read_mx(L[(size_t) warm[i].layer], warm[i].e, buf.data());
             });
         for (auto& t : wt) t.join();
+        if (warm_stats_on) {   // (DS4_WARM_STATS: the list as read, for warm_snapshot)
+            warm_list.clear();
+            for (const Warm& w : warm) warm_list.push_back({w.layer, w.e});
+            warm_read = nw;
+        }
         if (o.verbose && nw > 0)
             std::fprintf(stderr, "ds4: %zu CPU-lane experts read ahead (%.1f GB) in %.1f s\n", nw,
                          nw * (double) L[0].blob / 1e9, (now_ms() - t0) / 1000.0);
@@ -7850,6 +7867,73 @@ struct Model::Impl {
                          d.id, runs, ids.c_str(), kinds.c_str());
         }
         return true;
+    }
+
+    // DS4_WARM_STATS=1 (a diagnostic): one line on stderr, `when` - after the load (once), after a request's prompt and
+    // after its decode (each once a request, outside both its timers; request `req`, `wall_ms` into it) - of the load's
+    // read-ahead list (warm_list: the CPU lane's experts, the most-routed first; warm_read of them read ahead) in five
+    // fixed buckets by position: [0, n/3), [n/3, 2n/3), [2n/3, n), [n, 2n), [2n, the end) with n = warm_read (a bucket
+    // may be empty).  Each: its experts, those whose three parts each pass os::resident_sampled_checked's 8 sampled
+    // pages (sampled - a partly resident expert can pass), and their whole-expert-equivalent bytes.  Only when every
+    // part's file is this process's (truthful mincore: os::owned_by_me); else "masked" and no counts.  fstat or mincore
+    // failures are counted and printed, never taken for resident or cold.  It reads, touches, advises and writes
+    // nothing of the model: mincore and fstat only.  Returns the ms it took (printed too)
+    double warm_snapshot(const char* when, long long req, double wall_ms) const {
+        if (!warm_stats_on) return 0.0;
+        const double t0 = now_ms();
+        const size_t N = warm_list.size(), n = std::min(warm_read, N);
+        const size_t edge[6] = {0, n / 3, 2 * n / 3, n, std::min(N, 2 * n), N};
+        std::string where = std::string(when);
+        if (req > 0)
+            where += " (request " + std::to_string(req) + ", " + std::to_string((long long) wall_ms) + " ms into it)";
+        int not_mine = 0, fstat_failed = 0;
+        std::vector<signed char> own(pk.fds.size(), 2);   // (2: not asked yet)
+        for (const auto& x : warm_list) {
+            const Layer& l = L[(size_t) x.first];
+            for (int r = 0; r < 3; ++r) {
+                const size_t f = (size_t) l.mx_file[r];
+                if (f >= own.size() || own[f] != 2) continue;
+                own[f] = (signed char) os::owned_by_me(pk.fds[f]);
+                not_mine += own[f] == 0;
+                fstat_failed += own[f] < 0;
+            }
+        }
+        if (not_mine > 0 || fstat_failed > 0) {
+            const double ms = now_ms() - t0;
+            std::fprintf(stderr, "ds4: warm stats, %s: masked - %d of the list's files not this process's, %d not "
+                                 "stat-ed: mincore would report every page resident, so no residency (%zu experts on "
+                                 "the list, %zu read ahead); %.1f ms (DS4_WARM_STATS)\n",
+                         where.c_str(), not_mine, fstat_failed, N, n, ms);
+            return ms;
+        }
+        size_t in[5] = {}, all[5] = {}, errors = 0;
+        double bytes[5] = {};
+        for (int b = 0; b < 5; ++b)
+            for (size_t i = edge[b]; i < edge[b + 1]; ++i) {
+                const Layer& l = L[(size_t) warm_list[i].first];
+                const int e = warm_list[i].second;
+                ++all[b];
+                int res = 1;
+                for (int r = 0; r < 3 && res >= 0; ++r) {
+                    const int q = os::resident_sampled_checked(mx_mat(l, e, r), mx_part_bytes(l, r), 8);
+                    res = q < 0 ? -1 : std::min(res, q);
+                }
+                if (res < 0) ++errors;
+                else if (res == 1) ++in[b], bytes[b] += (double) l.blob;
+            }
+        std::string buckets;
+        for (int b = 0; b < 5; ++b) {
+            char t[96];
+            std::snprintf(t, sizeof t, "%s[%zu, %zu): %zu of %zu (%.1f GB)", b ? "; " : "", edge[b], edge[b + 1], in[b],
+                          all[b], bytes[b] / 1e9);
+            buckets += t;
+        }
+        const double ms = now_ms() - t0;
+        std::fprintf(stderr, "ds4: warm stats, %s: the read-ahead list's %zu experts, %zu read ahead - sampled "
+                             "resident (8 pages a part; whole-expert-equivalent bytes) %s; %zu mincore failures; %.1f "
+                             "ms (DS4_WARM_STATS)\n",
+                     where.c_str(), N, n, buckets.c_str(), errors, ms);
+        return ms;
     }
 
     // DS4_ROUTE_FUSE=1 (at load, before any request), on every device with layers: gemv_f32_pair and route_pair (with
@@ -12498,7 +12582,15 @@ struct Model::Impl {
 
 Model::Model() : p_(new Impl) {}
 Model::~Model() = default;
-bool Model::load(const Options& o, std::string& err) { return p_->load(o, err); }
+bool Model::load(const Options& o, std::string& err) {
+    const bool ok = p_->load(o, err);
+    if (ok) p_->warm_snapshot("after the load", 0, 0.0);   // (DS4_WARM_STATS: once a load)
+    return ok;
+}
+bool Model::warm_stats() const { return p_->warm_stats_on; }
+double Model::warm_snapshot(const char* when, long long req, double wall_ms) const {
+    return p_->warm_snapshot(when, req, wall_ms);
+}
 bool Model::step(int token, bool logits, std::string& err) { return p_->step(token, logits, err); }
 bool Model::feed(const int* tokens, int n, int logits_rows, std::string& err) {
     Impl& p = *p_;
