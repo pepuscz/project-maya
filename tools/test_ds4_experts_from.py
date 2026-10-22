@@ -108,7 +108,7 @@ class ExpertsFrom(unittest.TestCase):
     def pack(self, *extra, out="maya-ds4-hybrid"):
         cmd = [sys.executable, str(PACK), "--model", str(self.q)]
         if out:
-            cmd += ["--out", str(self.q / out)]
+            cmd += ["--out", str(self.q / out)]   # (an absolute out stays as it is)
         return subprocess.run(cmd + list(extra), capture_output=True, text=True)
 
     def test_only_the_routed_experts_taken_bit_for_bit(self):
@@ -158,6 +158,33 @@ class ExpertsFrom(unittest.TestCase):
     def test_out_required(self):
         self.refused("name the pack's folder with --out", *self.shards, out=None)
         self.assertFalse((self.q / "maya-ds4").exists())
+
+    def test_only_a_fresh_destination(self):
+        """The quant's own pack (written first), by its path, a link to it or a path through one; any existing folder,
+        empty or not; the model's folder: each refused before anything is written, every existing file unchanged."""
+        own = self.pack(out="maya-ds4")
+        self.assertEqual(own.returncode, 0, own.stderr)
+        other = self.q / "maya-ds4-old"
+        other.mkdir()
+        (other / "note.txt").write_text("kept")
+        (self.q / "maya-ds4-empty").mkdir()
+        (self.base / "alias").symlink_to(self.q / "maya-ds4")
+        snap = lambda: {str(p): p.read_bytes() for p in sorted(self.base.rglob("*")) if p.is_file()}   # noqa: E731
+        before = snap()
+        for out, want in ((str(self.q / "maya-ds4"), "is there - the hybrid pack goes to a fresh folder"),
+                          ("maya-ds4", "is there"),
+                          (str(self.base / "alias"), "is there"),
+                          (str(self.base / "alias" / "new"), "is the model's folder or the quant's own pack"),
+                          (str(other), "is there"),
+                          (str(self.q / "maya-ds4-empty"), "is there"),
+                          (str(self.q), "is there")):
+            with self.subTest(out):
+                r = self.pack("--experts-from", *self.shards, out=out)
+                self.assertNotEqual(r.returncode, 0, r.stdout)
+                self.assertIn(want, r.stderr)
+                self.assertEqual(snap(), before)
+                self.assertFalse((self.q / "maya-ds4" / "new").exists())
+        self.assertFalse(any(self.base.rglob("experts-from.json")))
 
     def test_the_first_shard_required(self):
         self.refused("its first shard (split.no 0, the model's metadata) is not among the files", *self.shards[1:])

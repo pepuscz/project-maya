@@ -21,7 +21,8 @@ present; without it the engine reads text only.
 --experts-from: another quant's shards of the same model to take ONLY the routed experts from (every layer's
 blk.N.ffn_{gate,up,down}_exps.weight, each of the quant's dims) - dense, router, shared experts and Engram stay the quant's
 own, the other set's tensors are passed over, and its shards without routed experts (unsloth's Engram table shard) need not
-be there; --out names the pack, experts-from.json in it says what was taken.  experts_from() lists what it checks.
+be there; --out names the pack - a fresh folder, never the quant's own pack or an existing folder (nor a link to one) -
+and experts-from.json in it says what was taken.  experts_from() lists what it checks.
 
 A quant that leaves the two Engram tables out (v1.1.16's Maya-S; Maya's quants hold them since) takes them from a set
 of GGUF files that holds them, beside it: --engram, else ../Engram/ (unsloth's MXFP8 shard of them, where setups before
@@ -280,7 +281,8 @@ def engram_set(model: pathlib.Path, explicit: str | None):
 
 
 ROUTED = re.compile(r"blk\.(\d+)\.ffn_(gate|up|down)_exps\.weight$")
-# the geometry the experts' set must share with the quant (its first shard's metadata)
+# the geometry the experts' set must share with the quant (its first shard's metadata) - a compatibility check, not
+# proof that both come from the same checkpoint's weights: the sources' pinned revisions are that provenance
 SAME_GEOMETRY = ("block_count", "embedding_length", "expert_count", "expert_used_count", "expert_feed_forward_length")
 
 
@@ -288,7 +290,8 @@ def experts_from(paths: list, gs: list, kv: dict):
     """--experts-from: another quant's shards of the same model to take the routed experts from, and nothing else.
     (the shards read, a tensor-free description for experts-from.json) - or SystemExit, which names what is wrong:
       - one split: every file whole, the same split.count, distinct split.no, its first shard (split.no 0: the only one
-        with the model's metadata) among them - so the architecture and SAME_GEOMETRY can be checked against the quant's;
+        with the model's metadata) among them - so the architecture and SAME_GEOMETRY can be checked against the quant's
+        (geometry compatibility only, not proof of the same checkpoint's weights: the pinned source revisions are that);
         the shards that hold no routed experts (the Engram table's, say) need not be there
       - its routed tensors (blk.N.ffn_{gate,up,down}_exps.weight) exactly the quant's, by name, none twice: no layer or
         role missing or extra
@@ -418,13 +421,21 @@ def main() -> int:
                     help="another quant's shards of the same model (one split, its first shard among them) to take ONLY "
                          "the routed experts from - every layer's blk.N.ffn_{gate,up,down}_exps.weight, each of the "
                          "quant's dims; every other tensor stays the quant's own (dense, router, shared experts, Engram). "
-                         "Shards without routed experts need not be there. --out is required; experts-from.json in it "
-                         "says what was taken")
+                         "Shards without routed experts need not be there. --out is required - a fresh folder, not the "
+                         "quant's own pack nor any existing folder or link; experts-from.json in it says what was taken")
     a = ap.parse_args()
     if a.experts_from and not a.out:
         raise SystemExit("--experts-from: name the pack's folder with --out (the quant's own pack stays as it is)")
     model = pathlib.Path(a.model).expanduser().resolve()
     out = pathlib.Path(a.out).expanduser() if a.out else model / "maya-ds4"
+    if a.experts_from:   # (a fresh folder of its own, before anything is read or written: never a pack that is there)
+        own, dest = (model / "maya-ds4").resolve(), out.resolve()
+        if os.path.lexists(out):
+            raise SystemExit("--experts-from: %s is there - the hybrid pack goes to a fresh folder of its own (no "
+                             "existing pack or folder, nor a link to one, is written into)" % out)
+        if dest == model or dest == own or own in dest.parents:
+            raise SystemExit("--experts-from: %s is the model's folder or the quant's own pack (%s), or inside it" %
+                             (out, own))
     shards = [model / n for n in a.shards] if a.shards else sorted(model.glob("*.gguf"))
     if not shards or not all(p.is_file() for p in shards):
         raise SystemExit("%s: no .gguf files" % model if not shards else
@@ -570,7 +581,7 @@ def main() -> int:
     vocab = next(t[5][0] for t in tensors if t[0] == "embed.weight")
     geo = geometry(kv, vocab)
 
-    out.mkdir(parents=True, exist_ok=True)
+    out.mkdir(parents=True, exist_ok=not a.experts_from)   # (--experts-from: still fresh, or no pack)
     with (out / "ds4.txt").open("w") as f:
         for k, v in geo.items():
             if v is None:
