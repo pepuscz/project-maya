@@ -4,7 +4,8 @@
 // shared expert), a window's grouped experts (bit for bit the token path's), the prompt path's expert sets and the CPU
 // lane's rows; the PCIe lane's streamed experts (bit for bit the VRAM ones'); and the KV caches' packed rows
 // (ds4_kernels.cu) against the BF16 rows bit for bit.  Needs a GPU, no model.
-// ds4_gguf_test [n_embd n_ff] | --kv (the caches alone) | --lane (the PCIe lane alone)
+// ds4_gguf_test [n_embd n_ff] | --kv (the caches alone) | --lane (the PCIe lane alone) | --ud (unsloth UD-IQ1_* pairs
+// at DS4 geometry)
 #include "../src/ds4/ds4_gguf.cuh"
 #include "../src/ds4/ds4_gguf_cpu.hpp"
 #include "../src/ds4/ds4_iq.cuh"
@@ -981,6 +982,11 @@ const std::pair<int, int> kQPairs[] = {
     {gg::iq::kIQ4_XS, gg::iq::kQ4_K},     {gg::iq::kQ2_K, gg::iq::kQ3_K},    {gg::iq::kQ4_K, gg::iq::kIQ4_XS},
     {gg::iq::kQ3_K, gg::iq::kQ2_K},       {gg::iq::kIQ3_S, gg::iq::kIQ2_XXS}, {gg::iq::kIQ3_S, gg::iq::kIQ2_S},
     {gg::iq::kIQ1_S, gg::iq::kIQ2_XS},    {gg::iq::kIQ2_XS, gg::iq::kIQ1_S},  {gg::iq::kIQ1_S, gg::iq::kQ2_K}};
+// unsloth's DeepSeek-V4.1-Flash-1017 UD-IQ1_S and UD-IQ1_M routed experts' (gate / up, down) types, every pair either
+// has (from their GGUF headers at revision 60ad365): --ud runs them at DS4's own geometry
+const std::pair<int, int> kUdPairs[] = {
+    {gg::iq::kIQ1_S, gg::iq::kIQ1_S},     {gg::iq::kIQ1_S, gg::iq::kIQ2_XXS}, {gg::iq::kIQ2_XXS, gg::iq::kIQ2_XXS},
+    {gg::iq::kIQ2_XXS, gg::iq::kIQ2_S},   {gg::iq::kIQ2_XXS, gg::iq::kIQ2_XS}, {gg::iq::kIQ2_XS, gg::iq::kIQ2_XS}};
 
 // a token's 6 low-bit experts at full size: GB/s of the weights read
 void bench_q(cudaStream_t s) {
@@ -1899,6 +1905,15 @@ int main(int argc, char** argv) {
     }
     if (argc >= 2 && std::strcmp(argv[1], "--lane") == 0) {   // the PCIe lane's streamed experts alone
         test_lanes(s);
+        std::printf("%s (%d failed)\n", g_fail ? "FAILED" : "ALL OK", g_fail);
+        return g_fail ? 1 : 0;
+    }
+    if (argc >= 2 && std::strcmp(argv[1], "--ud") == 0) {   // kUdPairs at n_embd 5120, n_ff 2304 (DS4's): the token
+        for (const auto& pr : kUdPairs) test_experts_q(5120, 2304, pr.first, pr.second, s);   // path, window, prompt
+        if (gg::launch_errors() != 0) {                                                        // sets, CPU lane
+            std::printf("launch errors: %d\n", gg::launch_errors());
+            ++g_fail;
+        }
         std::printf("%s (%d failed)\n", g_fail ? "FAILED" : "ALL OK", g_fail);
         return g_fail ? 1 : 0;
     }
