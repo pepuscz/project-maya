@@ -40,7 +40,8 @@ def nbytes(typ: int, dims: list) -> int:
     return n // per * bpb
 
 
-def gguf(path: pathlib.Path, tensors: list, meta: bool = True, split=None, geo=None, arch="deepseek41", cut=0) -> dict:
+def gguf(path: pathlib.Path, tensors: list, meta: bool = True, split=None, geo=None, arch="deepseek41", cut=0,
+         pad=True) -> dict:
     """A GGUF of tensors [(name, type, dims)] with distinct made-up bytes; meta: the model's metadata (architecture,
     geometry, a vocabulary), split: (no, count) -> {name: its bytes}."""
     kv = []
@@ -62,7 +63,8 @@ def gguf(path: pathlib.Path, tensors: list, meta: bool = True, split=None, geo=N
         data += b
         off += len(b)
     head = b"GGUF" + struct.pack("<IQQ", 3, len(tensors), len(kv)) + b"".join(kv) + info
-    head += b"\0" * ((-len(head)) % 32)
+    if pad or tensors:     # (pad=False: a metadata-only shard as unsloth publishes it - no tensors, no alignment padding)
+        head += b"\0" * ((-len(head)) % 32)
     body = head + data
     path.write_bytes(body[:len(body) - cut])
     return out
@@ -247,6 +249,17 @@ class ExpertsFrom(unittest.TestCase):
         gguf(self.u / "u-00004-of-00004.gguf", routed(1, IQ1_S, IQ2_XS)[:1], meta=False, split=(3, 4))
         self.refused("blk.1.ffn_gate_exps.weight in u-00003-of-00004.gguf and u-00004-of-00004.gguf",
                      *self.shards, str(self.u / "u-00004-of-00004.gguf"))
+
+    def test_a_metadata_shard_without_padding(self):
+        """unsloth's UD-IQ1_M 00001 (5,780,923 B): no tensors, its header ending 5 B short of the next 32 B boundary -
+        whole (050330Z refused it); a shard WITH tensors still needs every payload at its aligned data_start."""
+        gguf(self.u / "u-00001-of-00004.gguf", [], split=(0, 4), pad=False)
+        self.assertNotEqual(os.path.getsize(self.u / "u-00001-of-00004.gguf") % 32, 0)
+        r = self.pack("--experts-from", *self.shards, out="maya-ds4-hybrid-ok")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue((self.q / "maya-ds4-hybrid-ok" / "tensors.txt").is_file())
+        gguf(self.u / "u-00001-of-00004.gguf", [], split=(0, 4), pad=False, cut=1)   # (its header itself cut short)
+        self.refused("--experts-from: not whole (u-00001-of-00004.gguf:", *self.shards)
 
     def test_a_shard_not_whole(self):
         gguf(self.u / "u-00003-of-00004.gguf", routed(1, IQ1_S, IQ2_XS), meta=False, split=(2, 4), cut=40)

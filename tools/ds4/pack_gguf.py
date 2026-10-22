@@ -75,6 +75,7 @@ class Gguf:
                 self.tensors.append((name, typ, dims, off))
             align = int(self.kv.get("general.alignment", 32))
             pos = f.tell()
+            self.header_end = pos   # (where the metadata and tensor infos end; a file without tensors need hold no more)
             self.data_start = (pos + align - 1) // align * align
         del self.f
 
@@ -302,8 +303,15 @@ def experts_from(paths: list, gs: list, kv: dict):
     for p in paths:
         if not p.is_file():
             raise SystemExit("%s: not there (--experts-from)" % p)
-        g = Gguf(p)
-        why = short(g)
+        try:
+            g = Gguf(p)
+        except (Exception, SystemExit) as e:   # noqa: BLE001 - a header cut short raises anything (as engram_set)
+            raise SystemExit("--experts-from: not whole (%s: its header unreadable: %s)" % (p.name, str(e) or type(e).__name__))
+        # (whole: with tensors, every payload at its aligned data_start - short(); without, only its own header - the
+        #  first shard of a split as unsloth publishes it ends there, with no padding to the next alignment boundary)
+        size = p.stat().st_size
+        why = short(g) if g.tensors else (None if size >= g.header_end else
+                                          "%s: %d of %d header bytes" % (p.name, size, g.header_end))
         if why:
             raise SystemExit("--experts-from: not whole (%s)" % why)
         egs.append(g)
