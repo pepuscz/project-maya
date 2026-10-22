@@ -446,6 +446,18 @@ installs, or checked by hash before each start) can keep them elsewhere.
 | Setting | Default | |
 | --- | --- | --- |
 | `MAYA_DS4_LT_STORE` | `<pack>/lt-picks.txt` | the picks in this file instead; empty: none kept, each start measures its own |
+## DeepSeek: a GEMV call's int8 inputs rounded in one launch
+
+A GGUF pack's Q8_0 (and low-bit dense) GEMVs round their activations to int8 first, one small launch per job: a
+decoded token runs a few hundred of them per GPU, each about 2 us of work behind a launch gap. With
+`MAYA_DS4_Q8_BATCH=1` a call's jobs are rounded in one launch before its GEMVs, by the same per-block code, so the
+int8 values, the scales and the answers are bit for bit the same. `MAYA_DS4_Q8_CHECK=1` checks the batched rounding
+against the per-job one on every GPU at load (any difference fails the start).
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_DS4_Q8_BATCH` | off | `1`: a GEMV call's int8 rounding in one launch (the same bits) |
+| `MAYA_DS4_Q8_CHECK` | off | `1`: the batched rounding checked against the per-job one on every GPU at load |
 
 ## DeepSeek: the starting expert profile
 
