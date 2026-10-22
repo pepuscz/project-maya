@@ -81,7 +81,10 @@ class Gguf:
 
     def _str(self):
         n = struct.unpack("<Q", self.f.read(8))[0]
-        return self.f.read(n).decode("utf-8", "replace")
+        b = self.f.read(n)
+        if len(b) != n:     # (cut short: the numbers' unpack refuses that itself; a string must too, or header_end lies)
+            raise SystemExit("%s: header cut short (a string of %d bytes, %d there)" % (self.path, n, len(b)))
+        return b.decode("utf-8", "replace")
 
     def _val(self, t):
         fmt = {0: "B", 1: "b", 2: "H", 3: "h", 4: "I", 5: "i", 6: "f", 7: "?", 10: "Q", 11: "q", 12: "d"}

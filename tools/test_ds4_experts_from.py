@@ -41,9 +41,9 @@ def nbytes(typ: int, dims: list) -> int:
 
 
 def gguf(path: pathlib.Path, tensors: list, meta: bool = True, split=None, geo=None, arch="deepseek41", cut=0,
-         pad=True) -> dict:
+         pad=True, name=None) -> dict:
     """A GGUF of tensors [(name, type, dims)] with distinct made-up bytes; meta: the model's metadata (architecture,
-    geometry, a vocabulary), split: (no, count) -> {name: its bytes}."""
+    geometry, a vocabulary), split: (no, count), name: a general.name string last -> {name: its bytes}."""
     kv = []
     if meta:
         kv.append(s("general.architecture") + struct.pack("<I", 8) + s(arch))
@@ -53,6 +53,8 @@ def gguf(path: pathlib.Path, tensors: list, meta: bool = True, split=None, geo=N
     if split is not None:
         kv.append(s("split.no") + struct.pack("<IH", 2, split[0]))
         kv.append(s("split.count") + struct.pack("<IH", 2, split[1]))
+    if name is not None:
+        kv.append(s("general.name") + struct.pack("<I", 8) + s(name))
     info, data, off, out = b"", b"", 0, {}
     rng = random.Random(str(path))
     for name, typ, dims in tensors:
@@ -261,9 +263,48 @@ class ExpertsFrom(unittest.TestCase):
         gguf(self.u / "u-00001-of-00004.gguf", [], split=(0, 4), pad=False, cut=1)   # (its header itself cut short)
         self.refused("--experts-from: not whole (u-00001-of-00004.gguf:", *self.shards)
 
+    def test_a_metadata_shard_cut_inside_its_last_string(self):
+        """the same, ending in a string: whole, it packs; cut inside that string (the read short, the position at the
+        end) it is not whole - Codex 05:41Z"""
+        gguf(self.u / "u-00001-of-00004.gguf", [], split=(0, 4), pad=False, name="DeepSeek-V4.1-Flash UD-IQ1_M")
+        r = self.pack("--experts-from", *self.shards, out="maya-ds4-hybrid-ok")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        gguf(self.u / "u-00001-of-00004.gguf", [], split=(0, 4), pad=False, name="DeepSeek-V4.1-Flash UD-IQ1_M", cut=3)
+        self.refused("--experts-from: not whole (u-00001-of-00004.gguf: its header unreadable:", *self.shards)
+
     def test_a_shard_not_whole(self):
         gguf(self.u / "u-00003-of-00004.gguf", routed(1, IQ1_S, IQ2_XS), meta=False, split=(2, 4), cut=40)
         self.refused("--experts-from: not whole (u-00003-of-00004.gguf:", *self.shards)
+
+
+class Header(unittest.TestCase):
+    """Gguf itself: header_end is where a whole header ends - an empty one, an unpadded metadata one - and a header
+    cut anywhere, its last string's bytes too, is refused (never a short header_end)."""
+
+    def setUp(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("pack_gguf_header", PACK)
+        self.m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.m)
+        self.d = pathlib.Path(tempfile.mkdtemp())
+
+    def test_whole(self):
+        p = self.d / "empty.gguf"
+        p.write_bytes(b"GGUF" + struct.pack("<IQQ", 3, 0, 0))
+        g = self.m.Gguf(p)
+        self.assertEqual((g.tensors, g.kv, g.header_end, g.data_start), ([], {}, 24, 32))
+        gguf(p, [], split=(0, 4), pad=False, name="UD-IQ1_M")
+        g = self.m.Gguf(p)
+        self.assertEqual((g.header_end, g.kv["general.name"], g.kv["split.count"]), (p.stat().st_size, "UD-IQ1_M", 4))
+
+    def test_cut(self):
+        p = self.d / "meta.gguf"
+        gguf(p, [], split=(0, 4), pad=False, name="UD-IQ1_M")
+        size = p.stat().st_size
+        for cut in range(1, size + 1):
+            gguf(p, [], split=(0, 4), pad=False, name="UD-IQ1_M", cut=cut)
+            with self.subTest(cut=cut), self.assertRaises((Exception, SystemExit)):
+                self.m.Gguf(p)
 
 
 if __name__ == "__main__":
