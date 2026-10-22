@@ -436,6 +436,9 @@ def main() -> int:
         if dest == model or dest == own or own in dest.parents:
             raise SystemExit("--experts-from: %s is the model's folder or the quant's own pack (%s), or inside it" %
                              (out, own))
+        inside = next((d for d in dest.parents if (d / "tensors.txt").exists() or (d / "ds4.txt").exists()), None)
+        if inside is not None:   # (any pack, by whatever name or link: a frozen pack's files are hashed recursively)
+            raise SystemExit("--experts-from: %s is inside a pack (%s) - nothing is written into one" % (out, inside))
     shards = [model / n for n in a.shards] if a.shards else sorted(model.glob("*.gguf"))
     if not shards or not all(p.is_file() for p in shards):
         raise SystemExit("%s: no .gguf files" % model if not shards else

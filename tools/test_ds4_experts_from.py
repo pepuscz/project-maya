@@ -186,6 +186,25 @@ class ExpertsFrom(unittest.TestCase):
                 self.assertFalse((self.q / "maya-ds4" / "new").exists())
         self.assertFalse(any(self.base.rglob("experts-from.json")))
 
+    def test_never_inside_a_pack(self):
+        """A pack of another name (the drafter pack's, say), written first: a hybrid in a folder inside it, by its path or
+        through a link, refused before anything is written - Codex 03:40Z."""
+        own = self.pack(out="maya-ds4-dspark")
+        self.assertEqual(own.returncode, 0, own.stderr)
+        (self.base / "dalias").symlink_to(self.q / "maya-ds4-dspark")
+        snap = lambda: {str(p): p.read_bytes() for p in sorted(self.base.rglob("*")) if p.is_file()}   # noqa: E731
+        before = snap()
+        listing = sorted(p.name for p in (self.q / "maya-ds4-dspark").iterdir())
+        self.assertIn("tensors.txt", listing)
+        for out in (str(self.q / "maya-ds4-dspark" / "hybrid"), str(self.base / "dalias" / "hybrid"),
+                    str(self.q / "maya-ds4-dspark" / "a" / "b")):
+            with self.subTest(out):
+                r = self.pack("--experts-from", *self.shards, out=out)
+                self.assertNotEqual(r.returncode, 0, r.stdout)
+                self.assertIn("is inside a pack (%s)" % (self.q / "maya-ds4-dspark").resolve(), r.stderr)
+                self.assertEqual(snap(), before)
+                self.assertEqual(sorted(p.name for p in (self.q / "maya-ds4-dspark").iterdir()), listing)
+
     def test_the_first_shard_required(self):
         self.refused("its first shard (split.no 0, the model's metadata) is not among the files", *self.shards[1:])
 
