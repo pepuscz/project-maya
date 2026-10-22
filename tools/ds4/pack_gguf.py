@@ -18,6 +18,11 @@ from there when it is present.  Nor a vision tower: vision_pack.py makes it from
 (--vision: another folder), and the pack takes it and its geometry (vision.<key>, image_token_id) from there when it is
 present; without it the engine reads text only.
 
+--experts-from: another quant's shards of the same model to take ONLY the routed experts from (every layer's
+blk.N.ffn_{gate,up,down}_exps.weight, each of the quant's dims) - dense, router, shared experts and Engram stay the quant's
+own, the other set's tensors are passed over, and its shards without routed experts (unsloth's Engram table shard) need not
+be there; --out names the pack, experts-from.json in it says what was taken.  experts_from() lists what it checks.
+
 A quant that leaves the two Engram tables out (v1.1.16's Maya-S; Maya's quants hold them since) takes them from a set
 of GGUF files that holds them, beside it: --engram, else ../Engram/ (unsloth's MXFP8 shard of them, where setups before
 v1.1.17 put it) when it is whole.
@@ -274,6 +279,88 @@ def engram_set(model: pathlib.Path, explicit: str | None):
     return None, []
 
 
+ROUTED = re.compile(r"blk\.(\d+)\.ffn_(gate|up|down)_exps\.weight$")
+# the geometry the experts' set must share with the quant (its first shard's metadata)
+SAME_GEOMETRY = ("block_count", "embedding_length", "expert_count", "expert_used_count", "expert_feed_forward_length")
+
+
+def experts_from(paths: list, gs: list, kv: dict):
+    """--experts-from: another quant's shards of the same model to take the routed experts from, and nothing else.
+    (the shards read, a tensor-free description for experts-from.json) - or SystemExit, which names what is wrong:
+      - one split: every file whole, the same split.count, distinct split.no, its first shard (split.no 0: the only one
+        with the model's metadata) among them - so the architecture and SAME_GEOMETRY can be checked against the quant's;
+        the shards that hold no routed experts (the Engram table's, say) need not be there
+      - its routed tensors (blk.N.ffn_{gate,up,down}_exps.weight) exactly the quant's, by name, none twice: no layer or
+        role missing or extra
+      - each one's dims the quant's, its type one the engine reads, gate's and up's the same type in each layer
+    Each shard's .tensors keep only its routed ones; every other tensor in them is passed over (counted)."""
+    arch = kv["general.architecture"]
+    egs = []
+    for p in paths:
+        if not p.is_file():
+            raise SystemExit("%s: not there (--experts-from)" % p)
+        g = Gguf(p)
+        why = short(g)
+        if why:
+            raise SystemExit("--experts-from: not whole (%s)" % why)
+        egs.append(g)
+    counts = {int(g.kv.get("split.count", 1)) for g in egs}
+    nos = [int(g.kv.get("split.no", 0)) for g in egs]
+    if len(counts) != 1 or len(set(nos)) != len(nos) or not all(0 <= n < next(iter(counts)) for n in nos):
+        raise SystemExit("--experts-from: not one split's shards (split.count %s, split.no %s)" % (sorted(counts), nos))
+    first = next((g for g, n in zip(egs, nos) if n == 0), None)
+    if first is None:
+        raise SystemExit("--experts-from: its first shard (split.no 0, the model's metadata) is not among the files")
+    if first.kv.get("general.architecture") != arch:
+        raise SystemExit("--experts-from: architecture %r, the quant's %r" % (first.kv.get("general.architecture"), arch))
+    for k in SAME_GEOMETRY:
+        a, b = kv.get("%s.%s" % (arch, k)), first.kv.get("%s.%s" % (arch, k))
+        if a is None or a != b:
+            raise SystemExit("--experts-from: %s.%s %r, the quant's %r" % (arch, k, b, a))
+    mine = {t[0]: t for g in gs for t in g.tensors if ROUTED.match(t[0])}
+    theirs, where, passed, passed_bytes = {}, {}, 0, 0
+    for g in egs:
+        keep = []
+        for t in g.tensors:
+            if not ROUTED.match(t[0]):
+                passed += 1
+                if t[1] in TYPES:
+                    nel = 1
+                    for d in t[2]:
+                        nel *= d
+                    passed_bytes += nel // TYPES[t[1]][1] * TYPES[t[1]][2]
+                continue
+            if t[0] in theirs:
+                raise SystemExit("--experts-from: %s in %s and %s" % (t[0], where[t[0]], g.path.name))
+            theirs[t[0]], where[t[0]] = t, g.path.name
+            keep.append(t)
+        g.tensors = keep
+    if not mine:
+        raise SystemExit("--experts-from: the quant has no routed experts to take the place of")
+    missing, extra = sorted(set(mine) - set(theirs)), sorted(set(theirs) - set(mine))
+    if missing or extra:
+        raise SystemExit("--experts-from: routed tensors missing %s, extra %s" % (missing[:6], extra[:6]))
+    layers = {}
+    for name, (_, typ, dims, _) in sorted(theirs.items()):
+        if list(dims) != list(mine[name][2]):
+            raise SystemExit("--experts-from: %s dims %s, the quant's %s" % (name, list(dims), list(mine[name][2])))
+        if typ not in TYPES:
+            raise SystemExit("--experts-from: %s has ggml type %d, which the engine does not read" % (name, typ))
+        m = ROUTED.match(name)
+        layers.setdefault(int(m.group(1)), {})[m.group(2)] = typ
+    for il, roles in sorted(layers.items()):
+        if roles["gate"] != roles["up"]:
+            raise SystemExit("--experts-from: layer %d's gate %s and up %s differ" %
+                             (il, TYPES[roles["gate"]][0], TYPES[roles["up"]][0]))
+    desc = {"split_count": next(iter(counts)),
+            "shards": [{"file": g.path.name, "split_no": n, "bytes": g.path.stat().st_size, "routed": len(g.tensors)}
+                       for g, n in sorted(zip(egs, nos), key=lambda x: x[1])],
+            "routed": len(theirs), "passed_over": {"tensors": passed, "bytes": passed_bytes},
+            "layers": {str(il): [TYPES[r[k]][0] for k in ("gate", "up", "down")] for il, r in sorted(layers.items())},
+            "replaced": {name: TYPES[t[1]][0] for name, t in sorted(mine.items()) if t[1] in TYPES}}
+    return [g for g in egs if g.tensors], desc
+
+
 def write_engram(out: pathlib.Path, kv: dict, vocab: int):
     a = kv["general.architecture"]
     g = lambda k, d=None: kv.get("%s.%s" % (a, k), d)  # noqa: E731
@@ -327,7 +414,15 @@ def main() -> int:
                                      "(default: <model>/../Engram, when it is whole)")
     ap.add_argument("--shards", nargs="+", help="the GGUF's files in --model (default: every .gguf there - one "
                                                 "model's; the setup names them: a folder may hold an earlier layout)")
+    ap.add_argument("--experts-from", nargs="+", metavar="GGUF",
+                    help="another quant's shards of the same model (one split, its first shard among them) to take ONLY "
+                         "the routed experts from - every layer's blk.N.ffn_{gate,up,down}_exps.weight, each of the "
+                         "quant's dims; every other tensor stays the quant's own (dense, router, shared experts, Engram). "
+                         "Shards without routed experts need not be there. --out is required; experts-from.json in it "
+                         "says what was taken")
     a = ap.parse_args()
+    if a.experts_from and not a.out:
+        raise SystemExit("--experts-from: name the pack's folder with --out (the quant's own pack stays as it is)")
     model = pathlib.Path(a.model).expanduser().resolve()
     out = pathlib.Path(a.out).expanduser() if a.out else model / "maya-ds4"
     shards = [model / n for n in a.shards] if a.shards else sorted(model.glob("*.gguf"))
@@ -382,6 +477,18 @@ def main() -> int:
     rel = lambda p: os.path.relpath(p, model).replace(os.sep, "/")  # noqa: E731
     gs_all = gs + list(eg_from.values())
     names = [g.path.name for g in gs] + [rel(p) for p in eg_from]
+    ex_desc = None
+    if a.experts_from:   # (the routed experts from another quant's shards: the quant's own left out of the pack)
+        egs, ex_desc = experts_from([pathlib.Path(p).expanduser().resolve() for p in a.experts_from], gs, kv)
+        for g in gs:
+            g.tensors = [t for t in g.tensors if not ROUTED.match(t[0])]
+        for g in egs:
+            r = rel(g.path)
+            if " " in r:
+                raise SystemExit("%s: the experts' path relative to the model has a space" % g.path)
+        gs_all += egs
+        names += [rel(g.path) for g in egs]
+        ex_desc["files"] = [rel(g.path) for g in egs]
 
     tensors, unknown = [], []
     for fi, g in enumerate(gs_all):
@@ -480,6 +587,11 @@ def main() -> int:
             f.write("file %d %s\n" % (i, name))
         for name, dt, fi, off, nb, shape in tensors:
             f.write("t %s %s %d %d %d %s\n" % (name, dt, fi, off, nb, " ".join(map(str, shape))))
+    if ex_desc is not None:
+        (out / "experts-from.json").write_text(json.dumps(ex_desc, indent=1) + "\n")
+        print("routed experts from %d shards of %d (%s): %d tensors; %d of their other tensors passed over" %
+              (len(ex_desc["files"]), ex_desc["split_count"], ", ".join(ex_desc["files"]), ex_desc["routed"],
+               ex_desc["passed_over"]["tensors"]))
     nl, cols = write_engram(out / "engram.bin", kv, vocab)
     # the server's chat template (pack.py's, so both formats chat alike); the GGUF's own when it is not there
     template = pathlib.Path(__file__).resolve().parent / "chat_template.jinja"
