@@ -656,6 +656,10 @@ struct Glm5Model::FastState {
     std::shared_ptr<glmfast::Workers> cpu_pool;
     GlmExpertHelper helper;   // opt-in, independent expert ownership on the secondary GPU
     uint8_t* helper_owned_d = nullptr;   // primary router excludes these experts from PCIe admission/prefetch
+    // STRATA_GLM_HELPER_PROMOTE (an integrated helper): the boundary's background moves also promote hot helper-owned
+    // experts into VRAM (their RAM copy stays the helper's) and hand demoted VRAM experts to the helper
+    bool helper_promote = false;
+    uint64_t moves_checked = 0;   // STRATA_GLM_PROMOTE_CHECK: landed background moves whose VRAM and RAM bytes were compared
     uint64_t helper_swaps = 0;
     std::atomic<bool> helper_failed{false};
     std::string helper_error;

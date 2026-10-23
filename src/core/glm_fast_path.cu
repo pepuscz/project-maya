@@ -1894,6 +1894,20 @@ bool Glm5Model::fast_helper_setup(std::string& err) {
             requested += R.stride;
         }
     }
+    // STRATA_GLM_HELPER_PROMOTE=1 (an integrated helper): the background moves keep VRAM on the conversation's hot experts
+    // - a hot helper-owned expert is promoted (its RAM copy stays the helper's), a demoted VRAM expert becomes the
+    // helper's; the bookkeeping capacity then also covers the VRAM experts it may take over (an integrated helper
+    // aliases the RAM tier: no memory of its own)
+    const char* hp = getenv("STRATA_GLM_HELPER_PROMOTE");
+    F->helper_promote = hp != nullptr && std::atoi(hp) != 0 && F->helper.integrated();
+    if (F->helper_promote)
+        for (int il = l0_; il < lt_; ++il) {
+            const auto& ly = F->L[(size_t) il];
+            if (!ly.moe || !gf::moe_supported(ly.gu_type) || !gf::moe_supported(ly.d_type) || F->layer_rc[(size_t) il] < 0) continue;
+            const auto& R = F->rc[(size_t) F->layer_rc[(size_t) il]];
+            for (int e = 0; e < g_.n_expert; ++e)
+                if (F->slot_of[(size_t) il * g_.n_expert + e] >= 0) requested += R.stride;
+        }
     if (!F->helper.reserve(F->n_keys, requested, err)) return false;
     std::stable_sort(ranked.begin(), ranked.end(), [&](int a, int b) { return F->usage[(size_t) a] > F->usage[(size_t) b]; });
     int resident = 0;
@@ -1936,6 +1950,9 @@ bool Glm5Model::fast_helper_setup(std::string& err) {
     }
     F->cpu_retime = false;
     F->cal_key.clear();   // the CPU's decode timing must not re-plan the GPU helper's lane
+    if (F->helper_promote)
+        std::fprintf(stderr, "glm helper: CUDA%d promotes hot owned experts into CUDA%d's VRAM between tokens and takes the "
+                             "demoted ones (MAYA_GLM_HELPER_PROMOTE)\n", device, dev_);
     if (n_parts_ > 1)
         std::fprintf(stderr, "glm helper: CUDA%d owns %d complementary experts in %.2f GiB of %s for part %d's layers "
                              "[%d, %d); CUDA%d keeps that part's trunk layers; prefill unchanged\n",
@@ -2094,7 +2111,7 @@ bool Glm5Model::fast_helper_check(std::string& err) {
 
 bool Glm5Model::fast_helper_adapt(std::string& err) {
     FastState* F = fast_;
-    if (F->helper.device() < 0 || F->bg_hold) return true;
+    if (F->helper.device() < 0 || F->bg_hold || F->helper_promote) return true;   // (promote mode: the background moves own it)
     auto primary = F->slot_of;
     for (const auto& m : F->bg) if (m.up) primary[(size_t) m.key] = m.vslot;
     // A pending RAM read/copy is not a candidate until it lands.
@@ -3772,6 +3789,9 @@ void Glm5Model::fast_destroy() {
     F->workers.reset();
     win_lanes_stop();   // (after the service thread: it hands them their routes)
     F->cpu_pool.reset();
+    if (F->moves_checked > 0)
+        std::fprintf(stderr, "glm promote check: CUDA%d %llu landed moves' VRAM and RAM bytes equal\n", dev_,
+                     (unsigned long long) F->moves_checked);
     if (F->helper.device() >= 0) {
         std::fprintf(stderr, "glm helper: CUDA%d computed %llu experts in %llu routes, %.1f ms, %llu cache swaps\n", F->helper.device(),
                      (unsigned long long) F->helper_experts.load(), (unsigned long long) F->helper_routes.load(),
@@ -4956,6 +4976,18 @@ bool Glm5Model::fast_boundary(std::string& err) {
             }
             if (v < 0) break;
             const int vkey = il * g.n_expert + P.key[(size_t) v];
+            if (F->helper_promote && F->ram_of[(size_t) vkey] >= 0 && R.st[(size_t) F->ram_of[(size_t) vkey]] == FastState::kRHelper) {
+                // a promoted helper expert: its RAM copy is still the helper's - forget the VRAM copy (the table edit runs
+                // before any route of the next token, which then goes to the helper), the slot is the spare at once
+                upd(F->tab_key(vkey), 0ull);
+                F->slot_of[(size_t) vkey] = -1;
+                ++P.evictions;
+                P.st[(size_t) v] = FastState::kSpare;
+                P.key[(size_t) v] = -1;
+                P.spare[j] = v;
+                upd(F->spare_key(il, j), (unsigned long long) P.slot_ptr(v));
+                continue;
+            }
             // demote it into the RAM tier: a free slot, else the RAM tier's victim (if colder than it)
             int rs = -1;
             uint32_t rc_min = UINT32_MAX;
@@ -5044,6 +5076,26 @@ bool Glm5Model::fast_boundary(std::string& err) {
     //     landed - no window in which a route would go to disk.  STRATA_GLM_PROMOTE=<moves a boundary>, 0: off.
     {
         const int NE = g.n_expert;
+        bool owners_dirty = false;   // (promote mode: the helper took a demoted expert - the device's ownership table follows)
+        // STRATA_GLM_PROMOTE_CHECK (a diagnostic): a landed move's VRAM slot read back and compared byte for byte with its
+        // RAM copy - before the slot or the copy is released; a difference fails the boundary
+        static const bool move_check = getenv("STRATA_GLM_PROMOTE_CHECK") != nullptr && std::atoi(getenv("STRATA_GLM_PROMOTE_CHECK")) != 0;
+        const auto same_bytes = [&](const FastState::BgMove& m, const char* what) {
+            if (!move_check) return true;
+            const auto& R2 = F->rc[(size_t) m.rclass];
+            const size_t blob = F->L[(size_t) m.il].blob;
+            if (F->stage.empty() || F->stage[0] == nullptr || F->stage_bytes < blob ||
+                !glmfast::cuda_ok(cudaMemcpy(F->stage[0], F->lp[(size_t) m.il].slot_ptr(m.vslot), blob, cudaMemcpyDeviceToHost),
+                                  "glm promote check", err))
+                return err.empty() ? (err = "glm promote check: no staging buffer", false) : false;
+            if (std::memcmp(F->stage[0], R2.base + (size_t) m.rslot * R2.stride, blob) != 0) {
+                err = std::string("glm promote check: a ") + what + " of layer " + std::to_string(m.il) + " expert " +
+                      std::to_string(m.key % NE) + " differs between CUDA" + std::to_string(dev_) + "'s VRAM and its RAM copy";
+                return false;
+            }
+            ++F->moves_checked;
+            return true;
+        };
         std::vector<FastState::BgMove> keep;
         for (auto& m : F->bg) {
             const cudaError_t me = cudaEventQuery(m.ev);
@@ -5055,7 +5107,16 @@ bool Glm5Model::fast_boundary(std::string& err) {
             }
             auto& P = F->lp[(size_t) m.il];
             auto& R = F->rc[(size_t) m.rclass];
-            if (m.up) {
+            if (!same_bytes(m, m.up ? "promotion" : "demotion")) return false;
+            if (m.up && R.st[(size_t) m.rslot] == FastState::kRHelper) {
+                // a helper expert promoted (promote mode): resident in VRAM, its RAM copy stays the helper's
+                P.st[(size_t) m.vslot] = FastState::kResident;
+                P.key[(size_t) m.vslot] = m.key % NE;
+                P.tick[(size_t) m.vslot] = F->clock;
+                F->slot_of[(size_t) m.key] = m.vslot;
+                upd(F->tab_key((size_t) m.key), (unsigned long long) P.slot_ptr(m.vslot));
+                ++F->bg_up;
+            } else if (m.up) {
                 P.st[(size_t) m.vslot] = FastState::kResident;
                 P.key[(size_t) m.vslot] = m.key % NE;
                 P.tick[(size_t) m.vslot] = F->clock;
@@ -5079,11 +5140,21 @@ bool Glm5Model::fast_boundary(std::string& err) {
                 R.tick[(size_t) m.rslot] = F->clock;
                 F->ram_of[(size_t) m.key] = m.rslot;
                 upd(F->rtab_key((size_t) m.key), (unsigned long long) (R.base + (size_t) m.rslot * R.stride));
+                if (F->helper_promote) {
+                    // promote mode: the demoted expert becomes the helper's (served there from now on, never over PCIe)
+                    if (!F->helper.insert((int) m.key, R.base + (size_t) m.rslot * R.stride, F->L[(size_t) m.il].blob, R.stride, err))
+                        return false;
+                    R.st[(size_t) m.rslot] = FastState::kRHelper;
+                    owners_dirty = true;
+                }
                 ++F->bg_down;
             }
             F->ev_free.push_back(m.ev);
         }
         F->bg.swap(keep);
+        if (owners_dirty && !glmfast::cuda_ok(cudaMemcpy(F->helper_owned_d, F->helper.owners().data(), (size_t) F->n_keys,
+                                                        cudaMemcpyHostToDevice), "helper ownership after the moves", err))
+            return false;
         static const int bg_n = [] {
             const char* v = getenv("STRATA_GLM_PROMOTE");
             return v != nullptr ? std::max(0, std::atoi(v)) : 8;
@@ -5147,9 +5218,11 @@ bool Glm5Model::fast_boundary(std::string& err) {
                 int ntop = 0;
                 for (int e = 0; e < NE; ++e) {
                     const size_t key = (size_t) il * NE + e;
-                    if (F->slot_of[key] >= 0 || F->helper.owns((int) key)) continue;
+                    if (F->slot_of[key] >= 0) continue;
+                    const bool owned = F->helper.owns((int) key);   // (promote mode: a candidate too, its RAM copy the helper's)
+                    if (owned && !F->helper_promote) continue;
                     const int rs = F->ram_of[key];
-                    if (rs < 0 || R.st[(size_t) rs] != FastState::kRHold) continue;
+                    if (rs < 0 || R.st[(size_t) rs] != (owned ? FastState::kRHelper : FastState::kRHold)) continue;
                     const uint32_t h = F->cnt[key];
                     if (ntop == want && h <= top[(size_t) ntop - 1].hot) continue;
                     int at = ntop < want ? ntop++ : ntop - 1;
@@ -5176,14 +5249,27 @@ bool Glm5Model::fast_boundary(std::string& err) {
                 auto& R = F->rc[(size_t) rc];
                 if (c.free_slot >= 0) {
                     P.st[(size_t) c.free_slot] = FastState::kLanding;
-                    R.st[(size_t) c.rs] = FastState::kRPin;
+                    if (R.st[(size_t) c.rs] != FastState::kRHelper) R.st[(size_t) c.rs] = FastState::kRPin;   // (a helper copy stays)
                     cudaMemcpyAsync(P.slot_ptr(c.free_slot), R.base + (size_t) c.rs * R.stride, F->L[(size_t) c.il].blob,
                                     cudaMemcpyHostToDevice, F->copy);
                     cudaEvent_t ev = F->get_event();
                     cudaEventRecord(ev, F->copy);
                     F->bg.push_back(FastState::BgMove{c.il, c.free_slot, c.il * NE + c.e, rc, c.rs, true, ev});
                     ++filled;
-                } else if (lane_all && c.cold_slot >= 0 && c.hot >= bg_ratio * std::max<uint32_t>(c.cold, 1u) + 4u) {
+                } else if ((lane_all || F->helper_promote) && c.cold_slot >= 0 && c.hot >= bg_ratio * std::max<uint32_t>(c.cold, 1u) + 4u) {
+                    const int ckey = c.il * NE + P.key[(size_t) c.cold_slot];
+                    const int cro = F->ram_of[(size_t) ckey];
+                    if (F->helper_promote && cro >= 0 && R.st[(size_t) cro] == FastState::kRHelper) {
+                        // the coldest resident is a promoted helper expert: forget its VRAM copy now (the helper still holds
+                        // it); the free slot takes the hot candidate at the next boundary's refill
+                        upd(F->tab_key((size_t) ckey), 0ull);
+                        F->slot_of[(size_t) ckey] = -1;
+                        P.st[(size_t) c.cold_slot] = FastState::kFree;
+                        P.key[(size_t) c.cold_slot] = -1;
+                        ++F->bg_down;
+                        ++issued;
+                        continue;
+                    }
                     int rs = -1;
                     for (int s2 = 0; s2 < R.n && rs < 0; ++s2)
                         if (R.st[(size_t) s2] == FastState::kRFree) rs = s2;
