@@ -18,6 +18,7 @@
 #include "glm_fast_state.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/glm_model.hpp"
+#include "strata/core/glm_helper_moves.hpp"
 #include "strata/kernels/glm_fast.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
@@ -4773,6 +4774,7 @@ void Glm5Model::fast_ahead_reader() {
 // (demoted into the RAM tier when it beats the RAM tier's least-used, dropped otherwise); (4) the RAM tier keeps
 // a few free slots for disk reads.  The table edits ride one small update kernel at the head of the next token.
 bool Glm5Model::fast_boundary(std::string& err) {
+    bool helper_owners_dirty = false;   // (promote mode: the helper took a demoted expert - its device table follows)
     FastState* F = fast_;
     if (F == nullptr || F->lp.empty() || F->rc.empty()) return true;
     // Also catches an asynchronous failure before waiting for routes that may never have been published.
@@ -4918,6 +4920,18 @@ bool Glm5Model::fast_boundary(std::string& err) {
             if (F->ram_resident) {   // the deferred half of the move: forget the VRAM copy only now
                 upd(F->tab_key((size_t) d.key), 0ull);
                 F->slot_of[(size_t) d.key] = -1;
+            }
+            if (F->helper_promote) {
+                // promote mode: a demoted expert becomes the helper's (served there, never over PCIe) - step 3's
+                // spare refill as step 5's moves (Codex's ecb37b3 review: this path kept it the RAM tier's)
+                if (F->helper.owns(d.key)) {
+                    err = "glm helper promote: a demoted expert the helper already owns (layer " + std::to_string(d.il) + ")";
+                    return false;
+                }
+                if (!F->helper.insert(d.key, R.base + (size_t) d.rslot * R.stride, F->L[(size_t) d.il].blob, R.stride, err))
+                    return false;
+                R.st[(size_t) d.rslot] = FastState::kRHelper;
+                helper_owners_dirty = true;
             }
         }
         char& vst = F->lp[(size_t) d.il].st[(size_t) d.vslot];
@@ -5076,7 +5090,6 @@ bool Glm5Model::fast_boundary(std::string& err) {
     //     landed - no window in which a route would go to disk.  STRATA_GLM_PROMOTE=<moves a boundary>, 0: off.
     {
         const int NE = g.n_expert;
-        bool owners_dirty = false;   // (promote mode: the helper took a demoted expert - the device's ownership table follows)
         // STRATA_GLM_PROMOTE_CHECK (a diagnostic): a landed move's VRAM slot read back and compared byte for byte with its
         // RAM copy - before the slot or the copy is released; a difference fails the boundary
         static const bool move_check = getenv("STRATA_GLM_PROMOTE_CHECK") != nullptr && std::atoi(getenv("STRATA_GLM_PROMOTE_CHECK")) != 0;
@@ -5142,19 +5155,20 @@ bool Glm5Model::fast_boundary(std::string& err) {
                 upd(F->rtab_key((size_t) m.key), (unsigned long long) (R.base + (size_t) m.rslot * R.stride));
                 if (F->helper_promote) {
                     // promote mode: the demoted expert becomes the helper's (served there from now on, never over PCIe)
+                    if (F->helper.owns((int) m.key)) {
+                        err = "glm helper promote: a demoted expert the helper already owns (layer " + std::to_string(m.il) + ")";
+                        return false;
+                    }
                     if (!F->helper.insert((int) m.key, R.base + (size_t) m.rslot * R.stride, F->L[(size_t) m.il].blob, R.stride, err))
                         return false;
                     R.st[(size_t) m.rslot] = FastState::kRHelper;
-                    owners_dirty = true;
+                    helper_owners_dirty = true;
                 }
                 ++F->bg_down;
             }
             F->ev_free.push_back(m.ev);
         }
         F->bg.swap(keep);
-        if (owners_dirty && !glmfast::cuda_ok(cudaMemcpy(F->helper_owned_d, F->helper.owners().data(), (size_t) F->n_keys,
-                                                        cudaMemcpyHostToDevice), "helper ownership after the moves", err))
-            return false;
         static const int bg_n = [] {
             const char* v = getenv("STRATA_GLM_PROMOTE");
             return v != nullptr ? std::max(0, std::atoi(v)) : 8;
@@ -5194,6 +5208,11 @@ bool Glm5Model::fast_boundary(std::string& err) {
                 int il, e, rs, free_slot, cold_slot;
             };
             std::vector<Cand> cands;
+            // the keys an up move is still copying (F->bg: only the moves not landed yet) - a helper copy is never
+            // pinned, so these alone keep such an expert from a second slot (bg_move_candidate)
+            std::vector<int> pending_up;
+            for (const auto& m : F->bg)
+                if (m.up) pending_up.push_back(m.key);
             for (int il = l0_; il < lt_; ++il) {
                 if (!F->L[(size_t) il].moe || F->layer_rc[(size_t) il] < 0) continue;
                 const auto& P = F->lp[(size_t) il];
@@ -5218,11 +5237,15 @@ bool Glm5Model::fast_boundary(std::string& err) {
                 int ntop = 0;
                 for (int e = 0; e < NE; ++e) {
                     const size_t key = (size_t) il * NE + e;
-                    if (F->slot_of[key] >= 0) continue;
-                    const bool owned = F->helper.owns((int) key);   // (promote mode: a candidate too, its RAM copy the helper's)
-                    if (owned && !F->helper_promote) continue;
                     const int rs = F->ram_of[key];
-                    if (rs < 0 || R.st[(size_t) rs] != (owned ? FastState::kRHelper : FastState::kRHold)) continue;
+                    const strata::core::RamHold hold = rs < 0 ? strata::core::RamHold::other
+                                                       : R.st[(size_t) rs] == FastState::kRHold   ? strata::core::RamHold::tier
+                                                       : R.st[(size_t) rs] == FastState::kRHelper ? strata::core::RamHold::helper
+                                                                                                  : strata::core::RamHold::other;
+                    const bool pending = std::find(pending_up.begin(), pending_up.end(), (int) key) != pending_up.end();
+                    if (!strata::core::bg_move_candidate(F->slot_of[key] >= 0, pending, F->helper.owns((int) key),
+                                                         F->helper_promote, hold))
+                        continue;
                     const uint32_t h = F->cnt[key];
                     if (ntop == want && h <= top[(size_t) ntop - 1].hot) continue;
                     int at = ntop < want ? ntop++ : ntop - 1;
@@ -5288,6 +5311,9 @@ bool Glm5Model::fast_boundary(std::string& err) {
             }
         }
     }
+    if (helper_owners_dirty && !glmfast::cuda_ok(cudaMemcpy(F->helper_owned_d, F->helper.owners().data(), (size_t) F->n_keys,
+                                                           cudaMemcpyHostToDevice), "helper ownership after the moves", err))
+        return false;
     flush();
     if (ok && !fast_helper_adapt(err)) return false;
     F->check_resident(l0_, lt_, g.n_expert);   // (the tables as the next token's routes find them)
