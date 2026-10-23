@@ -269,7 +269,7 @@ bool run(int gu_type, int dn_type, bool parity_only, bool shared_mode, bool swee
                 const auto got_sh = sh_result.get(EMB * 4);
                 std::vector<float> a(EMB), b(EMB);
                 std::memcpy(a.data(), ref_sh.data(), EMB * 4); std::memcpy(b.data(), got_sh.data(), EMB * 4);
-                ok &= compare("shared down", a, b, ref_sh == got_sh);
+                ok &= compare((label + " shared down").c_str(), a, b, ref_sh == got_sh);   // (the variant and case it follows)
             }
         }
         // Down uses the identical baseline hq so gate/up differences cannot mask errors.
