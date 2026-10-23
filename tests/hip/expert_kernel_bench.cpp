@@ -3,7 +3,10 @@
 // --parity-only also checks sparse plans, CPU contributions and shared experts.
 // --sweep exposes rejected tuning variants; --shared times the fused Q6_K shared down.
 // --fixture GU,DN (repeatable) times that gate/up and down type pair instead of the default 16,22 and 16,18 (Maya-M:
-// 22,18); --host puts the expert pools in pinned, mapped host memory, as an integrated GPU's expert helper reads them.
+// 22,18); --host puts the expert pools in pinned, mapped host memory, as an integrated GPU's expert helper reads them;
+// --exact fails any comparison that is not bit-identical (the default allows rel_L2 1e-6 / max_abs 1e-4); --k K1,K2,..
+// times each route width (experts a call, <= 8; default 8) on its own bytes, over enough pools that one graph rotates
+// at least 320 MiB of expert weights.
 #include "strata/kernels/glm_expert_bench.hpp"
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
@@ -27,6 +30,8 @@ namespace bench = gf::hip_expert_bench;
 using V = bench::Variant;
 namespace {
 constexpr int NE = 8, EMB = 4096, FF = 2048, POOLS = 5, CALLS = 60, ROUNDS = 7;
+constexpr size_t ROTATE_MIN = size_t(320) << 20;   // --k: the expert bytes one timing graph rotates through, at least
+bool g_exact = false;                              // --exact
 void check(hipError_t e, const char* what) {
     if (e != hipSuccess) {
         std::fprintf(stderr, "%s: %s (no processes will be stopped)\n", what, hipGetErrorString(e));
@@ -114,7 +119,7 @@ bool compare(const char* label, const std::vector<float>& a, const std::vector<f
         max_abs = std::max(max_abs, std::abs(diff)); num += diff * diff; den += double(a[i]) * a[i];
     }
     const double rel = std::sqrt(num / std::max(den, 1e-30));
-    const bool ok = finite && (exact || (rel <= 1e-6 && max_abs <= 1e-4));
+    const bool ok = finite && (exact || (!g_exact && rel <= 1e-6 && max_abs <= 1e-4));
     std::printf("parity %-28s max_abs=%.3e rel_L2=%.3e bit_identical=%s %s\n",
                 label, max_abs, rel, exact ? "yes" : "no", ok ? "PASS" : "FAIL");
     return ok;
@@ -145,18 +150,18 @@ const char* name(V v) {
 struct Graph {
     hipGraph_t graph{};
     hipGraphExec_t exec{};
-    Graph(hipStream_t s, const std::function<void(int)>& launch) {
+    Graph(hipStream_t s, const std::function<void(int)>& launch, int pools) {
         check(hipStreamBeginCapture(s, hipStreamCaptureModeThreadLocal), "capture begin");
-        for (int i = 0; i < CALLS; ++i) launch(i % POOLS);
+        for (int i = 0; i < CALLS; ++i) launch(i % pools);
         check(hipStreamEndCapture(s, &graph), "capture end");
         check(hipGraphInstantiateWithFlags(&exec, graph, 0), "graph instantiate");
     }
     ~Graph() { check(hipGraphExecDestroy(exec), "graph exec destroy"); check(hipGraphDestroy(graph), "graph destroy"); }
 };
 // Alternate the two graphs each round so clock/server-load drift affects both.
-void timing(const char* kernel, V variant, size_t bytes, hipStream_t s,
+void timing(const char* kernel, V variant, size_t bytes, hipStream_t s, int pools,
             const std::function<void(int)>& old_launch, const std::function<void(int)>& new_launch) {
-    Graph old(s, old_launch), fresh(s, new_launch);
+    Graph old(s, old_launch, pools), fresh(s, new_launch, pools);
     hipEvent_t start, end;
     check(hipEventCreate(&start), "event create"); check(hipEventCreate(&end), "event create");
     for (int j = 0; j < 3; ++j) {
@@ -179,11 +184,17 @@ void timing(const char* kernel, V variant, size_t bytes, hipStream_t s,
                 before / after, 100 * (1 - after / before));
     check(hipEventDestroy(start), "event destroy"); check(hipEventDestroy(end), "event destroy");
 }
-bool run(int gu_type, int dn_type, bool parity_only, bool shared_mode, bool sweep, hipStream_t s, bool host = false) {
-    const int pools = parity_only ? 1 : POOLS;
+bool run(int gu_type, int dn_type, bool parity_only, bool shared_mode, bool sweep, hipStream_t s, bool host = false,
+         const std::vector<int>& ks = {}) {
     const size_t gu_bytes = size_t(2) * FF * (EMB / 256) * block_bytes(gu_type);
     const size_t dn_bytes = size_t(EMB) * (FF / 256) * block_bytes(dn_type);
     const size_t blob_bytes = gu_bytes + dn_bytes;
+    const std::vector<int> widths = ks.empty() ? std::vector<int>{NE} : ks;
+    int pools = parity_only ? 1 : POOLS;
+    if (!parity_only && !ks.empty()) {   // the narrowest route width still rotates ROTATE_MIN bytes
+        const size_t per_pool = size_t(*std::min_element(widths.begin(), widths.end())) * blob_bytes;
+        pools = std::max(POOLS, int((ROTATE_MIN + per_pool - 1) / per_pool));
+    }
     const size_t hbytes = size_t(NE) * (FF / 32) * sizeof(block_q8_1);
     std::printf("fixture gu=%d down=%d experts=%d n_embd=%d n_ff=%d pools=%d weights=%.1f MiB shared=%s experts in %s\n",
                 gu_type, dn_type, NE, EMB, FF, pools, pools * NE * blob_bytes / 1048576., shared_mode ? "Q6_K 4096x2048" : "off",
@@ -212,7 +223,7 @@ bool run(int gu_type, int dn_type, bool parity_only, bool shared_mode, bool swee
     std::vector<float> extra(EMB);
     for (int i = 0; i < EMB; ++i) extra[i] = float((i % 31) - 15) / 32.f;
     cpu.put(extra.data(), EMB * 4); shared.put(extra.data(), EMB * 4);
-    gf::MoeDev plans[POOLS];
+    std::vector<gf::MoeDev> plans(pools);
     for (int p = 0; p < pools; ++p) {
         plans[p].plan_ptr = ptrs.as<unsigned long long>() + p * NE;
         plans[p].plan_w = w.as<float>(); plans[p].cpu_flag = flag.as<int>(); plans[p].cpu_part = cpu.as<float>();
@@ -275,15 +286,45 @@ bool run(int gu_type, int dn_type, bool parity_only, bool shared_mode, bool swee
         if (!parity_only) {
             // Independent random h activations in all pools; bytes read, not FLOPs, define GB/s.
             auto h = activation(NE * FF, rng); old_hq.put(h.data(), h.size());
-            const std::string glabel = "gate_up<" + std::to_string(gu_type) + ">";
-            const std::string dlabel = "down<" + std::to_string(dn_type) + ">";
-            for (V v : gu_variants)
-                timing(glabel.c_str(), v, NE * gu_bytes + (use_shared ? sw.size() : 0), s,
-                       [&](int p) { gu(V::baseline, p, hq.p, sh_result.as<float>()); }, [&](int p) { gu(v, p, hq.p, sh_result.as<float>()); });
-            for (V v : dn_variants)
-                timing(dlabel.c_str(), v, NE * dn_bytes, s,
-                       [&](int p) { dn(V::baseline, p, old_hq.p, out.as<float>()); },
-                       [&](int p) { dn(v, p, old_hq.p, out.as<float>()); });
+            for (int kt : widths) {
+                const std::string kk = ks.empty() ? "" : " k" + std::to_string(kt);
+                const std::string glabel = "gate_up<" + std::to_string(gu_type) + ">" + kk;
+                const std::string dlabel = "down<" + std::to_string(dn_type) + ">" + kk;
+                if (!ks.empty())
+                    std::printf("timing k=%d experts a call: %d pools, %.1f MiB of experts rotated a graph\n",
+                                kt, pools, pools * kt * blob_bytes / 1048576.);
+                auto gk = [&](V v, int p) {
+                    bench::gate_up(v, gu_type, plans[p], kt, EMB, FF, limit, xq.p, hq.p,
+                                   use_shared ? sh_weights.p : nullptr, 14, sh_hq.p, FF, sh_result.as<float>(), s);
+                };
+                auto dk = [&](V v, int p) {
+                    bench::down(v, dn_type, plans[p], kt, EMB, FF, gu_bytes, old_hq.p,
+                                use_shared ? shared.as<float>() : nullptr, out.as<float>(), s);
+                };
+                // this width's own parity: every variant against the baseline at k = kt (--exact: bit for bit)
+                hq.zero(hbytes); gk(V::baseline, 0); check(hipStreamSynchronize(s), "k gu sync");
+                const auto ref_k = hq.get(hbytes);
+                dk(V::baseline, 0); check(hipStreamSynchronize(s), "k dn sync");
+                const auto ref_kd = out.get(EMB * 4);
+                for (V v : gu_variants) {
+                    hq.zero(hbytes); gk(v, 0); check(hipStreamSynchronize(s), "k gu sync");
+                    const auto got = hq.get(hbytes);
+                    ok &= compare((glabel + " " + name(v)).c_str(), dequant(ref_k), dequant(got), ref_k == got);
+                }
+                for (V v : dn_variants) {
+                    dk(v, 0); check(hipStreamSynchronize(s), "k dn sync");
+                    const auto got = out.get(EMB * 4);
+                    std::vector<float> a(EMB), b(EMB);
+                    std::memcpy(a.data(), ref_kd.data(), EMB * 4); std::memcpy(b.data(), got.data(), EMB * 4);
+                    ok &= compare((dlabel + " " + name(v)).c_str(), a, b, ref_kd == got);
+                }
+                for (V v : gu_variants)
+                    timing(glabel.c_str(), v, kt * gu_bytes + (use_shared ? sw.size() : 0), s, pools,
+                           [&](int p) { gk(V::baseline, p); }, [&](int p) { gk(v, p); });
+                for (V v : dn_variants)
+                    timing(dlabel.c_str(), v, kt * dn_bytes, s, pools,
+                           [&](int p) { dk(V::baseline, p); }, [&](int p) { dk(v, p); });
+            }
         }
     }
     return ok;
@@ -292,6 +333,20 @@ bool run(int gu_type, int dn_type, bool parity_only, bool shared_mode, bool swee
 int main(int argc, char** argv) {
     bool parity_only = false, shared_mode = false, sweep = false, host = false;
     std::vector<std::pair<int, int>> fixtures;
+    std::vector<int> ks;
+    auto parse_k = [&ks](const char* list) {
+        std::string t(list);
+        for (size_t at = 0; at <= t.size();) {
+            const size_t comma = std::min(t.find(',', at), t.size());
+            const std::string one = t.substr(at, comma - at);
+            if (one.empty() || one.find_first_not_of("0123456789") != std::string::npos) return false;
+            const int k = std::atoi(one.c_str());
+            if (k < 1 || k > NE) return false;
+            ks.push_back(k);
+            at = comma + 1;
+        }
+        return !ks.empty();
+    };
     auto known = [](int t) { return t == 16 || t == 18 || t == 22; };
     for (int i = 1; i < argc; ++i) {
         int gu = 0, dn = 0;
@@ -299,11 +354,13 @@ int main(int argc, char** argv) {
         else if (std::string(argv[i]) == "--shared") shared_mode = true;
         else if (std::string(argv[i]) == "--sweep") sweep = true;
         else if (std::string(argv[i]) == "--host") host = true;
+        else if (std::string(argv[i]) == "--exact") g_exact = true;
+        else if (std::string(argv[i]) == "--k" && i + 1 < argc && parse_k(argv[i + 1])) ++i;
         else if (std::string(argv[i]) == "--fixture" && i + 1 < argc && std::sscanf(argv[i + 1], "%d,%d", &gu, &dn) == 2 &&
                  known(gu) && known(dn)) { fixtures.emplace_back(gu, dn); ++i; }
         else {
-            std::fprintf(stderr, "usage: %s [--parity-only] [--shared] [--sweep] [--host] [--fixture GU,DN]... "
-                                 "(types 16, 18, 22)\n", argv[0]);
+            std::fprintf(stderr, "usage: %s [--parity-only] [--shared] [--sweep] [--host] [--exact] [--k K1,K2,..] "
+                                 "[--fixture GU,DN]... (types 16, 18, 22; k 1..8)\n", argv[0]);
             return 2;
         }
     }
@@ -318,10 +375,10 @@ int main(int argc, char** argv) {
     check(hipStreamCreate(&stream), "stream create");
     bool ok = true;
     if (!fixtures.empty()) {
-        for (auto [gu, dn] : fixtures) ok &= run(gu, dn, parity_only, shared_mode, sweep, stream, host);
+        for (auto [gu, dn] : fixtures) ok &= run(gu, dn, parity_only, shared_mode, sweep, stream, host, ks);
     } else {
-        ok &= run(16, 22, parity_only, shared_mode, sweep, stream, host);
-        ok &= run(16, 18, parity_only, shared_mode, sweep, stream, host);
+        ok &= run(16, 22, parity_only, shared_mode, sweep, stream, host, ks);
+        ok &= run(16, 18, parity_only, shared_mode, sweep, stream, host, ks);
         if (parity_only) { ok &= run(18, 16, true, shared_mode, sweep, stream, host); ok &= run(22, 22, true, shared_mode, sweep, stream, host); }
     }
     check(hipStreamDestroy(stream), "stream destroy");
