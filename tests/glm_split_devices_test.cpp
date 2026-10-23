@@ -1,7 +1,8 @@
 // The devices of a GLM layer split beside an expert helper (glm_split_devices): the helper's device left out of the
 // default list, a named list (MAYA_GLM_DEVS) refused when it names the helper or repeats a device, pinned boundaries
 // taking the first n + 1 devices beside the helper, `auto` taking up to the part limit - and no helper: the lists as
-// before.  Host only, no GPU.
+// before.  And the background moves' candidates beside a promoting helper (glm_helper_moves.hpp).  Host only, no GPU.
+#include "strata/core/glm_helper_moves.hpp"
 #include "strata/core/glm_split_devices.hpp"
 
 #include <cstdio>
@@ -47,6 +48,36 @@ int main() {
     run(&with_helper, 3, 2, 0, 8, false, "a named list naming the helper is refused");
     run(&twice, 3, -1, 0, 8, false, "a named list naming a device twice is refused");
     run(&cards, 3, -1, 3, 8, false, "a named list shorter than the boundaries need is refused");
-    if (fails == 0) std::puts("glm_split_devices: the helper's device is never a part of the split");
+
+    // the background moves' candidates (bg_move_candidate): not in VRAM, no promotion under way, held as the owner holds it
+    using strata::core::RamHold;
+    using strata::core::bg_move_candidate;
+    expect(!bg_move_candidate(true, false, false, false, RamHold::tier), "in VRAM: no candidate");
+    expect(bg_move_candidate(false, false, false, false, RamHold::tier), "a RAM-tier expert is a candidate");
+    expect(!bg_move_candidate(false, false, false, false, RamHold::other), "a pinned (moving) RAM copy is not");
+    expect(!bg_move_candidate(false, false, true, false, RamHold::helper), "helper-owned, promote off: not a candidate");
+    expect(bg_move_candidate(false, false, true, true, RamHold::helper), "helper-owned, promote on: a candidate");
+    expect(!bg_move_candidate(false, false, true, true, RamHold::tier), "helper-owned but held by the tier: not");
+    expect(!bg_move_candidate(false, false, false, true, RamHold::helper), "not owned but held as the helper's: not");
+    expect(!bg_move_candidate(false, true, true, true, RamHold::helper), "a helper expert's promotion under way: not");
+    expect(!bg_move_candidate(false, true, false, false, RamHold::tier), "a tier expert's promotion under way: not");
+    {
+        // Codex's ecb37b3 repro: a helper expert's promotion enqueued at boundary 0, its copy still landing at
+        // boundaries 1 and 2 (NotReady), landed at 3 - one VRAM slot, never a second enqueue
+        int slots = 0;
+        bool in_vram = false, pending = false;
+        for (int boundary = 0; boundary < 4; ++boundary) {
+            if (pending && boundary == 3) {   // step 5 (a): the landed move goes live
+                pending = false;
+                in_vram = true;
+            }
+            if (bg_move_candidate(in_vram, pending, true, true, RamHold::helper)) {   // step 5 (c): enqueue
+                ++slots;
+                pending = true;
+            }
+        }
+        expect(slots == 1 && in_vram && !pending, "a promotion under way is never enqueued twice; landed, one slot");
+    }
+    if (fails == 0) std::puts("glm_split_devices: the helper's device is never a part of the split; a promoting helper's moves take one slot an expert");
     return fails == 0 ? 0 : 1;
 }
