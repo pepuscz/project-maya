@@ -660,6 +660,7 @@ struct Glm5Model::FastState {
     // experts into VRAM (their RAM copy stays the helper's) and hand demoted VRAM experts to the helper
     bool helper_promote = false;
     uint64_t moves_checked = 0;   // STRATA_GLM_PROMOTE_CHECK: landed background moves whose VRAM and RAM bytes were compared
+    uint64_t helper_promoted = 0, helper_taken = 0;   // promote mode: helper experts promoted into VRAM, demoted ones the helper took
     uint64_t helper_swaps = 0;
     std::atomic<bool> helper_failed{false};
     std::string helper_error;

@@ -3793,6 +3793,9 @@ void Glm5Model::fast_destroy() {
     if (F->moves_checked > 0)
         std::fprintf(stderr, "glm promote check: CUDA%d %llu landed moves' VRAM and RAM bytes equal\n", dev_,
                      (unsigned long long) F->moves_checked);
+    if (F->helper_promote)
+        std::fprintf(stderr, "glm helper promote: CUDA%d %llu helper experts promoted into VRAM, %llu demoted ones taken by the helper\n",
+                     dev_, (unsigned long long) F->helper_promoted, (unsigned long long) F->helper_taken);
     if (F->helper.device() >= 0) {
         std::fprintf(stderr, "glm helper: CUDA%d computed %llu experts in %llu routes, %.1f ms, %llu cache swaps\n", F->helper.device(),
                      (unsigned long long) F->helper_experts.load(), (unsigned long long) F->helper_routes.load(),
@@ -4785,6 +4788,28 @@ bool Glm5Model::fast_boundary(std::string& err) {
     std::lock_guard<std::mutex> lk(F->mu);
     int nu = 0;
     bool ok = true;
+    // STRATA_GLM_PROMOTE_CHECK (a diagnostic): a landed move's VRAM slot read back and compared byte for byte with its RAM
+    // copy - step 2's demotions and step 5's moves alike, before the slot or the copy is released; a difference fails
+    static const bool move_check = getenv("STRATA_GLM_PROMOTE_CHECK") != nullptr && std::atoi(getenv("STRATA_GLM_PROMOTE_CHECK")) != 0;
+    const auto same_bytes = [&](int il, int vslot, int rclass, int rslot, int key, const char* what) {
+        if (!move_check) return true;
+        const auto& R2 = F->rc[(size_t) rclass];
+        const size_t blob = F->L[(size_t) il].blob;
+        if (F->stage.empty() || F->stage[0] == nullptr || F->stage_bytes < blob) {
+            err = "glm promote check: no staging buffer";
+            return false;
+        }
+        if (!glmfast::cuda_ok(cudaMemcpy(F->stage[0], F->lp[(size_t) il].slot_ptr(vslot), blob, cudaMemcpyDeviceToHost),
+                              "glm promote check", err))
+            return false;
+        if (std::memcmp(F->stage[0], R2.base + (size_t) rslot * R2.stride, blob) != 0) {
+            err = std::string("glm promote check: a ") + what + " of layer " + std::to_string(il) + " expert " +
+                  std::to_string(key % g_.n_expert) + " differs between CUDA" + std::to_string(dev_) + "'s VRAM and its RAM copy";
+            return false;
+        }
+        ++F->moves_checked;
+        return true;
+    };
     const auto flush = [&] {
         if (nu > 0 && ok) {
             ok = glmfast::cuda_ok(cudaMemcpyAsync(F->upd_key_d, F->upd_key_h, (size_t) nu * sizeof(int),
@@ -4915,6 +4940,10 @@ bool Glm5Model::fast_boundary(std::string& err) {
         }
         auto& R = F->rc[(size_t) d.rclass];
         if (R.st[(size_t) d.rslot] == FastState::kRDemote && R.key[(size_t) d.rslot] == d.key) {
+            // (compared only while the slot is still kDraining - a slot lent meanwhile holds other bytes by design)
+            if (F->lp[(size_t) d.il].st[(size_t) d.vslot] == FastState::kDraining &&
+                !same_bytes(d.il, d.vslot, d.rclass, d.rslot, d.key, "demotion"))
+                return false;
             R.st[(size_t) d.rslot] = FastState::kRHold;
             upd(F->rtab_key(d.key), (unsigned long long) (R.base + (size_t) d.rslot * R.stride));
             if (F->ram_resident) {   // the deferred half of the move: forget the VRAM copy only now
@@ -4932,6 +4961,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
                     return false;
                 R.st[(size_t) d.rslot] = FastState::kRHelper;
                 helper_owners_dirty = true;
+                ++F->helper_taken;
             }
         }
         char& vst = F->lp[(size_t) d.il].st[(size_t) d.vslot];
@@ -5090,25 +5120,6 @@ bool Glm5Model::fast_boundary(std::string& err) {
     //     landed - no window in which a route would go to disk.  STRATA_GLM_PROMOTE=<moves a boundary>, 0: off.
     {
         const int NE = g.n_expert;
-        // STRATA_GLM_PROMOTE_CHECK (a diagnostic): a landed move's VRAM slot read back and compared byte for byte with its
-        // RAM copy - before the slot or the copy is released; a difference fails the boundary
-        static const bool move_check = getenv("STRATA_GLM_PROMOTE_CHECK") != nullptr && std::atoi(getenv("STRATA_GLM_PROMOTE_CHECK")) != 0;
-        const auto same_bytes = [&](const FastState::BgMove& m, const char* what) {
-            if (!move_check) return true;
-            const auto& R2 = F->rc[(size_t) m.rclass];
-            const size_t blob = F->L[(size_t) m.il].blob;
-            if (F->stage.empty() || F->stage[0] == nullptr || F->stage_bytes < blob ||
-                !glmfast::cuda_ok(cudaMemcpy(F->stage[0], F->lp[(size_t) m.il].slot_ptr(m.vslot), blob, cudaMemcpyDeviceToHost),
-                                  "glm promote check", err))
-                return err.empty() ? (err = "glm promote check: no staging buffer", false) : false;
-            if (std::memcmp(F->stage[0], R2.base + (size_t) m.rslot * R2.stride, blob) != 0) {
-                err = std::string("glm promote check: a ") + what + " of layer " + std::to_string(m.il) + " expert " +
-                      std::to_string(m.key % NE) + " differs between CUDA" + std::to_string(dev_) + "'s VRAM and its RAM copy";
-                return false;
-            }
-            ++F->moves_checked;
-            return true;
-        };
         std::vector<FastState::BgMove> keep;
         for (auto& m : F->bg) {
             const cudaError_t me = cudaEventQuery(m.ev);
@@ -5120,7 +5131,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
             }
             auto& P = F->lp[(size_t) m.il];
             auto& R = F->rc[(size_t) m.rclass];
-            if (!same_bytes(m, m.up ? "promotion" : "demotion")) return false;
+            if (!same_bytes(m.il, m.vslot, m.rclass, m.rslot, m.key, m.up ? "promotion" : "demotion")) return false;
             if (m.up && R.st[(size_t) m.rslot] == FastState::kRHelper) {
                 // a helper expert promoted (promote mode): resident in VRAM, its RAM copy stays the helper's
                 P.st[(size_t) m.vslot] = FastState::kResident;
@@ -5129,6 +5140,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
                 F->slot_of[(size_t) m.key] = m.vslot;
                 upd(F->tab_key((size_t) m.key), (unsigned long long) P.slot_ptr(m.vslot));
                 ++F->bg_up;
+                ++F->helper_promoted;
             } else if (m.up) {
                 P.st[(size_t) m.vslot] = FastState::kResident;
                 P.key[(size_t) m.vslot] = m.key % NE;
@@ -5163,6 +5175,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
                         return false;
                     R.st[(size_t) m.rslot] = FastState::kRHelper;
                     helper_owners_dirty = true;
+                    ++F->helper_taken;
                 }
                 ++F->bg_down;
             }
