@@ -505,6 +505,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_include_directories(hip_expert_kernel_bench PRIVATE third_party/ggml)
     target_link_libraries(hip_expert_kernel_bench PRIVATE strata_kernels strata_hip_runtime)
     add_test(NAME hip_expert_kernel_parity COMMAND hip_expert_kernel_bench --parity-only)
+    add_test(NAME hip_expert_kernel_parity_host COMMAND hip_expert_kernel_bench --parity-only --host --fixture 22,18)
     set_tests_properties(hip_expert_kernel_parity PROPERTIES TIMEOUT 120)
     # the dense GEMV (mv) at the decode shapes: the RDNA3 kernel against the originals, bit for bit
     add_executable(glm_mv_bench tests/hip/glm_mv_bench.cu)

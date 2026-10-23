@@ -2,6 +2,8 @@
 // HIP_VISIBLE_DEVICES=0 LD_LIBRARY_PATH=/opt/rocm/lib build-multi/hip_expert_kernel_bench
 // --parity-only also checks sparse plans, CPU contributions and shared experts.
 // --sweep exposes rejected tuning variants; --shared times the fused Q6_K shared down.
+// --fixture GU,DN (repeatable) times that gate/up and down type pair instead of the default 16,22 and 16,18 (Maya-M:
+// 22,18); --host puts the expert pools in pinned, mapped host memory, as an integrated GPU's expert helper reads them.
 #include "strata/kernels/glm_expert_bench.hpp"
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
@@ -17,6 +19,7 @@
 #include <functional>
 #include <random>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace gf = strata::kernels::glmf;
@@ -31,9 +34,17 @@ void check(hipError_t e, const char* what) {
     }
 }
 struct Buffer {
-    void* p = nullptr;
-    explicit Buffer(size_t n) { check(hipMalloc(&p, n), "hipMalloc"); }
-    ~Buffer() { if (p) check(hipFree(p), "hipFree"); }
+    void* p = nullptr;      // what kernels and copies use (a mapped host buffer's device pointer)
+    void* base = nullptr;   // a host buffer's own pointer, for hipHostFree
+    bool host = false;
+    explicit Buffer(size_t n, bool pinned_host = false) : host(pinned_host) {
+        if (!host) { check(hipMalloc(&p, n), "hipMalloc"); return; }
+        void* h = nullptr;
+        check(hipHostMalloc(&h, n, hipHostMallocMapped | hipHostMallocPortable), "hipHostMalloc");
+        check(hipHostGetDevicePointer(&p, h, 0), "host device pointer");
+        base = h;
+    }
+    ~Buffer() { if (host) check(hipHostFree(base), "hipHostFree"); else if (p) check(hipFree(p), "hipFree"); }
     Buffer(const Buffer&) = delete;
     Buffer& operator=(const Buffer&) = delete;
     template<class T> T* as() const { return static_cast<T*>(p); }
@@ -168,15 +179,16 @@ void timing(const char* kernel, V variant, size_t bytes, hipStream_t s,
                 before / after, 100 * (1 - after / before));
     check(hipEventDestroy(start), "event destroy"); check(hipEventDestroy(end), "event destroy");
 }
-bool run(int gu_type, int dn_type, bool parity_only, bool shared_mode, bool sweep, hipStream_t s) {
+bool run(int gu_type, int dn_type, bool parity_only, bool shared_mode, bool sweep, hipStream_t s, bool host = false) {
     const int pools = parity_only ? 1 : POOLS;
     const size_t gu_bytes = size_t(2) * FF * (EMB / 256) * block_bytes(gu_type);
     const size_t dn_bytes = size_t(EMB) * (FF / 256) * block_bytes(dn_type);
     const size_t blob_bytes = gu_bytes + dn_bytes;
     const size_t hbytes = size_t(NE) * (FF / 32) * sizeof(block_q8_1);
-    std::printf("fixture gu=%d down=%d experts=%d n_embd=%d n_ff=%d pools=%d weights=%.1f MiB shared=%s\n",
-                gu_type, dn_type, NE, EMB, FF, pools, pools * NE * blob_bytes / 1048576., shared_mode ? "Q6_K 4096x2048" : "off");
-    Buffer blobs(pools * NE * blob_bytes), ptrs(pools * NE * 8), w(NE * 4), flag(4), cpu(EMB * 4);
+    std::printf("fixture gu=%d down=%d experts=%d n_embd=%d n_ff=%d pools=%d weights=%.1f MiB shared=%s experts in %s\n",
+                gu_type, dn_type, NE, EMB, FF, pools, pools * NE * blob_bytes / 1048576., shared_mode ? "Q6_K 4096x2048" : "off",
+                host ? "pinned host memory" : "device memory");
+    Buffer blobs(pools * NE * blob_bytes, host), ptrs(pools * NE * 8), w(NE * 4), flag(4), cpu(EMB * 4);
     Buffer xq(EMB / 32 * sizeof(block_q8_1)), hq(hbytes), old_hq(hbytes), out(EMB * 4), old_out(EMB * 4);
     Buffer shared(EMB * 4), sh_weights(size_t(EMB) * (FF / 256) * sizeof(block_q6_K));
     Buffer sh_hq(FF / 32 * sizeof(block_q8_1)), sh_result(EMB * 4), sh_old(EMB * 4);
@@ -278,12 +290,22 @@ bool run(int gu_type, int dn_type, bool parity_only, bool shared_mode, bool swee
 }
 }
 int main(int argc, char** argv) {
-    bool parity_only = false, shared_mode = false, sweep = false;
+    bool parity_only = false, shared_mode = false, sweep = false, host = false;
+    std::vector<std::pair<int, int>> fixtures;
+    auto known = [](int t) { return t == 16 || t == 18 || t == 22; };
     for (int i = 1; i < argc; ++i) {
+        int gu = 0, dn = 0;
         if (std::string(argv[i]) == "--parity-only") parity_only = true;
         else if (std::string(argv[i]) == "--shared") shared_mode = true;
         else if (std::string(argv[i]) == "--sweep") sweep = true;
-        else { std::fprintf(stderr, "usage: %s [--parity-only] [--shared] [--sweep]\n", argv[0]); return 2; }
+        else if (std::string(argv[i]) == "--host") host = true;
+        else if (std::string(argv[i]) == "--fixture" && i + 1 < argc && std::sscanf(argv[i + 1], "%d,%d", &gu, &dn) == 2 &&
+                 known(gu) && known(dn)) { fixtures.emplace_back(gu, dn); ++i; }
+        else {
+            std::fprintf(stderr, "usage: %s [--parity-only] [--shared] [--sweep] [--host] [--fixture GU,DN]... "
+                                 "(types 16, 18, 22)\n", argv[0]);
+            return 2;
+        }
     }
     check(hipSetDevice(0), "GPU 0");
     hipDeviceProp_t prop;
@@ -294,9 +316,14 @@ int main(int argc, char** argv) {
                 prop.name, prop.gcnArchName, free_bytes / 1048576., CALLS, ROUNDS);
     hipStream_t stream;
     check(hipStreamCreate(&stream), "stream create");
-    bool ok = run(16, 22, parity_only, shared_mode, sweep, stream);
-    ok &= run(16, 18, parity_only, shared_mode, sweep, stream);
-    if (parity_only) { ok &= run(18, 16, true, shared_mode, sweep, stream); ok &= run(22, 22, true, shared_mode, sweep, stream); }
+    bool ok = true;
+    if (!fixtures.empty()) {
+        for (auto [gu, dn] : fixtures) ok &= run(gu, dn, parity_only, shared_mode, sweep, stream, host);
+    } else {
+        ok &= run(16, 22, parity_only, shared_mode, sweep, stream, host);
+        ok &= run(16, 18, parity_only, shared_mode, sweep, stream, host);
+        if (parity_only) { ok &= run(18, 16, true, shared_mode, sweep, stream, host); ok &= run(22, 22, true, shared_mode, sweep, stream, host); }
+    }
     check(hipStreamDestroy(stream), "stream destroy");
     std::printf("hip_expert_kernel_bench: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
