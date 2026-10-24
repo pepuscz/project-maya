@@ -7611,8 +7611,8 @@ struct Model::Impl {
     }
     // the fill thread: each fill's expert read into the pinned stage (read_mx: its file parts, resident - the CPU lane
     // just used it) and copied into its slot on rc_st; the copy's end waited for by polling rc_fill_ev, bounded
-    // (kHelperWaitMs) and given up on quit - a copy still under way then: rc_busy (no more fills; the stage and the pool
-    // kept at the end, as the helper's own memory is when its stream does not finish)
+    // (kHelperWaitMs), on quit too - a copy still under way after the bound: rc_busy (no more fills; the stage and the
+    // pool kept at the end, as the helper's own memory is when its stream does not finish)
     void rc_loop() {
         for (;;) {
             RcFill f;
@@ -7638,13 +7638,11 @@ struct Model::Impl {
                 if (submitted) {
                     const double t0 = now_ms();
                     cudaError_t q = cudaErrorNotReady;
+                    // (not given up on quit: a fill the last tick queued is often still in flight when the engine
+                    //  ends, and it ends within the bound - the destructor joins this thread before the pool goes)
                     for (;;) {
                         q = recorded ? cudaEventQuery(rc_fill_ev) : cudaStreamQuery(rc_st);
                         if (q != cudaErrorNotReady || now_ms() - t0 > kHelperWaitMs) break;
-                        {
-                            std::lock_guard<std::mutex> lk(rc_mu);
-                            if (rc_quit) break;
-                        }
                         std::this_thread::sleep_for(std::chrono::microseconds(50));
                     }
                     f.ok = recorded && q == cudaSuccess;
