@@ -1018,7 +1018,7 @@ struct Model::Impl {
     int flow_check_done = 0;          // (the main thread's) the runs checked so far
     bool flow_check_now = false;      // this run compares its pool items (set before its devices start)
     const std::string flow_helper_fail = std::getenv("DS4_FLOW_HELPER_FAIL") ? std::getenv("DS4_FLOW_HELPER_FAIL") : "";
-    std::atomic<bool> flow_fail_armed{true};   // (DS4_FLOW_HELPER_FAIL: once a load)
+    mutable std::atomic<bool> flow_fail_armed{true};   // (DS4_FLOW_HELPER_FAIL: once a load; armed off from flow_jobs, a const)
     // (an IoQueue thread's copy of a pool's part to pinned staging: the helper is integrated, its memory the host's)
     static bool helper_copy(int dev, void* dst, const void* src, size_t n) {
         return cudaSetDevice(dev) == cudaSuccess && cudaMemcpy(dst, src, n, cudaMemcpyDeviceToHost) == cudaSuccess;
