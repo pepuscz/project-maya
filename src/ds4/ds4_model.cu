@@ -11308,16 +11308,18 @@ struct Model::Impl {
         } ra_join{ra_stop, ra};
         if (!copy_ahead(d, c, S, di, err)) return false;
         // this device's Engram layers: chunk k's rows read on a helper thread while chunk k - 1 runs (slot k % 2, once
-        // chunk k - 2's copy of it is done)
-        std::vector<int> egs;
+        // chunk k - 2's copy of it is done) - with a long prompt's skip, only the layers chunk k runs (its kv_only too)
+        std::vector<std::pair<int, int>> egs;   // (Engram layer, trunk layer)
         for (const Layer& l0 : L)
             for (int m = 0; m < l0.nm; ++m)
-                if (member(l0, m).dev == di && !l0.mtp && l0.eg >= 0) egs.push_back(l0.eg);
+                if (member(l0, m).dev == di && !l0.mtp && l0.eg >= 0) egs.push_back({l0.eg, l0.il});
         const size_t eg_per = (size_t) (pk.eg_ngram - 1) * pk.eg_heads * (pk.eg_hd + pk.eg_hd / 32);
         auto read_eg = [this, &c, &run, &egs, eg_per](int k) {
             if (k >= 2) cudaEventSynchronize(c.eg_ev[k % 2]);
-            for (int li : egs)
-                engram_rows(run.p0[(size_t) k], run.T[(size_t) k], li, c.eg_host[k % 2] + (size_t) li * c.C * eg_per);
+            for (const auto& e : egs)
+                if (run.runs(k, e.second))
+                    engram_rows(run.p0[(size_t) k], run.T[(size_t) k], e.first,
+                                c.eg_host[k % 2] + (size_t) e.first * c.C * eg_per);
         };
         std::future<void> eg_next;
         if (!egs.empty()) eg_next = std::async(std::launch::async, read_eg, 0);
@@ -11995,6 +11997,16 @@ struct Model::Impl {
         static const bool on = std::getenv("DS4_YOCO_SPLIT") != nullptr && std::atoi(std::getenv("DS4_YOCO_SPLIT")) != 0;
         return on;
     }
+    // DS4_YOCO_TP=1: the skip on a tensor-parallel group too, when every trunk layer is that one group's.  Each member
+    // computes the yoco layer's compressed KV and index keys over the chunk's rows itself (its own copy: no member hands
+    // them to another within the group), every all-reduce is one (chunk, layer)'s and runs on both members alike, and
+    // the skip leaves out the same (chunk, layer)s and the same cut chunk's rows on each - so the members' all-reduces
+    // stay paired, and the flow plans nothing for a skipped (chunk, layer) (flow_next, fl_rows) as on one GPU.  Off: a
+    // TP group never skips, as before
+    static bool yoco_tp() {
+        static const bool on = std::getenv("DS4_YOCO_TP") != nullptr && std::atoi(std::getenv("DS4_YOCO_TP")) != 0;
+        return on;
+    }
     int yoco_layer() const {
         if (yoco_mode() == 0 || chunk <= 0 || g.nl < 2 || (int) g.ratios.size() < g.nl) return -1;
         int yl = -1;
@@ -12002,11 +12014,16 @@ struct Model::Impl {
             if (g.ratios[(size_t) il] == 1) yl = il;
         if (yl <= 0 || !L[(size_t) yl].kv_src) return -1;
         const int yd = L[(size_t) yl].dev;
+        const bool tp = yoco_tp() && L[0].nm > 1;   // (one TP group for every trunk layer: the same members each)
         for (int il = 0; il < g.nl; ++il) {
             const Layer& l = L[(size_t) il];
-            if (l.nm != 1 || (!yoco_split() && l.dev != L[0].dev)) return -1;
+            if (tp) {
+                if (l.nm != L[0].nm || l.grp != L[0].grp || l.dev != L[0].dev) return -1;
+            } else if (l.nm != 1 || (!yoco_split() && l.dev != L[0].dev)) {
+                return -1;
+            }
             if (il > yl && (g.ratios[(size_t) il] != 1 || l.kv_src)) return -1;
-            if (il > yl && yoco_split()) {   // (a skipped layer: on the yoco layer's GPU, its sources there too)
+            if (il > yl && yoco_split() && !tp) {   // (a skipped layer: on the yoco layer's GPU, its sources there too)
                 if (l.dev != yd) return -1;
                 for (int sidx : {l.src, l.ix_src ? l.ik_src : -1})
                     if (sidx >= 0 && L[(size_t) srcs[(size_t) sidx].layer].dev != yd) return -1;
@@ -12035,12 +12052,15 @@ struct Model::Impl {
         // order).  The chunks stay as they are: the ones before the cut go through the layers before yoco and its
         // kv_only, the cut's chunk through those over all its rows and through the rest from the cut on (Run::r0, a
         // view of its buffers), the chunks after it through every layer - each layer's experts read as without the
-        // skip.  One GPU (DS4_YOCO=1; 0: off), several with DS4_YOCO_SPLIT=1 (yoco_split); not with every row's
-        // logits (tests)
+        // skip.  One GPU (DS4_YOCO=1; 0: off), several with DS4_YOCO_SPLIT=1 (yoco_split), a TP group with
+        // DS4_YOCO_TP=1 (yoco_tp); not with every row's logits (tests)
         const int yl = logits_rows > kWin ? -1 : yoco_layer();
         if (yl > 0 && devs.size() > 1) {
             static bool said = false;
-            if (!said)
+            if (!said && L[0].nm > 1)
+                std::fprintf(stderr, "ds4: a long prompt's skip on the tensor-parallel group of %d (lead CUDA%d): layers "
+                                     "%d-%d (DS4_YOCO_TP)\n", L[0].nm, devs[(size_t) L[0].dev].id, yl, g.nl - 1);
+            else if (!said)
                 std::fprintf(stderr, "ds4: a long prompt's skip on %zu GPUs: layers %d-%d on CUDA%d (DS4_YOCO_SPLIT)\n",
                              devs.size(), yl, g.nl - 1, devs[(size_t) L[(size_t) yl].dev].id);
             said = true;
