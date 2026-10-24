@@ -5,7 +5,7 @@
 // lane's rows; the PCIe lane's streamed experts (bit for bit the VRAM ones'); and the KV caches' packed rows
 // (ds4_kernels.cu) against the BF16 rows bit for bit.  Needs a GPU, no model.
 // ds4_gguf_test [n_embd n_ff] | --kv (the caches alone) | --lane (the PCIe lane alone) | --ud (unsloth UD-IQ1_* pairs
-// at DS4 geometry)
+// at DS4 geometry) | --bench-helper <gate / up type> <down type> (the decode helper's k picks x T tokens, GB/s)
 #include "../src/ds4/ds4_gguf.cuh"
 #include "../src/ds4/ds4_gguf_cpu.hpp"
 #include "../src/ds4/ds4_iq.cuh"
@@ -1101,6 +1101,129 @@ void bench_q(cudaStream_t s) {
     }
 }
 
+// the decode helper's shapes (a GPU lane that takes a few of each layer's picks): k picks a token of 128 experts at DS4's
+// geometry, T tokens (1: a token; 2-4: a DSpark verify window) - the token path (T times gate / up + down) and the
+// window's grouped path (each distinct expert read once for its tokens, as the helper runs a window); GB/s of the
+// experts' weights read.  The reps cycle 16 pick sets over all 128 experts (~1.4 GB), so the reads come from memory, not
+// from a last-level cache that would hold one set's few experts
+void bench_helper(int tg, int td, cudaStream_t s) {
+    const int D = 5120, F = 2304, n_exp = 128, n_sets = 16, reps = 48;
+    const float lim = 10.0f;
+    QExperts E = make_q(D, F, n_exp, tg, td);
+    const double ebytes = 2.0 * F * E.rb(0) + (double) D * E.rb(2);
+    cudaEvent_t a, b;
+    cudaEventCreate(&a);
+    cudaEventCreate(&b);
+    std::printf("bench helper %s/%s (D %d, F %d): %.2f MB an expert\n", tn(tg), tn(td), D, F, ebytes / 1e6);
+    struct Set {
+        unsigned long long *pp = nullptr, *gp = nullptr;
+        float* pw = nullptr;
+        int *gs = nullptr, *ge = nullptr, *ng = nullptr;
+        int distinct = 0;
+    };
+    for (int k : {2, 3, 6})
+        for (int T = 1; T <= 4; ++T) {
+            std::vector<Set> sets(n_sets);
+            double distinct = 0;
+            for (Set& st : sets) {
+                std::vector<unsigned long long> pp((size_t) T * 8, 0ull);
+                std::vector<float> pw((size_t) T * 8, 0.0f);
+                std::vector<int> pick((size_t) T * 8, -1);
+                for (int t = 0; t < T; ++t) {
+                    std::vector<int> all(n_exp);
+                    for (int i = 0; i < n_exp; ++i) all[i] = i;
+                    std::shuffle(all.begin(), all.end(), rng);
+                    for (int i = 0; i < k; ++i) {
+                        pick[t * 8 + i] = all[i];
+                        pw[t * 8 + i] = 0.2f;
+                        pp[t * 8 + i] = (unsigned long long) (E.dev + (size_t) all[i] * E.blob);
+                    }
+                }
+                std::vector<unsigned long long> gptr;
+                std::vector<int> gstart, gent;
+                for (int x0 = 0; x0 < n_exp; ++x0) {
+                    std::vector<int> ents;
+                    for (int t = 0; t < T; ++t)
+                        for (int i = 0; i < k; ++i)
+                            if (pick[t * 8 + i] == x0) ents.push_back(t * 8 + i);
+                    if (ents.empty()) continue;
+                    gptr.push_back((unsigned long long) (E.dev + (size_t) x0 * E.blob));
+                    gstart.push_back((int) gent.size());
+                    for (int e : ents) gent.push_back(e);
+                }
+                gstart.push_back((int) gent.size());
+                st.distinct = (int) gptr.size();
+                distinct += st.distinct;
+                st.pp = dev(pp), st.gp = dev(gptr), st.pw = dev(pw);
+                st.gs = dev(gstart), st.ge = dev(gent), st.ng = dev(std::vector<int>(1, st.distinct));
+            }
+            distinct /= n_sets;
+            std::vector<float> x((size_t) T * D);
+            for (auto& v : x) v = frand();
+            float* dx = dev(x);
+            float* dh = dev(std::vector<float>((size_t) 8 * F));
+            float* dout = dev(std::vector<float>((size_t) T * D));
+            float* dwh = dev(std::vector<float>((size_t) T * 8 * F));
+            float* dpart = dev(std::vector<float>((size_t) T * 8 * D));
+            auto timed = [&](auto&& fn) {   // fn(set): one set's calls
+                for (const Set& st : sets) fn(st);
+                CU(cudaStreamSynchronize(s));
+                cudaEventRecord(a, s);
+                for (int i = 0; i < reps; ++i) fn(sets[(size_t) i % n_sets]);
+                cudaEventRecord(b, s);
+                CU(cudaEventSynchronize(b));
+                float ms = 0;
+                cudaEventElapsedTime(&ms, a, b);
+                return (double) ms / reps;
+            };
+            const double tok = timed([&](const Set& st) {
+                for (int t = 0; t < T; ++t) {
+                    x3::MoeArgs ma;
+                    ma.plan_ptr = st.pp + t * 8;
+                    ma.plan_w = st.pw + t * 8;
+                    ma.lay = E.lay;
+                    ma.k = k;
+                    ma.n_embd = D;
+                    ma.n_ff = F;
+                    ma.limit = lim;
+                    gg::moe_gate_up(ma, dx + (size_t) t * D, dh, s);
+                    gg::moe_down(ma, dh, nullptr, dout + (size_t) t * D, s);
+                }
+            });
+            bool ok = true;
+            const double win = timed([&](const Set& st) {
+                x3::WinArgs w;
+                w.grp_ptr = st.gp;
+                w.grp_start = st.gs;
+                w.grp_ent = st.ge;
+                w.n_groups = st.ng;
+                w.plan_ptr = st.pp;
+                w.plan_w = st.pw;
+                w.x = dx;
+                w.x_stride = D;
+                w.h = dwh;
+                w.part = dpart;
+                w.out = dout;
+                w.out_stride = D;
+                w.lay = E.lay;
+                w.T = T;
+                w.k = k;
+                w.n_embd = D;
+                w.n_ff = F;
+                w.limit = lim;
+                ok = gg::win_experts(w, s) && ok;
+            });
+            if (!ok) ++g_fail;
+            std::printf("bench helper k %d T %d: %4.1f distinct  token path %7.1f us %5.0f GB/s  window %7.1f us %5.0f "
+                        "GB/s\n", k, T, distinct, tok * 1000, (double) k * T * ebytes / (tok * 1e-3) / 1e9, win * 1000,
+                        distinct * ebytes / (win * 1e-3) / 1e9);
+            for (const Set& st : sets)
+                cudaFree(st.pp), cudaFree(st.gp), cudaFree(st.pw), cudaFree(st.gs), cudaFree(st.ge), cudaFree(st.ng);
+            cudaFree(dx), cudaFree(dh), cudaFree(dout), cudaFree(dwh), cudaFree(dpart);
+        }
+    cudaFree(E.dev);
+}
+
 // the CPU lane's speed: one full-size expert (gate / up rows, then down rows) for 1 and 4 tokens, on `nth` threads (rows
 // split between them), GB/s of weights read - MXFP4 (mx_cpu_rows) and the low-bit pairs (ggml-cpu's rows)
 void bench_cpu(int nth) {
@@ -1901,6 +2024,11 @@ int main(int argc, char** argv) {
     if (argc >= 2 && std::strcmp(argv[1], "--bench-q") == 0) {
         bench_q(s);
         return 0;
+    }
+    if (argc >= 4 && std::strcmp(argv[1], "--bench-helper") == 0) {   // <gate / up type> <down type> (ggml ids)
+        bench_helper(std::atoi(argv[2]), std::atoi(argv[3]), s);
+        std::printf("%s (%d failed)\n", g_fail ? "FAILED" : "ALL OK", g_fail);
+        return g_fail ? 1 : 0;
     }
     if (argc >= 2 && std::strcmp(argv[1], "--bench-cpu") == 0) {   // [threads]
         bench_cpu(argc >= 3 ? std::atoi(argv[2]) : 1);
