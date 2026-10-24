@@ -1875,7 +1875,7 @@ __global__ void wait_seq_kernel(const unsigned* seq_ptr, unsigned seq) {
 __global__ void __launch_bounds__(256) helper_take_kernel(const Req* req, unsigned seq, int k, int dim,
                                                           const unsigned long long* __restrict__ tab, int n,
                                                           unsigned long long* plan, float* w, float* x, unsigned* ack,
-                                                          const unsigned* quit) {
+                                                          const unsigned* quit, int xbatch) {
     __shared__ int live;
     if (threadIdx.x == 0) {   // (the request in host-mapped memory: read as the host's answers are, volatile)
         unsigned v;
@@ -1900,7 +1900,18 @@ __global__ void __launch_bounds__(256) helper_take_kernel(const Req* req, unsign
         plan[j] = p;
         w[j] = p != 0ull ? r->w[t][i] : 0.0f;
     }
-    for (int j = threadIdx.x; j < T * dim; j += blockDim.x) x[j] = r->x[j / dim][j % dim];
+    const int nx = T * dim, bd = (int) blockDim.x;
+    int j = threadIdx.x;
+    // (DS4_HANDOFF=1) eight of a thread's words a round, their volatile loads in flight together - not each a round
+    // trip to host memory before the next is asked for - then stored; the same words into the same places
+    for (; xbatch && j + 7 * bd < nx; j += 8 * bd) {
+        float v[8];
+#pragma unroll
+        for (int u = 0; u < 8; ++u) v[u] = r->x[(j + u * bd) / dim][(j + u * bd) % dim];
+#pragma unroll
+        for (int u = 0; u < 8; ++u) x[j + u * bd] = v[u];
+    }
+    for (; j < nx; j += bd) x[j] = r->x[j / dim][j % dim];
     __syncthreads();
     if (threadIdx.x == 0 && live) {
         __threadfence_system();
@@ -2242,8 +2253,9 @@ bool route_pair(const RoutePair& a, cudaStream_t s) {
 }
 void wait_seq(const unsigned* seq_ptr, unsigned seq, cudaStream_t s) { wait_seq_kernel<<<1, 32, 0, s>>>(seq_ptr, seq); }
 void helper_take(const Req* req, unsigned seq, int k, int dim, const unsigned long long* tab, int n,
-                 unsigned long long* plan, float* w, float* x, unsigned* ack, const unsigned* quit, cudaStream_t s) {
-    helper_take_kernel<<<1, 256, 0, s>>>(req, seq, k, dim, tab, n, plan, w, x, ack, quit);
+                 unsigned long long* plan, float* w, float* x, unsigned* ack, const unsigned* quit, cudaStream_t s,
+                 bool xbatch) {
+    helper_take_kernel<<<1, 256, 0, s>>>(req, seq, k, dim, tab, n, plan, w, x, ack, quit, xbatch ? 1 : 0);
 }
 void signal_seq(unsigned* flag, unsigned seq, cudaStream_t s) { signal_seq_kernel<<<1, 1, 0, s>>>(flag, seq); }
 void init_pre(float* pre, int T, cudaStream_t s) { init_pre_kernel<<<cdiv(T * 8, 128), 128, 0, s>>>(pre, T); }
