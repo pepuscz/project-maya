@@ -291,8 +291,10 @@ void wait_seq(const unsigned* seq_ptr, unsigned seq, cudaStream_t s);
 /// *quit: nothing taken - then its T tokens' picks the helper holds (tab[expert] its blob, 0: not held; n experts) into
 /// plan[t][i] (rows kPicks apart, every other entry 0) with their weights w[t][i], the tokens' x (dim floats each, rows
 /// back to back) into x, and seq into *ack: it has read the slot, which the host's answer lets the device write again.
+/// xbatch (DS4_HANDOFF=1): x read eight words a thread at a time, the loads in flight together - the same words.
 void helper_take(const Req* req, unsigned seq, int k, int dim, const unsigned long long* tab, int n,
-                 unsigned long long* plan, float* w, float* x, unsigned* ack, const unsigned* quit, cudaStream_t s);
+                 unsigned long long* plan, float* w, float* x, unsigned* ack, const unsigned* quit, cudaStream_t s,
+                 bool xbatch = false);
 /// *flag = seq after a system fence: the stream's work before it (the helper's answer) is in place.
 void signal_seq(unsigned* flag, unsigned seq, cudaStream_t s);
 /// A chunk's routed experts as sorted rows: the picks (t, i < k) of T tokens (idx rows kPicks apart) by the virtual

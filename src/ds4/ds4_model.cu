@@ -1169,6 +1169,10 @@ struct Model::Impl {
     float* helper_res = nullptr;                  // host-mapped [kRing][kWin][dim]: a token's weighted sum of its picks
     static constexpr double kHelperWaitMs = 10000.0;
     static constexpr double kHelperIdleMs = 5000.0;   // (its stream's work, waited for at a check's end and teardown)
+    // DS4_HANDOFF=1: the take reads a request's tokens (x, in host-mapped memory) eight words a thread at a time, the
+    // loads in flight together - the same words (helper_take's xbatch; the load's DS4_HELPER_CHECK runs it too).  The
+    // 185200Z decode trace: the take ends ~21 us after the lead's publish, x one volatile word after another
+    bool handoff = std::getenv("DS4_HANDOFF") != nullptr && std::atoi(std::getenv("DS4_HANDOFF")) != 0;
     bool helper_keep = false;                     // its stream did not finish at the end: no memory freed under it
     // an integrated helper's pool is host RAM: reserved from helper_open on in every load-time RAM budget (ram_room),
     // until its upload has filled it (an allocation alone may not commit the pages ram_avail would see)
@@ -7675,6 +7679,9 @@ struct Model::Impl {
                          "(DS4_HELPER_RECENT)\n",
                          helper_id, rc_want, layers, rc_bytes / 1e9, rc_need, rc_win, rc_fills);
         }
+        if (handoff)   // (not a 'ds4: helper' line: the runners' helper parsers see none)
+            std::fprintf(stderr, "ds4: DS4_HANDOFF: CUDA%d's take reads a request's tokens eight words a thread at a "
+                                 "time\n", helper_id);
         return true;
     }
 
@@ -7986,7 +7993,7 @@ struct Model::Impl {
         if (ok) {
             const size_t D = (size_t) g.dim;
             helper_take(reqs + slot, sq, l.k_exp, g.dim, l.helper_tab, l.n_exp, helper_plan, helper_w, helper_x,
-                        helper_flags + slot, helper_flags + 2 * kRing, helper_st);
+                        helper_flags + slot, helper_flags + 2 * kRing, helper_st, handoff);
             if (T > 1 && !tokens) {
                 gf::MoeWin mw;
                 mw.plan_ptr = helper_plan;
