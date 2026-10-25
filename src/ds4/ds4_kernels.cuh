@@ -354,10 +354,16 @@ struct ArGroup {
     // member order, then reads the others' sums) - [slots][stride] sums, [2][nm][slots][kArBlocks][8] flags
     float* sums = nullptr;
     unsigned* bflags = nullptr;
+    // two members, a chunk's all-reduces (DS4_AR2 1 / 2): ar2_kernel's progress words, [nm][slots][kAr2Blocks][16]
+    // (2: FP16 on the wire)
+    unsigned* pflags = nullptr;
+    int ar2 = 0;
 };
 constexpr int kArBlocks = 64;
+constexpr int kAr2Blocks = 64;
+constexpr int kAr2Piece = 8192;   // (float4s a piece: 128 KB of F32 rows, 64 KB on an FP16 wire)
 /// lean (two members, DS4_AR_SLAB's runs beside other work): a one-thread wait for the others' rows first, so the sums'
-/// blocks start only once they have landed - the same sums
+/// blocks start only once they have landed - the same sums.  A group of two with pflags (DS4_AR2): ar2_kernel, lean or not
 void allreduce(float* x, int n, const ArGroup& a, int mi, unsigned seq, unsigned* cnt, cudaStream_t s, bool lean = false);
 
 }  // namespace strata::ds4

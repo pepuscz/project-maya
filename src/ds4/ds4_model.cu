@@ -1565,10 +1565,11 @@ struct Model::Impl {
     // ... and a run of chunks' (prof_chunk): a layer's start, after its attention, after the routing and the shared
     // expert, after its experts (the streamed ones' waits for their reads in it); printed after the run
     bool prof_chunk = false;
-    double cprof_ms[9] = {};   // (4, 5: the attention's projections, its compression and indexer; 6, 7: its q, its
-                               // sparse attention - 1 then its output's projections; 8: on a tensor-parallel group,
-                               // the output's all-reduce and its post)
-    double hprof_ms[9] = {}, hprof_last = 0;   // (the host's time between the same marks: one GPU)
+    double cprof_ms[10] = {};   // (4, 5: the attention's projections, its compression and indexer; 6, 7: its q, its
+                                // sparse attention - 1 then its output's projections; 8: on a tensor-parallel group,
+                                // the output's all-reduce and its post; 9: the MoE's all-reduce and its post - 3
+                                // then the experts alone)
+    double hprof_ms[10] = {}, hprof_last = 0;   // (the host's time between the same marks: one GPU)
     void prof_mark(const Dev& d, int stage) {
         if (!prof_window && !prof_chunk) return;
         std::lock_guard<std::mutex> lk(prof_mu);
@@ -1618,7 +1619,7 @@ struct Model::Impl {
         std::lock_guard<std::mutex> lk(prof_mu);
         const bool chunk_sample = prof_chunk;
         bool sample_ok = !prof_failed;
-        double sample_ms[9] = {};
+        double sample_ms[10] = {};
         std::vector<std::pair<int, cudaEvent_t>> last;
         int current_dev = -1;
         if (sample_ok) {
@@ -1657,7 +1658,7 @@ struct Model::Impl {
         }
         if (sample_ok) {
             double* total = chunk_sample ? cprof_ms : st.prof_ms;
-            const int stages = chunk_sample ? 9 : 6;
+            const int stages = chunk_sample ? 10 : 6;
             for (int i = 0; i < stages; ++i) total[i] += sample_ms[i];
             for (const ProfMark& m : prof_marks) prof_pool[(size_t) m.dev].push_back(m.ev);
             prof_marks.clear();
@@ -2983,6 +2984,29 @@ struct Model::Impl {
                 (!hmap(G.arb.sums, (size_t) G.arb.slots * G.arb.stride, err) ||
                  !hmap(G.arb.bflags, (size_t) 2 * G.arb.nm * G.arb.slots * kArBlocks * 8, err)))
                 return false;
+            if (chunk > 0 && G.arb.nm == 2 && ar2() > 0) {   // DS4_AR2: ar2_kernel's progress words (zeroed)
+                if (!hmap(G.arb.pflags, (size_t) G.arb.nm * G.arb.slots * kAr2Blocks * 16, err)) return false;
+                G.arb.ar2 = ar2();
+            }
+        }
+        if (ar2() < 0) {
+            err = "DS4_AR2 takes 0, 1 or 2";
+            return false;
+        }
+        if (ar2() > 0) {
+            std::string on;
+            for (const Group& G : groups)
+                if (G.arb.ar2 > 0)
+                    for (int m : G.mem) on += (on.empty() ? "CUDA" : ", CUDA") + std::to_string(devs[(size_t) m].id);
+            if (on.empty())
+                std::fprintf(stderr, "ds4: DS4_AR2=%d: no group of two takes prompt chunks - not used\n", ar2());
+            else
+                std::fprintf(stderr,
+                             "ds4: DS4_AR2=%d: the prompt chunks' all-reduces on %s pipelined (%d blocks, %d KB pieces), "
+                             "the other member's rows read 16 bytes a lane%s\n",
+                             ar2(), on.c_str(), kAr2Blocks, kAr2Piece * 16 >> 10,
+                             ar2() == 2 ? "; FP16 on the wire (both partials rounded, summed in F32 in member order)"
+                                        : "; the sums bit for bit");
         }
         if (g.n_mtp > 0) {
             if (!halloc(h_taps, (size_t) tap_cap * g.d_targets.size() * g.dim, err)) return false;
@@ -11232,10 +11256,11 @@ struct Model::Impl {
         }
         if (c.flow) {
             if (!flow_layer(d, c, L0, mi, wp.k, T, b, err)) return false;
+            prof_mark(d, 3);
             if (nm > 1) allreduce(c.acc, T * D, ab, mi, ++c.arb_seq, d.xcnt, s);
             hc_post_inplace(c.acc, c.h, c.f_post, c.f_comb, D, H, T, s);
             CK(cudaMemcpyAsync(c.pre, c.f_pre, (size_t) T * 8 * 4, cudaMemcpyDeviceToDevice, s));
-            prof_mark(d, 3);
+            prof_mark(d, 9);   // (DS4_PROF: the MoE's all-reduce and post apart from its experts)
             kick(s);
             return true;
         }
@@ -11261,10 +11286,11 @@ struct Model::Impl {
             v_done = v_to;
         }
         if (!run_vram(d, c, L0, l, l, b.data(), v_done, L0.pv_n, T, err)) return false;
+        prof_mark(d, 3);
         if (nm > 1) allreduce(c.acc, T * D, ab, mi, ++c.arb_seq, d.xcnt, s);
         hc_post_inplace(c.acc, c.h, c.f_post, c.f_comb, D, H, T, s);
         CK(cudaMemcpyAsync(c.pre, c.f_pre, (size_t) T * 8 * 4, cudaMemcpyDeviceToDevice, s));
-        prof_mark(d, 3);
+        prof_mark(d, 9);
         kick(s);   // (Windows HIP: the experts and the layer's end submitted now, not at the next layer's wait)
         return true;
     }
@@ -12596,6 +12622,19 @@ struct Model::Impl {
     // the skip leaves out the same (chunk, layer)s and the same cut chunk's rows on each - so the members' all-reduces
     // stay paired, and the flow plans nothing for a skipped (chunk, layer) (flow_next, fl_rows) as on one GPU.  Off: a
     // TP group never skips, as before
+    // DS4_AR2=1 / 2 (0 / unset: off): a group of two's chunk all-reduces - the attention output's (DS4_AR_SLAB's runs
+    // too) and the MoE's - in ar2_kernel: the put and the sums pipelined in pieces, the other member's rows read 16 bytes
+    // a lane.  1: ar_sum_kernel's sums bit for bit; 2: FP16 on the wire (both partials rounded, summed in F32 in member
+    // order).  Decode's all-reduces (G.ar) never take it.  Another value: the load refuses (-1)
+    static int ar2() {
+        static const int v = [] {
+            const char* e = std::getenv("DS4_AR2");
+            if (e == nullptr || *e == 0) return 0;
+            const int x = std::atoi(e);
+            return (x >= 0 && x <= 2 && std::strspn(e, "0123456789") == std::strlen(e)) ? x : -1;
+        }();
+        return v;
+    }
     // DS4_AR_SLAB=<rows> (a multiple of 64; 0 / unset: off): layer_chunk's attention all-reduce in runs of that many rows
     // on a stream of its own, overlapping the next slabs' attention (a group of two)
     static int ar_slab() {
@@ -12816,7 +12855,7 @@ struct Model::Impl {
                          "ds4 prompt GPU time, %d tokens: attention %.0f ms, routing + shared expert %.0f ms, experts %.0f ms "
                          "(with the waits for streamed ones), between layers %.0f ms\n",
                          n, cprof_ms[4] + cprof_ms[5] + cprof_ms[6] + cprof_ms[7] + cprof_ms[1] + cprof_ms[8],
-                         cprof_ms[2], cprof_ms[3], cprof_ms[0]);
+                         cprof_ms[2], cprof_ms[3] + cprof_ms[9], cprof_ms[0]);
             std::fprintf(stderr,
                          "ds4 prompt attention GPU time: Engram + mixing + projections %.0f ms, compression + indexer "
                          "%.0f ms, q %.0f ms, sparse attention %.0f ms, output projections %.0f ms\n",
@@ -12825,11 +12864,15 @@ struct Model::Impl {
             //  tensor-parallel group, the all-reduce and the post; one GPU: the post alone)
             std::fprintf(stderr, "ds4 prompt attention output GPU time: projections %.0f ms, all-reduce + post %.0f ms\n",
                          cprof_ms[1], cprof_ms[8]);
+            // (the experts' two parts: the experts with the waits for streamed ones, and the MoE's all-reduce and its
+            //  post; one GPU: the post alone)
+            std::fprintf(stderr, "ds4 prompt experts GPU time: experts %.0f ms, all-reduce + post %.0f ms\n",
+                         cprof_ms[3], cprof_ms[9]);
             std::fprintf(stderr,
                          "ds4 prompt host time between the same marks: attention %.0f ms, routing + shared expert %.0f ms, "
                          "experts %.0f ms, between layers %.0f ms\n",
                          hprof_ms[4] + hprof_ms[5] + hprof_ms[6] + hprof_ms[7] + hprof_ms[1] + hprof_ms[8],
-                         hprof_ms[2], hprof_ms[3], hprof_ms[0]);
+                         hprof_ms[2], hprof_ms[3] + hprof_ms[9], hprof_ms[0]);
             for (double& v : cprof_ms) v = 0;
             for (double& v : hprof_ms) v = 0;
             prof_chunk = false;
