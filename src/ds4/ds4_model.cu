@@ -1555,6 +1555,7 @@ struct Model::Impl {
     std::vector<uint8_t*> hb_buf;                   // [thread][slot][1 + member]
     std::vector<cudaEvent_t> hb_ev;                 // [thread][slot][device]
     int hb_nm = 0;
+    std::atomic<bool> hb_said{false};               // (DS4_HANDBACK_FAST=2: a fallback's line, once)
     std::unique_ptr<std::atomic<size_t>[]> lz_dev_bytes;
     std::atomic<size_t> lz_next{0};
     std::atomic<int> lz_left{0}, lz_differ{0};
@@ -12278,9 +12279,11 @@ struct Model::Impl {
                 return refuse("no event");
             hb_ev.push_back(e);
         }
+        const bool kern = std::atoi(std::getenv("DS4_HANDBACK_FAST")) == 2;
         std::fprintf(stderr, "ds4: DS4_HANDBACK_FAST: the hand-back's copies asynchronous - %zu threads, two pinned slots "
-                             "each (%.0f MB), the copies on their own streams\n",
-                     n_th, (double) n_th * per * rf_bytes / 1e6);
+                             "each (%.0f MB), the copies on their own streams%s\n",
+                     n_th, (double) n_th * per * rf_bytes / 1e6,
+                     kern ? "; by kernels on the slots' devices (DS4_HANDBACK_FAST=2)" : "");
         return true;
     }
     // (DS4_HANDBACK_FAST) borrow_end's reads and copies: each thread takes the next expert into its slot s (read from
@@ -12293,6 +12296,11 @@ struct Model::Impl {
     void handback_fast(const std::vector<std::pair<int, int>>& jobs, size_t n_th, std::vector<char>& bad,
                        std::vector<std::atomic<size_t>>& dev_bytes, std::atomic<bool>& broken) {
         const size_t per = (size_t) 2 * (1 + (size_t) hb_nm), nd = devs.size();
+        // DS4_HANDBACK_FAST=2: each part by a kernel on its slot's device (copy_bytes, reading the pinned slot), not the
+        // copy engine - the prompt's compute is done, its CUs idle (098 / 099: the hand-back stayed ~4.5-5 s with its
+        // reads in the page cache and its copies async, ~1.3 GB/s a device through the copy engines)
+        static const bool hb_kernel = std::getenv("DS4_HANDBACK_FAST") != nullptr &&
+                                      std::atoi(std::getenv("DS4_HANDBACK_FAST")) == 2;
         std::atomic<size_t> next{0};
         std::vector<std::thread> th;
         for (size_t t = 0; t < n_th; ++t)
@@ -12325,10 +12333,24 @@ struct Model::Impl {
                         }
                         const size_t di = (size_t) x.dev;
                         const size_t bytes = l.nm > 1 ? unit(x) : l.blob;
-                        ok = cudaSetDevice(devs[di].id) == cudaSuccess &&
-                             cudaMemcpyAsync(sat(l, x, l.slot[(size_t) e], bytes), src, bytes, cudaMemcpyHostToDevice,
-                                             lz_st[t][di]) == cudaSuccess &&
-                             cudaEventRecord(hb_ev[(t * 2 + (size_t) s) * nd + di], lz_st[t][di]) == cudaSuccess;
+                        uint8_t* to = sat(l, x, l.slot[(size_t) e], bytes);
+                        ok = cudaSetDevice(devs[di].id) == cudaSuccess;
+                        void* from = nullptr;   // (DS4_HANDBACK_FAST=2: the slot's device reads the pinned slot itself)
+                        if (ok && hb_kernel && cudaHostGetDevicePointer(&from, (void*) src, 0) == cudaSuccess &&
+                            from != nullptr) {
+                            copy_bytes(to, from, bytes, lz_st[t][di]);
+                            ok = cudaGetLastError() == cudaSuccess;
+                        } else if (ok) {
+                            if (hb_kernel) {
+                                (void) cudaGetLastError();
+                                if (!hb_said.exchange(true))
+                                    std::fprintf(stderr, "ds4: DS4_HANDBACK_FAST=2: a pinned slot has no device address "
+                                                         "on CUDA%d - its copies on the copy engine, as before\n",
+                                                 devs[di].id);
+                            }
+                            ok = cudaMemcpyAsync(to, src, bytes, cudaMemcpyHostToDevice, lz_st[t][di]) == cudaSuccess;
+                        }
+                        ok = ok && cudaEventRecord(hb_ev[(t * 2 + (size_t) s) * nd + di], lz_st[t][di]) == cudaSuccess;
                         if (!ok) broken = true;   // (a runtime failure, not the file's: the slot's bytes unknown)
                         else {
                             used[(size_t) s * nd + di] = 1;
