@@ -356,6 +356,8 @@ struct ArGroup {
     unsigned* bflags = nullptr;
 };
 constexpr int kArBlocks = 64;
-void allreduce(float* x, int n, const ArGroup& a, int mi, unsigned seq, unsigned* cnt, cudaStream_t s);
+/// lean (two members, DS4_AR_SLAB's runs beside other work): a one-thread wait for the others' rows first, so the sums'
+/// blocks start only once they have landed - the same sums
+void allreduce(float* x, int n, const ArGroup& a, int mi, unsigned seq, unsigned* cnt, cudaStream_t s, bool lean = false);
 
 }  // namespace strata::ds4

@@ -1,6 +1,7 @@
 // ds4_pool_test: IoQueue's device-copy jobs (DS4_FLOW_HELPER's copies out of the helper's pool), CPU only - a fake
 // copy function stands in for the GPU runtime; and DS4_TP_BORROW's tail arithmetic (ds4_borrow.hpp).
 // Build: g++ -std=c++17 -O2 -pthread -I src/ds4 tests/ds4_pool_test.cpp
+#include "ds4_arslab.hpp"
 #include "ds4_borrow.hpp"
 #include "ds4_pool.hpp"
 
@@ -169,6 +170,47 @@ void tp_borrow_arithmetic() {
     EXPECT(keep == 2);
 }
 
+// DS4_AR_SLAB: the runs depend on T and rows alone - members with different slabs issue the same runs (their
+// all-reduces pair), the runs cover the chunk once in order, and none is issued before its rows' wo_b is done
+void ar_slab_runs() {
+    using strata::ds4::ar_runs_done;
+    using strata::ds4::ArRun;
+    auto issue = [](int T, int A, int rows, std::vector<int>* done_at) {   // one member: slabs of A rows
+        std::vector<ArRun> all;
+        int ar0 = 0;
+        for (int a0 = 0; a0 < T; a0 += A) {
+            const int done = std::min(T, a0 + A);
+            for (const ArRun& r : ar_runs_done(done, T, rows, ar0)) {
+                all.push_back(r);
+                if (done_at) done_at->push_back(done);
+            }
+        }
+        EXPECT(ar0 == T);   // (every row issued by the last slab)
+        return all;
+    };
+    for (int T : {1, 64, 511, 512, 8192, 8191, 30720 % 8192}) {
+        for (int rows : {64, 512, 1024, 4096}) {
+            std::vector<int> at;
+            const std::vector<ArRun> a = issue(T, 512, rows, &at), b = issue(T, 448, rows, nullptr);
+            EXPECT(a.size() == b.size());
+            bool same = a.size() == b.size(), cover = true, after = true;
+            int next = 0;
+            for (size_t i = 0; i < a.size(); ++i) {
+                same = same && a[i].r0 == b[i].r0 && a[i].r1 == b[i].r1;
+                cover = cover && a[i].r0 == next && a[i].r1 > a[i].r0 && a[i].r1 - a[i].r0 <= rows;
+                after = after && a[i].r1 <= at[i];
+                next = a[i].r1;
+            }
+            EXPECT(same && cover && after && next == T);
+        }
+    }
+    int ar0 = 0;
+    EXPECT(ar_runs_done(8192, 8192, 0, ar0).empty() && ar0 == 0);   // (off: no runs)
+    EXPECT(ar_runs_done(100, 8192, 1024, ar0).empty() && ar0 == 0);  // (a slab short of the first run's end)
+    const std::vector<ArRun> r = ar_runs_done(2100, 8192, 1024, ar0);
+    EXPECT(r.size() == 2 && r[0].r0 == 0 && r[0].r1 == 1024 && r[1].r0 == 1024 && r[1].r1 == 2048 && ar0 == 2048);
+}
+
 }  // namespace
 
 int main() {
@@ -177,6 +219,7 @@ int main() {
     memory_copy_unchanged();
     many_device_copies();
     tp_borrow_arithmetic();
+    ar_slab_runs();
     if (failures) {
         std::fprintf(stderr, "ds4_pool_test: %d FAILED\n", failures);
         return 1;

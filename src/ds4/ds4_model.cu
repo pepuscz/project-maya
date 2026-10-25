@@ -11,6 +11,7 @@
 //   h = post * moe + comb^T h;  pre = f_pre
 // and after the last layer logits = head(rmsnorm(sum_s pre[s] h[s])).
 #include "ds4_model.hpp"
+#include "ds4_arslab.hpp"
 #include "ds4_borrow.hpp"
 #include "ds4_engram_io.hpp"
 
@@ -624,6 +625,12 @@ struct Chunk {
     unsigned* hand_flag[2] = {nullptr, nullptr};
     unsigned* hand_ack = nullptr;
     unsigned arb_seq = 0;        // the group's chunk all-reduces
+    // DS4_AR_SLAB=<rows> (a group of two): the attention output's all-reduce cut in runs of that many rows, each on
+    // this stream as soon as the slabs before it are done (ar_rows: the main stream's mark, ar_done: the last run's),
+    // with its own counter for xfer_put (the main stream's is d.xcnt)
+    cudaStream_t ars = nullptr;
+    cudaEvent_t ar_rows = nullptr, ar_done = nullptr;
+    unsigned* ar_cnt = nullptr;
     // pinned, two chunks in flight: the embedding rows (the first layer's device), the Engram rows (an Engram layer's)
     uint16_t* emb_host[2] = {nullptr, nullptr};
     uint8_t* eg_host[2] = {nullptr, nullptr};
@@ -1528,9 +1535,10 @@ struct Model::Impl {
     // ... and a run of chunks' (prof_chunk): a layer's start, after its attention, after the routing and the shared
     // expert, after its experts (the streamed ones' waits for their reads in it); printed after the run
     bool prof_chunk = false;
-    double cprof_ms[8] = {};   // (4, 5: the attention's projections, its compression and indexer; 6, 7: its q, its
-                               // sparse attention - 1 then its output's projections)
-    double hprof_ms[8] = {}, hprof_last = 0;   // (the host's time between the same marks: one GPU)
+    double cprof_ms[9] = {};   // (4, 5: the attention's projections, its compression and indexer; 6, 7: its q, its
+                               // sparse attention - 1 then its output's projections; 8: on a tensor-parallel group,
+                               // the output's all-reduce and its post)
+    double hprof_ms[9] = {}, hprof_last = 0;   // (the host's time between the same marks: one GPU)
     void prof_mark(const Dev& d, int stage) {
         if (!prof_window && !prof_chunk) return;
         std::lock_guard<std::mutex> lk(prof_mu);
@@ -1580,7 +1588,7 @@ struct Model::Impl {
         std::lock_guard<std::mutex> lk(prof_mu);
         const bool chunk_sample = prof_chunk;
         bool sample_ok = !prof_failed;
-        double sample_ms[8] = {};
+        double sample_ms[9] = {};
         std::vector<std::pair<int, cudaEvent_t>> last;
         int current_dev = -1;
         if (sample_ok) {
@@ -1619,7 +1627,7 @@ struct Model::Impl {
         }
         if (sample_ok) {
             double* total = chunk_sample ? cprof_ms : st.prof_ms;
-            const int stages = chunk_sample ? 8 : 6;
+            const int stages = chunk_sample ? 9 : 6;
             for (int i = 0; i < stages; ++i) total[i] += sample_ms[i];
             for (const ProfMark& m : prof_marks) prof_pool[(size_t) m.dev].push_back(m.ev);
             prof_marks.clear();
@@ -3481,6 +3489,12 @@ struct Model::Impl {
             const size_t down_b = flow_down_bytes((int) di);   // (the flow's down scratch, where it takes one)
             if (down_b > 0 && !dalloc(d, c.down, down_b, err)) return false;
             CK(cudaStreamCreateWithFlags(&c.cs, cudaStreamNonBlocking));
+            if (ar_slab() > 0) {   // (DS4_AR_SLAB: layer_chunk uses it only on a group of two)
+                CK(cudaStreamCreateWithFlags(&c.ars, cudaStreamNonBlocking));
+                CK(cudaEventCreateWithFlags(&c.ar_rows, cudaEventDisableTiming));
+                CK(cudaEventCreateWithFlags(&c.ar_done, cudaEventDisableTiming));
+                if (!dalloc(d, c.ar_cnt, 1, err)) return false;   // (zeroed: xfer_put's counter is 0 between uses)
+            }
             for (int i = 0; i < Chunk::kParts; ++i) {
                 CK(cudaEventCreateWithFlags(&c.filled[i], cudaEventDisableTiming));
                 CK(cudaEventCreateWithFlags(&c.freed[i], cudaEventDisableTiming));
@@ -11038,6 +11052,23 @@ struct Model::Impl {
         }
         // the attention in slabs: q, the sparse attention, wo_a, wo_b (this member's share) into acc
         if (NHL == 0) CK(cudaMemsetAsync(c.acc, 0, (size_t) T * D * sizeof(*c.acc), s));   // (no heads)
+        // DS4_AR_SLAB=<rows>, a group of two whose members both have heads: the all-reduce of acc (and its post) in runs
+        // of that many rows on the chunk's all-reduce stream, each as soon as the slabs before its end are done, while
+        // the next slabs' attention runs here.  Each element is still this member's partial and the other's summed in
+        // member order and each token's post reads only its own row - the same bits as one all-reduce after the loop.
+        // The runs are cut by rows, not by slabs: both members issue the same all-reduces even if their slabs differ
+        const int arr = nm == 2 && c.ars != nullptr && member(L0, 0).ahn > 0 && member(L0, 1).ahn > 0 ? ar_slab() : 0;
+        int ar0 = 0;   // (the first row not yet all-reduced: ar_runs_done's)
+        auto ar_run = [&](const ArRun& r) -> bool {   // its sums and post on c.ars, after this stream's work so far
+            if (cudaEventRecord(c.ar_rows, s) != cudaSuccess || cudaStreamWaitEvent(c.ars, c.ar_rows, 0) != cudaSuccess) {
+                err = "DS4_AR_SLAB: the all-reduce stream's wait on CUDA" + std::to_string(d.id);
+                return false;
+            }
+            allreduce(c.acc + (size_t) r.r0 * D, (r.r1 - r.r0) * D, ab, mi, ++c.arb_seq, c.ar_cnt, c.ars, true);
+            hc_post_inplace(c.acc + (size_t) r.r0 * D, c.h + (size_t) r.r0 * H * D, c.a_post + (size_t) r.r0 * 8,
+                            c.a_comb + (size_t) r.r0 * 64, D, H, r.r1 - r.r0, c.ars);
+            return true;
+        };
         for (int a0 = 0; a0 < T && NHL > 0; a0 += c.A) {
             const int na = std::min(c.A, T - a0);
             if (!gemm(d, c, l.wq_b, c.qr16 + (size_t) a0 * g.q_lora, g.q_lora, na, c.q, HQ, 0.0f, err)) return false;
@@ -11078,10 +11109,21 @@ struct Model::Impl {
             x3::rows_f16(c.oa, OG * g.o_lora, nullptr, na, OG * g.o_lora, c.oa16, s);
             if (!gemm(d, c, l.wo_b, c.oa16, OG * g.o_lora, na, c.acc + (size_t) a0 * D, D, 0.0f, err)) return false;
             prof_mark(d, 1);
+            for (const ArRun& r : ar_runs_done(a0 + na, T, arr, ar0))   // (every run whose rows are now done)
+                if (!ar_run(r)) return false;
         }
-        if (nm > 1) allreduce(c.acc, T * D, ab, mi, ++c.arb_seq, d.xcnt, s);
-        hc_post_inplace(c.acc, c.h, c.a_post, c.a_comb, D, H, T, s);
-        prof_mark(d, 1);
+        if (arr > 0) {   // (the runs all queued in the loop: this stream waits for the last one's post)
+            if (ar0 != T || cudaEventRecord(c.ar_done, c.ars) != cudaSuccess ||
+                cudaStreamWaitEvent(s, c.ar_done, 0) != cudaSuccess) {
+                err = "DS4_AR_SLAB: the all-reduce runs on CUDA" + std::to_string(d.id);
+                return false;
+            }
+        } else {
+            if (nm > 1) allreduce(c.acc, T * D, ab, mi, ++c.arb_seq, d.xcnt, s);
+            hc_post_inplace(c.acc, c.h, c.a_post, c.a_comb, D, H, T, s);
+        }
+        prof_mark(d, 8);   // (DS4_PROF: the output's all-reduce and post apart from its projections - with DS4_AR_SLAB
+                           //  only what the slabs did not hide)
         kick(s);   // (the attention submitted while the host queues the routing)
         // the MoE
         if (!hc_mix_chunk(d, c, c.h, l.hcf_fn, T, c.mix, err)) return false;
@@ -12277,6 +12319,16 @@ struct Model::Impl {
     // the skip leaves out the same (chunk, layer)s and the same cut chunk's rows on each - so the members' all-reduces
     // stay paired, and the flow plans nothing for a skipped (chunk, layer) (flow_next, fl_rows) as on one GPU.  Off: a
     // TP group never skips, as before
+    // DS4_AR_SLAB=<rows> (a multiple of 64; 0 / unset: off): layer_chunk's attention all-reduce in runs of that many rows
+    // on a stream of its own, overlapping the next slabs' attention (a group of two)
+    static int ar_slab() {
+        static const int rows = [] {
+            const char* e = std::getenv("DS4_AR_SLAB");
+            const int v = e != nullptr ? std::atoi(e) : 0;
+            return v > 0 ? std::max(64, v / 64 * 64) : 0;
+        }();
+        return rows;
+    }
     static bool yoco_tp() {
         static const bool on = std::getenv("DS4_YOCO_TP") != nullptr && std::atoi(std::getenv("DS4_YOCO_TP")) != 0;
         return on;
@@ -12486,17 +12538,21 @@ struct Model::Impl {
             std::fprintf(stderr,
                          "ds4 prompt GPU time, %d tokens: attention %.0f ms, routing + shared expert %.0f ms, experts %.0f ms "
                          "(with the waits for streamed ones), between layers %.0f ms\n",
-                         n, cprof_ms[4] + cprof_ms[5] + cprof_ms[6] + cprof_ms[7] + cprof_ms[1], cprof_ms[2],
-                         cprof_ms[3], cprof_ms[0]);
+                         n, cprof_ms[4] + cprof_ms[5] + cprof_ms[6] + cprof_ms[7] + cprof_ms[1] + cprof_ms[8],
+                         cprof_ms[2], cprof_ms[3], cprof_ms[0]);
             std::fprintf(stderr,
                          "ds4 prompt attention GPU time: Engram + mixing + projections %.0f ms, compression + indexer "
                          "%.0f ms, q %.0f ms, sparse attention %.0f ms, output projections %.0f ms\n",
-                         cprof_ms[4], cprof_ms[5], cprof_ms[6], cprof_ms[7], cprof_ms[1]);
+                         cprof_ms[4], cprof_ms[5], cprof_ms[6], cprof_ms[7], cprof_ms[1] + cprof_ms[8]);
+            // (the output's two parts: its projections - wo_a, wo_b and the inverse rope before them - and, on a
+            //  tensor-parallel group, the all-reduce and the post; one GPU: the post alone)
+            std::fprintf(stderr, "ds4 prompt attention output GPU time: projections %.0f ms, all-reduce + post %.0f ms\n",
+                         cprof_ms[1], cprof_ms[8]);
             std::fprintf(stderr,
                          "ds4 prompt host time between the same marks: attention %.0f ms, routing + shared expert %.0f ms, "
                          "experts %.0f ms, between layers %.0f ms\n",
-                         hprof_ms[4] + hprof_ms[5] + hprof_ms[6] + hprof_ms[7] + hprof_ms[1], hprof_ms[2],
-                         hprof_ms[3], hprof_ms[0]);
+                         hprof_ms[4] + hprof_ms[5] + hprof_ms[6] + hprof_ms[7] + hprof_ms[1] + hprof_ms[8],
+                         hprof_ms[2], hprof_ms[3], hprof_ms[0]);
             for (double& v : cprof_ms) v = 0;
             for (double& v : hprof_ms) v = 0;
             prof_chunk = false;

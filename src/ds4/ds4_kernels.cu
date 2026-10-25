@@ -2562,7 +2562,7 @@ void wait_flags(const unsigned* flags, int n, int stride, unsigned seq, cudaStre
     if (n > 0) wait_flags_kernel<<<1, 32, 0, s>>>(flags, n, stride, seq);
 }
 void set_flag(unsigned* flag, unsigned v, cudaStream_t s) { set_flag_kernel<<<1, 1, 0, s>>>(flag, v); }
-void allreduce(float* x, int n, const ArGroup& a, int mi, unsigned seq, unsigned* cnt, cudaStream_t s) {
+void allreduce(float* x, int n, const ArGroup& a, int mi, unsigned seq, unsigned* cnt, cudaStream_t s, bool lean) {
     const int slot = (int) (seq % (unsigned) a.slots);
     if (a.nm > 2 && a.sums != nullptr && a.bflags != nullptr) {   // (the reduce-scatter: ar_rs_kernel)
         static const bool f16 = [] {
@@ -2583,6 +2583,9 @@ void allreduce(float* x, int n, const ArGroup& a, int mi, unsigned seq, unsigned
     xp.dst[0] = a.data + ((size_t) mi * a.slots + slot) * a.stride;
     xp.bytes[0] = (size_t) n * 4;
     xfer_put(xp, a.flags + ((size_t) mi * a.slots + slot) * 32, seq, cnt, s);
+    if (lean)   // (one thread waits for the others' rows, so the sums' blocks are not held resident while it does)
+        for (int m = 0; m < a.nm; ++m)
+            if (m != mi) wait_flags(a.flags + ((size_t) m * a.slots + slot) * 32, 1, 32, seq, s);
     const int n4 = n / 4;
     const int blocks = std::max(1, std::min(64, cdiv(n4, kThreads)));
     ar_sum_kernel<<<blocks, kThreads, 0, s>>>(x, n4, a.data, a.stride, a.flags, a.nm, mi, slot, a.slots, seq);
