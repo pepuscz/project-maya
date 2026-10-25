@@ -3271,6 +3271,22 @@ struct Model::Impl {
                 bool all_flow = true;
                 for (const auto& cp : chunks) all_flow = all_flow && (cp == nullptr || cp->ring == nullptr || cp->flow);
                 if (all_flow && std::getenv("DS4_CHUNK_MIN") == nullptr) chunk_min = kFlowChunkMin;
+                if (down_share()) {   // (DS4_FLOW_DOWN_SHARE: a count a (layer, expert) - the members' flows share it)
+                    bool on = tp_uneven && flow_tp;
+                    for (const auto& cp : chunks) on = on && (cp == nullptr || cp->ring == nullptr || cp->flow);
+                    if (on) {
+                        int ne = 0;
+                        for (const Layer& l : L) ne = std::max(ne, l.n_exp);
+                        down_stride = (size_t) ne;
+                        down_reads.reset(new std::atomic<uint8_t>[L.size() * down_stride]);
+                        for (size_t i = 0; i < L.size() * down_stride; ++i) down_reads[i].store(0);
+                    }
+                    std::fprintf(stderr, "%s", on ? "ds4: DS4_FLOW_DOWN_SHARE: a tensor-parallel group's members read each "
+                                                    "streamed expert's down from the files once, through the page cache "
+                                                    "(dropped once every member read it)\n"
+                                                  : "ds4: DS4_FLOW_DOWN_SHARE: no tensor-parallel members on the prompt "
+                                                    "path's flow - not used\n");
+                }
                 if (tp_uneven && flow_tp) {   // (DS4_FLOW_TP with DS4_TP_GGUF_UNEVEN: the members that stream their parts)
                     std::string on;
                     for (size_t di = 0; di < chunks.size(); ++di)
@@ -3895,6 +3911,12 @@ struct Model::Impl {
             j.left = &it.left;
             j.bad = &it.bad;
             j.mem = it.ram != nullptr ? it.ram + l.lay.trellis[r] + mx_read_off(l, it.mi, r) : nullptr;
+            if (r == 2 && l.nm > 1 && down_reads != nullptr && !it.cache && it.ram == nullptr && it.keep == nullptr &&
+                (size_t) it.e < down_stride) {   // (DS4_FLOW_DOWN_SHARE: the members' one read of the whole down)
+                j.dfd = os::kBadFd;
+                j.share = &down_reads[(size_t) it.il * down_stride + (size_t) it.e];
+                j.share_n = l.nm;
+            }
             j.map = pk.at(l.mx_file[r], j.off);
             j.keep = it.keep != nullptr ? it.keep + l.lay.trellis[r] : nullptr;
             sb += flow_region(r);
@@ -3990,7 +4012,9 @@ struct Model::Impl {
         it.k = k;
         it.e = e;
         it.v = v;
-        it.cache = cache;
+        // (DS4_LEND_CACHE, a borrowing run: an expert whose VRAM slot lies under the run's buffers, through the page
+        //  cache - the run's later chunks and the hand-back find it there)
+        it.cache = cache || (lend_cache() > 0 && lent && (size_t) e < l.slot.size() && l.slot[(size_t) e] >= l.pv_n);
         const bool in_ram = !l.ram.empty() && l.ram[(size_t) e] >= 0;
         if (in_ram && ram_pinned) {   // (DMA'd from where it lies)
             const uint8_t* p = ram_slots[(size_t) l.ram[(size_t) e]];
@@ -5522,6 +5546,38 @@ struct Model::Impl {
                 for (size_t i; (i = wi.fetch_add(1)) < nw;) read_mx(L[(size_t) warm[i].layer], warm[i].e, buf.data());
             });
         for (auto& t : wt) t.join();
+        if (lend_cache() > 0) {   // DS4_LEND_CACHE: the line; 2: the experts a run may lend read into the page cache now
+            std::vector<std::pair<int, int>> ls;
+            for (const Layer& l : L)
+                if (!l.mtp && l.n_main < l.n_slots)
+                    for (int e = 0; e < l.n_exp; ++e)
+                        if (l.slot[(size_t) e] >= l.n_main) ls.push_back({l.il, e});
+            double gb = 0;
+            for (const auto& x : ls) gb += (double) L[(size_t) x.first].blob / 1e9;
+            const double tl = now_ms();
+            if (lend_cache() == 2) {
+                std::atomic<size_t> li{0};
+                std::vector<std::thread> lt;
+                for (int t = 0; t < 12 && !ls.empty(); ++t)
+                    lt.emplace_back([&] {
+                        std::vector<uint8_t> buf(maxb);
+                        for (size_t i; (i = li.fetch_add(1)) < ls.size();)
+                            read_mx(L[(size_t) ls[i].first], ls[i].second, buf.data());
+                    });
+                for (auto& t : lt) t.join();
+            }
+            if (ls.empty())
+                std::fprintf(stderr, "ds4: DS4_LEND_CACHE=%d: no device lends the prompt path its experts' VRAM - not used\n",
+                             lend_cache());
+            else if (lend_cache() == 1)
+                std::fprintf(stderr, "ds4: DS4_LEND_CACHE=1: a borrowing run streams the experts under its buffers (up to "
+                                     "%zu, %.1f GB) through the page cache; the hand-back reads them from there, then drops "
+                                     "them\n", ls.size(), gb);
+            else
+                std::fprintf(stderr, "ds4: DS4_LEND_CACHE=2: the %zu experts a run may lend (%.1f GB) read into the page "
+                                     "cache in %.1f s; a borrowing run streams them through it, the hand-back reads them "
+                                     "from there and leaves them\n", ls.size(), gb, (now_ms() - tl) / 1000.0);
+        }
         if (warm_stats_on) {   // (DS4_WARM_STATS: the list as read, for warm_snapshot)
             warm_list.clear();
             for (const Warm& w : warm) warm_list.push_back({w.layer, w.e});
@@ -12471,8 +12527,8 @@ struct Model::Impl {
                             }
                         }
                         bad[i] = !read || !ok || !same;   // (a part that differs: to the CPU lane, as a failed read)
-                        if (ok && same)   // (one copy of it: in VRAM again)
-                            for (int r = 0; r < 3; ++r)
+                        if (ok && same && lend_cache() < 2)   // (one copy of it: in VRAM again; DS4_LEND_CACHE=2 keeps
+                            for (int r = 0; r < 3; ++r)          //  the page cache's for the next run)
                                 os::advise(pk.fds[(size_t) l.mx_file[r]], l.mx_off[r] + (uint64_t) e * l.mx_stride[r],
                                            mx_part_bytes(l, r), false);
                         continue;
@@ -12493,7 +12549,7 @@ struct Model::Impl {
                             bad[i] = 1;   // (to the CPU lane, as a failed read)
                         }
                     }
-                    if (!bad[i])   // (one copy of it: in VRAM again)
+                    if (!bad[i] && lend_cache() < 2)   // (one copy of it: in VRAM again; DS4_LEND_CACHE=2: kept)
                         for (int r = 0; r < 3; ++r)
                             os::advise(pk.fds[(size_t) l.mx_file[r]], l.mx_off[r] + (uint64_t) e * l.mx_stride[r],
                                        mx_part_bytes(l, r), false);
@@ -12659,6 +12715,33 @@ struct Model::Impl {
         }();
         return v;
     }
+    // DS4_FLOW_DOWN_SHARE=1 (unset: as before): a tensor-parallel group's members each read the whole down of every
+    // expert the flow streams from the files (mx_read_off: r 2 is never cut) - unbuffered, so both from the disk, ~30 %
+    // of the bytes (096's prof load: the files' 35 GB at 32K, 168 GB at 130K for the pair, ~3 GB/s).  On: that read
+    // goes through the page cache (the second member's finds it there, or waits on the first's pages) and the range
+    // leaves the cache once every member counted it (down_reads, IoQueue::Job::share).  The bytes are the same
+    static bool down_share() {
+        static const bool on = std::getenv("DS4_FLOW_DOWN_SHARE") != nullptr &&
+                               std::atoi(std::getenv("DS4_FLOW_DOWN_SHARE")) != 0;
+        return on;
+    }
+    // DS4_LEND_CACHE=1 / 2 (unset: as before; with a borrowing run - DS4_TP_BORROW or a lending device): the experts
+    // whose VRAM slots lie under a run's buffers are streamed through the page cache (every part, Item::cache), so the
+    // run's later chunks and the hand-back (borrow_end, buffered) read them from RAM, not the disk again - 096: the
+    // hand-back read 13.05 / 13.86 GB in 5.2 / 4.8 s inside each long prompt, and each chunk read them once more.  1:
+    // the hand-back drops them from the cache, as before; 2: it leaves them there, and the load reads the experts a
+    // run may lend (the tail's slots) once after the CPU lane's read-ahead, so the next run's first chunk finds them
+    // too (~14 GB of page cache beside the read-ahead).  The bytes are the same
+    static int lend_cache() {
+        static const int v = [] {
+            const char* e = std::getenv("DS4_LEND_CACHE");
+            const int x = e != nullptr ? std::atoi(e) : 0;
+            return x == 1 || x == 2 ? x : 0;
+        }();
+        return v;
+    }
+    std::unique_ptr<std::atomic<uint8_t>[]> down_reads;   // (DS4_FLOW_DOWN_SHARE) [layer][expert]: members' reads so far
+    size_t down_stride = 0;
     // DS4_AR_SLAB=<rows> (a multiple of 64; 0 / unset: off): layer_chunk's attention all-reduce in runs of that many rows
     // on a stream of its own, overlapping the next slabs' attention (a group of two)
     static int ar_slab() {
