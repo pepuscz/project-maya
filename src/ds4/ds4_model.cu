@@ -4374,7 +4374,11 @@ struct Model::Impl {
         const size_t lb = c.spec_begin, le = c.base + c.items.size(), n_lay = le - lb;
         int k2 = 0, il2 = 0;
         if (flow_next(c, k, L0.il, k2, il2)) flow_spec(c, k2, il2, fl_rows(c, k2, il2));
-        const size_t R = (size_t) c.ring_n, bmax = std::max<size_t>(1, R / 2);
+        // (a batch at most half the device's own ring - DS4_RING_LEND_MB's larger ring lets the copies run further
+        //  ahead, not the batches grow: 101's 176-slot ring with 88-item batches made each one wait for 88 landings, 893 /
+        //  1078 tok/s against 948 / 1146)
+        const size_t R = (size_t) c.ring_n,
+                     bmax = std::max<size_t>(1, (c.ring_n_base > 0 ? (size_t) c.ring_n_base : R) / 2);
         int v_done = 0;
         while (c.n_comp < le) {
             // a batch's bounds are fixed by the stream alone (bmax items, never across the ring's end), never by what
