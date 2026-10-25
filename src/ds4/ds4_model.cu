@@ -939,6 +939,10 @@ struct Model::Impl {
     // reads a 16K prompt's experts once instead of twice (V100: 461.8 -> 321.3 s, 736 -> 506 GB read) but its buffers
     // take ~1.9 GB of VRAM experts (745 -> 644 on a 32 GB V100) from every decoded token
     static constexpr int kMaxChunk = 4 * kVlRows;
+    // an explicit --prefill-chunk at most (the default and chunk_default stay at kMaxChunk): a 130K prompt in two
+    // chunks reads its streamed experts twice, not four times (097: the x4 links carried ~256 GB a member at 32768).
+    // Above 65024 a chunk's rows would pass 65535 in a grid's y (combine, the post): not allowed
+    static constexpr int kMaxChunkExplicit = 65024;
     std::vector<std::unique_ptr<Chunk>> chunks;   // per device
     size_t eg_cap = kWin;             // tokens h_eg holds
     int tap_cap = kWin;               // rows h_taps holds (a chunk seeds the drafter with its last 128)
@@ -1509,6 +1513,12 @@ struct Model::Impl {
     std::vector<std::vector<int>> lz_slot;          // [layer][expert]: the slot it keeps while it waits, else -1
     std::vector<std::thread> lz_th;
     std::vector<std::vector<cudaStream_t>> lz_st;   // [thread][device]
+    // (DS4_HANDBACK_FAST) the synchronous hand-back's copies asynchronous: each thread two slots (a whole blob and one
+    // part a member each, pinned), its copies on lz_st's streams, an event a (thread, slot, device) before a slot is
+    // filled again
+    std::vector<uint8_t*> hb_buf;                   // [thread][slot][1 + member]
+    std::vector<cudaEvent_t> hb_ev;                 // [thread][slot][device]
+    int hb_nm = 0;
     std::unique_ptr<std::atomic<size_t>[]> lz_dev_bytes;
     std::atomic<size_t> lz_next{0};
     std::atomic<int> lz_left{0}, lz_differ{0};
@@ -2609,7 +2619,8 @@ struct Model::Impl {
         else if (chunk > 0 && o.prefill_chunk < 0) chunk = chunk_default(chunk);
         if (const char* v = std::getenv("DS4_CHUNK_MIN")) chunk_min = std::max(1, std::atoi(v));
         if (chunk > 0) {
-            chunk = std::min(kMaxChunk, std::max(dc != nullptr ? 16 : 256, chunk / 16 * 16));
+            chunk = std::min(o.prefill_chunk > kMaxChunk && dc == nullptr ? kMaxChunkExplicit : kMaxChunk,
+                             std::max(dc != nullptr ? 16 : 256, chunk / 16 * 16));
             eg_cap = (size_t) chunk;
             tap_cap = std::max(kWin, 128);
         } else   // (only as asked for: --prefill-chunk 0, or --tp 1 with --threads off)
@@ -12187,6 +12198,114 @@ struct Model::Impl {
         }
         return true;
     }
+    // (DS4_HANDBACK_FAST) its pinned slots, streams and events, made once and kept (false: the synchronous copies, as
+    // before - a line says why)
+    bool hb_ready(size_t n_th) {
+        int nm = 1;
+        for (const Layer& l : L) nm = std::max(nm, l.nm);
+        const size_t per = (size_t) 2 * (1 + (size_t) nm);
+        if (hb_buf.size() >= n_th * per && hb_ev.size() >= n_th * 2 * devs.size() && lz_st.size() >= n_th && hb_nm == nm)
+            return true;
+        auto refuse = [&](const char* what) {
+            std::fprintf(stderr, "ds4: DS4_HANDBACK_FAST: %s - the hand-back's copies synchronous, as before\n", what);
+            return false;
+        };
+        hb_nm = nm;
+        while (hb_buf.size() < n_th * per) {
+            uint8_t* p = nullptr;
+            if (cudaHostAlloc((void**) &p, rf_bytes, cudaHostAllocPortable) != cudaSuccess) return refuse("no pinned slots");
+            host_allocs.push_back(p);
+            hb_buf.push_back(p);
+        }
+        while (lz_st.size() < n_th) {   // (the read back's streams: [thread][device], non-blocking, kept)
+            std::vector<cudaStream_t> v(devs.size(), nullptr);
+            for (size_t di = 0; di < devs.size(); ++di)
+                if (cudaSetDevice(devs[di].id) != cudaSuccess ||
+                    cudaStreamCreateWithFlags(&v[di], cudaStreamNonBlocking) != cudaSuccess) {
+                    for (cudaStream_t x : v)
+                        if (x != nullptr) cudaStreamDestroy(x);
+                    return refuse("no stream");
+                }
+            lz_st.push_back(v);
+        }
+        while (hb_ev.size() < n_th * 2 * devs.size()) {
+            const size_t di = hb_ev.size() % devs.size();
+            cudaEvent_t e = nullptr;
+            if (cudaSetDevice(devs[di].id) != cudaSuccess ||
+                cudaEventCreateWithFlags(&e, cudaEventDisableTiming) != cudaSuccess)
+                return refuse("no event");
+            hb_ev.push_back(e);
+        }
+        std::fprintf(stderr, "ds4: DS4_HANDBACK_FAST: the hand-back's copies asynchronous - %zu threads, two pinned slots "
+                             "each (%.0f MB), the copies on their own streams\n",
+                     n_th, (double) n_th * per * rf_bytes / 1e6);
+        return true;
+    }
+    // (DS4_HANDBACK_FAST) borrow_end's reads and copies: each thread takes the next expert into its slot s (read from
+    // the file - the page cache's with DS4_LEND_CACHE), each member's part split off there (blob_to_half) and copied
+    // into its slot on the thread's stream for that device, an event recorded after; the slot is filled again only
+    // once its events are done, so a thread reads and splits the next expert while its copies run, and the devices
+    // take several copies at once.  bad[i]: the read failed (the CPU lane takes it, as before); broken: a copy, an
+    // event or a sync failed (a runtime failure: the tables can no longer be vouched for).  Every stream synced before
+    // it returns
+    void handback_fast(const std::vector<std::pair<int, int>>& jobs, size_t n_th, std::vector<char>& bad,
+                       std::vector<std::atomic<size_t>>& dev_bytes, std::atomic<bool>& broken) {
+        const size_t per = (size_t) 2 * (1 + (size_t) hb_nm), nd = devs.size();
+        std::atomic<size_t> next{0};
+        std::vector<std::thread> th;
+        for (size_t t = 0; t < n_th; ++t)
+            th.emplace_back([&, t] {
+                std::vector<char> used(2 * nd, 0);   // (slot s, device: an event recorded)
+                int s = 0;
+                for (;;) {
+                    const size_t i = next.fetch_add(1);
+                    if (i >= jobs.size() || broken.load()) break;
+                    const Layer& l = L[(size_t) jobs[i].first];
+                    const int e = jobs[i].second;
+                    for (size_t di = 0; di < nd; ++di)   // (slot s free again: its last copies done)
+                        if (used[(size_t) s * nd + di]) {
+                            if (cudaSetDevice(devs[di].id) != cudaSuccess ||
+                                cudaEventSynchronize(hb_ev[(t * 2 + (size_t) s) * nd + di]) != cudaSuccess)
+                                broken = true;
+                            used[(size_t) s * nd + di] = 0;
+                        }
+                    uint8_t* stage = hb_buf[t * per + (size_t) s * (1 + (size_t) hb_nm)];
+                    const bool read = l.blob <= rf_bytes && read_mx_file(l, e, stage);
+                    bad[i] = !read;   // (a read that fails: the CPU lane takes it - the file has it)
+                    bool ok = read && !broken.load();
+                    for (int m = 0; m < l.nm && ok; ++m) {
+                        const Layer& x = member(l, m);
+                        const uint8_t* src = stage;
+                        if (l.nm > 1) {
+                            uint8_t* half = hb_buf[t * per + (size_t) s * (1 + (size_t) hb_nm) + 1 + (size_t) m];
+                            blob_to_half(l, stage, m, half);
+                            src = half;
+                        }
+                        const size_t di = (size_t) x.dev;
+                        const size_t bytes = l.nm > 1 ? unit(x) : l.blob;
+                        ok = cudaSetDevice(devs[di].id) == cudaSuccess &&
+                             cudaMemcpyAsync(sat(l, x, l.slot[(size_t) e], bytes), src, bytes, cudaMemcpyHostToDevice,
+                                             lz_st[t][di]) == cudaSuccess &&
+                             cudaEventRecord(hb_ev[(t * 2 + (size_t) s) * nd + di], lz_st[t][di]) == cudaSuccess;
+                        if (!ok) broken = true;   // (a runtime failure, not the file's: the slot's bytes unknown)
+                        else {
+                            used[(size_t) s * nd + di] = 1;
+                            dev_bytes[di].fetch_add(bytes);
+                        }
+                    }
+                    if (read && !ok) bad[i] = 1;   // (as the synchronous path: to the CPU lane, and broken)
+                    if (ok && lend_cache() < 2)   // (one copy of it: in VRAM again)
+                        for (int r = 0; r < 3; ++r)
+                            os::advise(pk.fds[(size_t) l.mx_file[r]], l.mx_off[r] + (uint64_t) e * l.mx_stride[r],
+                                       mx_part_bytes(l, r), false);
+                    s ^= 1;
+                }
+                for (size_t di = 0; di < nd; ++di)   // (every copy of this thread's done)
+                    if (cudaSetDevice(devs[di].id) != cudaSuccess || cudaStreamSynchronize(lz_st[t][di]) != cudaSuccess)
+                        broken = true;
+            });
+        for (auto& x : th) x.join();
+    }
     // (DS4_TP_BORROW_LAZY) what a read back behind the decode needs, before any expert moves: the pinned table entries
     // (n of them a member) and each thread's non-blocking stream a device. false: the hand-back stays inside the prompt
     bool lz_ready(size_t n, size_t n_th) {
@@ -12494,7 +12613,16 @@ struct Model::Impl {
         static const bool check = std::getenv("DS4_CHECK_LEND") != nullptr;   // (each one read back, against the file)
         std::vector<char> bad(jobs.size(), 0);
         std::vector<std::thread> th;
-        for (int t = 0; t < (int) n_th; ++t)
+        static const bool fast = std::getenv("DS4_HANDBACK_FAST") != nullptr &&
+                                 std::atoi(std::getenv("DS4_HANDBACK_FAST")) != 0;
+        const bool go_fast = fast && !check && n_th > 0 && hb_ready(n_th);
+        if (go_fast) {   // (DS4_HANDBACK_FAST: n_th threads, two slots each, the copies asynchronous)
+            std::vector<std::pair<int, int>> hj;
+            hj.reserve(jobs.size());
+            for (const Job& j : jobs) hj.push_back({j.layer, j.e});
+            handback_fast(hj, n_th, bad, dev_bytes, broken);
+        }
+        for (int t = 0; t < (int) n_th && !go_fast; ++t)
             th.emplace_back([&, t] {
                 uint8_t* stage = rf_stage[(size_t) t];
                 std::vector<uint8_t> back;
