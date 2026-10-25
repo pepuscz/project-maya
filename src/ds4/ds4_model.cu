@@ -1039,6 +1039,42 @@ struct Model::Impl {
         return cudaSetDevice(dev) == cudaSuccess && cudaMemcpy(dst, src, n, cudaMemcpyDeviceToHost) == cudaSuccess;
     }
     static bool helper_copy_fail(int, void*, const void*, size_t) { return false; }   // (DS4_FLOW_HELPER_FAIL=copy)
+    // DS4_HELPER_KCOPY=1 (unset: helper_copy, as before): the same copy by a kernel on the helper (copy_bytes) on the
+    // IoQueue thread's own stream there, into staging's device address - the helper reads its own memory and writes
+    // the host's, no copy engine (099: with HSA_ENABLE_SDMA=0 the prompts' read waits fell 34 -> 0.5 s a member at
+    // 130K, but the layer devices' blit kernels cost their compute more; this moves only the helper's side).  A
+    // staging address the device cannot map: helper_copy's way.  The bytes are the same
+    static bool helper_kcopy_on() {
+        static const bool on = std::getenv("DS4_HELPER_KCOPY") != nullptr && std::atoi(std::getenv("DS4_HELPER_KCOPY")) != 0;
+        return on;
+    }
+    static bool helper_copy_k(int dev, void* dst, const void* src, size_t n) {
+        thread_local cudaStream_t st = nullptr;
+        thread_local int st_dev = -1;
+        if (cudaSetDevice(dev) != cudaSuccess) return false;
+        static std::atomic<bool> said{false};   // (a fallback's line, once a process: the runners fail the arm on it)
+        if (st == nullptr || st_dev != dev) {
+            if (cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking) != cudaSuccess) {
+                (void) cudaGetLastError();
+                st = nullptr;
+                if (!said.exchange(true))
+                    std::fprintf(stderr, "ds4: DS4_HELPER_KCOPY: no stream on CUDA%d - its copies on the copy engine, as "
+                                         "before\n", dev);
+                return helper_copy(dev, dst, src, n);
+            }
+            st_dev = dev;
+        }
+        void* d = nullptr;
+        if (cudaHostGetDevicePointer(&d, dst, 0) != cudaSuccess || d == nullptr) {
+            (void) cudaGetLastError();
+            if (!said.exchange(true))
+                std::fprintf(stderr, "ds4: DS4_HELPER_KCOPY: staging has no device address on CUDA%d - its copies on the "
+                                     "copy engine, as before\n", dev);
+            return helper_copy(dev, dst, src, n);
+        }
+        copy_bytes(d, src, n, st);
+        return cudaGetLastError() == cudaSuccess && cudaStreamSynchronize(st) == cudaSuccess;
+    }
     bool spec_win = false;            // the window being run is a draft's verification (layer() keeps backups)
     float* h_taps = nullptr;          // pinned [kWin][targets][dim]: the last window's taps (each block device's seeding
                                       // read it: Dev::ev_seed; the next window's taps wait for every one, wait_seed)
@@ -3282,6 +3318,11 @@ struct Model::Impl {
                 bool all_flow = true;
                 for (const auto& cp : chunks) all_flow = all_flow && (cp == nullptr || cp->ring == nullptr || cp->flow);
                 if (all_flow && std::getenv("DS4_CHUNK_MIN") == nullptr) chunk_min = kFlowChunkMin;
+                if (helper_kcopy_on())   // (DS4_HELPER_KCOPY: its line - helper_copy_k falls back per copy if it must)
+                    std::fprintf(stderr, "%s", flow_helper ? "ds4: DS4_HELPER_KCOPY: the prompt path's flow copies the "
+                                                             "helper pool's experts into staging by a kernel on the helper, "
+                                                             "not its copy engine\n"
+                                                           : "ds4: DS4_HELPER_KCOPY: no DS4_FLOW_HELPER - not used\n");
                 if (down_share()) {   // (DS4_FLOW_DOWN_SHARE: a count a (layer, expert) - the members' flows share it)
                     bool on = tp_uneven && flow_tp;
                     for (const auto& cp : chunks) on = on && (cp == nullptr || cp->ring == nullptr || cp->flow);
@@ -3907,6 +3948,7 @@ struct Model::Impl {
                 j.dmem = it.hsrc + l.lay.trellis[r] + mx_read_off(l, it.mi, r);
                 j.ddev = helper_id;
                 j.dcopy = flow_helper_fail == "copy" && flow_fail_armed.exchange(false) ? &Model::Impl::helper_copy_fail
+                          : helper_kcopy_on()                                         ? &Model::Impl::helper_copy_k
                                                                                        : &Model::Impl::helper_copy;
                 sb += flow_region(r);
                 continue;

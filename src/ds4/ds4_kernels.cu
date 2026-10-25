@@ -2188,6 +2188,16 @@ __global__ void __launch_bounds__(kThreads) ar2_kernel(float* x, int n4, float* 
     }
 }
 
+// copy_bytes: n16 16-byte words, then the n - 16 n16 bytes left, grid-stride (the caller cuts nothing: any n)
+__global__ void __launch_bounds__(kThreads) copy16_kernel(uint4* dst, const uint4* src, size_t n16) {
+    for (size_t q = (size_t) blockIdx.x * blockDim.x + threadIdx.x; q < n16; q += (size_t) gridDim.x * blockDim.x)
+        dst[q] = src[q];
+}
+__global__ void __launch_bounds__(kThreads) copy1_kernel(uint8_t* dst, const uint8_t* src, size_t n) {
+    for (size_t q = (size_t) blockIdx.x * blockDim.x + threadIdx.x; q < n; q += (size_t) gridDim.x * blockDim.x)
+        dst[q] = src[q];
+}
+
 // a thread a (token, value): every stream's value read before any is written
 __global__ void hc_post_inplace_kernel(const float* __restrict__ y, float* h, const float* __restrict__ post,
                                        const float* __restrict__ comb, int dim, int hc) {
@@ -2619,6 +2629,19 @@ void xfer_put(const Xfer& x, unsigned* flag, unsigned seq, unsigned* cnt, cudaSt
     for (int i = 0; i < x.n; ++i) total += x.bytes[i] / 16;
     const int blocks = (int) std::max<size_t>(1, std::min<size_t>(64, (total + kThreads - 1) / kThreads));
     xfer_put_kernel<<<blocks, kThreads, 0, s>>>(x, flag, seq, cnt);
+}
+void copy_bytes(void* dst, const void* src, size_t n, cudaStream_t s) {
+    if (n == 0) return;
+    const bool al = ((uintptr_t) dst % 16) == 0 && ((uintptr_t) src % 16) == 0;
+    const size_t n16 = al ? n / 16 : 0, tail = n - n16 * 16;
+    if (n16 > 0) {
+        const unsigned blocks = (unsigned) std::max<size_t>(1, std::min<size_t>(256, (n16 + kThreads - 1) / kThreads));
+        copy16_kernel<<<blocks, kThreads, 0, s>>>((uint4*) dst, (const uint4*) src, n16);
+    }
+    if (tail > 0) {
+        const unsigned blocks = (unsigned) std::max<size_t>(1, std::min<size_t>(256, (tail + kThreads - 1) / kThreads));
+        copy1_kernel<<<blocks, kThreads, 0, s>>>((uint8_t*) dst + n16 * 16, (const uint8_t*) src + n16 * 16, tail);
+    }
 }
 void xfer_get(const Xfer& x, const unsigned* flag, unsigned seq, cudaStream_t s) {
     size_t total = 0;

@@ -337,6 +337,9 @@ struct Xfer {
     int n = 0;
 };
 void xfer_put(const Xfer& x, unsigned* flag, unsigned seq, unsigned* cnt, cudaStream_t s);
+/// n bytes from src to dst by a kernel on the current device (16 bytes a lane where both are 16-aligned, the rest a
+/// byte a lane) - DS4_HELPER_KCOPY: the helper's pool into pinned staging without the copy engine
+void copy_bytes(void* dst, const void* src, size_t n, cudaStream_t s);
 void xfer_get(const Xfer& x, const unsigned* flag, unsigned seq, cudaStream_t s);
 /// Waits (one thread) until flags[i * stride] >= seq for i < n (a pipelined chunk's readers have taken a buffer);
 /// set_flag: *flag = v after a system fence (a reader's acknowledgement).
