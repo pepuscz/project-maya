@@ -1491,6 +1491,36 @@ struct Model::Impl {
     size_t rf_bytes = 0;
     int64_t lent_experts = 0;
     double lent_ms = 0;
+    // DS4_TP_BORROW_LAZY=1 (with DS4_TP_BORROW): the hand-back off the prompt's critical path. At the prompt's end every
+    // lent expert goes to the CPU lane - as a failed read does: no table names its slot - and keeps its slot (lz_slot);
+    // a few threads read them back into those slots while the decode runs (their own non-blocking streams), and the
+    // decode thread maps each one in at a window's end (lend_tick, from cache_tick: its members' table entries on their
+    // streams, before the next window). A borrowing prompt waits for the rest first (lend_drain). Exactly once: an
+    // expert waiting here is never swapped in by the expert cache nor given a recent slot on the helper, and nothing
+    // else writes its kept slot. Unset: the hand-back as before, inside the prompt
+    const bool lazy_on = std::getenv("DS4_TP_BORROW_LAZY") != nullptr && std::atoi(std::getenv("DS4_TP_BORROW_LAZY")) != 0;
+    struct LzJob {
+        int layer, e, slot;
+    };
+    std::vector<LzJob> lz_jobs;                     // (the decode thread's; the threads read it, never change it)
+    std::unique_ptr<std::atomic<int>[]> lz_state;   // a job's: 0 reading, 1 read back (to map), 2 not (the CPU lane
+                                                    // keeps it), 3 mapped, 4 left to the CPU lane
+    std::vector<std::vector<int>> lz_slot;          // [layer][expert]: the slot it keeps while it waits, else -1
+    std::vector<std::thread> lz_th;
+    std::vector<std::vector<cudaStream_t>> lz_st;   // [thread][device]
+    std::unique_ptr<std::atomic<size_t>[]> lz_dev_bytes;
+    std::atomic<size_t> lz_next{0};
+    std::atomic<int> lz_left{0}, lz_differ{0};
+    std::atomic<bool> lz_stop{false}, lz_broken{false};
+    unsigned long long* lz_tab = nullptr;   // pinned: a job's members' table entries (lend_tick's copies read them)
+    size_t lz_tab_n = 0;
+    int lz_nm = 1;
+    double lz_t0 = 0;
+    size_t lz_bytes = 0;
+    bool lz_wait(const Layer& l, int e) const {
+        return !lz_slot.empty() && (size_t) l.il < lz_slot.size() && !lz_slot[(size_t) l.il].empty() &&
+               lz_slot[(size_t) l.il][(size_t) e] >= 0;
+    }
     // the decode after a long prompt (warm_after): its thread, reading the experts the prompt's last rows picked into
     // the page cache while the first tokens decode; stopped by the next prompt
     std::thread warm_th;
@@ -1664,6 +1694,9 @@ struct Model::Impl {
 
     ~Impl() {
         warm_end();
+        lz_stop.store(true);   // (DS4_TP_BORROW_LAZY: a read back under way ends its expert, the rest stay unread)
+        for (std::thread& t : lz_th)
+            if (t.joinable()) t.join();
         eg_io.stop();   // (its threads write into h_eg)
         for (auto& w : workers) w->stop();
         for (size_t i = 0; i < chunks.size(); ++i)
@@ -7180,6 +7213,7 @@ struct Model::Impl {
     }
 
     void cache_tick(int T) {
+        lend_tick();   // (DS4_TP_BORROW_LAZY: the experts read back since the last window, mapped in first)
         rc_tick(T);   // (DS4_HELPER_RECENT: before the cache, whose queue takes this window's CPU-lane hits)
         if (!o.expert_cache || cache_ths.empty()) return;
         cache_switch();
@@ -7288,7 +7322,7 @@ struct Model::Impl {
             for (int e : hits)   // (never one of the helper's: its picks are its own, in one place - the sync path's
                                  //  hits can name them; nor one a recent fill is bringing to it)
                 if (l.slot[(size_t) e] < 0 && !helper_owned(l, e) && !(l.rc_n > 0 && rc_filling(l, e)) &&
-                    (best < 0 || l.heat[(size_t) e] > l.heat[(size_t) best]))
+                    !lz_wait(l, e) && (best < 0 || l.heat[(size_t) e] > l.heat[(size_t) best]))
                     best = e;
             if (best >= 0 && l.spare_vram >= 0 && !l.swap_pending && sw_inflight < c_inflight) {   // VRAM: the hottest in
                 int cold = -1;
@@ -7310,7 +7344,7 @@ struct Model::Impl {
             int rb = -1;   // RAM: the hottest read from the file, in place of the layer's coldest held (or a free slot)
             for (int e : hits)
                 if (e != vin && l.slot[(size_t) e] < 0 && l.ram[(size_t) e] < 0 && !helper_owned(l, e) &&
-                    (rb < 0 || l.heat[(size_t) e] > l.heat[(size_t) rb]))
+                    !lz_wait(l, e) && (rb < 0 || l.heat[(size_t) e] > l.heat[(size_t) rb]))
                     rb = e;
             if (rb < 0) continue;
             int rc = -1;
@@ -7894,7 +7928,8 @@ struct Model::Impl {
                 ++st.rc_fails;
                 continue;
             }
-            if (l.slot[(size_t) f.e] >= 0 || helper_owned(l, f.e) || f.e == l.sw_in) {   // (VRAM has it now)
+            if (l.slot[(size_t) f.e] >= 0 || helper_owned(l, f.e) || f.e == l.sw_in || lz_wait(l, f.e)) {   // (VRAM has
+                                                                                                    //  it now, or will)
                 ++st.rc_abandoned;
                 continue;
             }
@@ -7928,7 +7963,7 @@ struct Model::Impl {
             std::vector<int> want;
             for (int e = 0; e < l.n_exp; ++e)
                 if (n[(size_t) e] >= rc_need && l.slot[(size_t) e] < 0 && !helper_owned(l, e) && e != l.sw_in &&
-                    !rc_filling(l, e))
+                    !rc_filling(l, e) && !lz_wait(l, e))
                     want.push_back(e);
             std::stable_sort(want.begin(), want.end(), [&](int a, int b) { return n[(size_t) a] > n[(size_t) b]; });
             int made = 0;
@@ -11980,6 +12015,11 @@ struct Model::Impl {
         bool any = false;
         for (const auto& cp : chunks) any = any || (cp != nullptr && cp->borrow);
         if (!any) return true;
+        lend_drain();   // (DS4_TP_BORROW_LAZY: the last prompt's read back done and mapped - the buffers go over its slots)
+        if (lend_broken) {
+            err = kLendBroken;
+            return false;
+        }
         cache_drain();
         bool tp = false;   // (DS4_TP_BORROW: a group's layer keeps the fewest of its members' slots - from all of them)
         for (const auto& cp : chunks) tp = tp || (cp != nullptr && cp->tp_lend);
@@ -12041,11 +12081,242 @@ struct Model::Impl {
         }
         return true;
     }
+    // (DS4_TP_BORROW_LAZY) what a read back behind the decode needs, before any expert moves: the pinned table entries
+    // (n of them a member) and each thread's non-blocking stream a device. false: the hand-back stays inside the prompt
+    bool lz_ready(size_t n, size_t n_th) {
+        int nm = 1;
+        for (const Layer& l : L) nm = std::max(nm, l.nm);
+        if (lz_tab_n < n * (size_t) nm) {   // (pinned, kept: the next runs reuse it)
+            unsigned long long* p = nullptr;
+            if (cudaHostAlloc((void**) &p, n * (size_t) nm * 8, cudaHostAllocPortable) != cudaSuccess) {
+                std::fprintf(stderr, "ds4: the prompt path's room: no pinned table for a read back behind the decode - "
+                                     "handed back inside the prompt (DS4_TP_BORROW_LAZY)\n");
+                return false;
+            }
+            host_allocs.push_back(p);
+            lz_tab = p;
+            lz_tab_n = n * (size_t) nm;
+        }
+        while (lz_st.size() < n_th) {   // (kept: the next runs reuse them)
+            std::vector<cudaStream_t> v(devs.size(), nullptr);
+            for (size_t di = 0; di < devs.size(); ++di)
+                if (cudaSetDevice(devs[di].id) != cudaSuccess ||
+                    cudaStreamCreateWithFlags(&v[di], cudaStreamNonBlocking) != cudaSuccess) {
+                    std::fprintf(stderr, "ds4: the prompt path's room: no stream for a read back behind the decode - "
+                                         "handed back inside the prompt (DS4_TP_BORROW_LAZY)\n");
+                    for (cudaStream_t s : v)
+                        if (s != nullptr) cudaStreamDestroy(s);
+                    return false;
+                }
+            lz_st.push_back(v);
+        }
+        lz_nm = nm;
+        return true;
+    }
+    // (DS4_TP_BORROW_LAZY) the hand-back's first half, at the prompt's end (every device done with its buffers): each
+    // lent expert to the CPU lane - its slot -1, its host the file's, every member's table entry 0, as a failed read
+    // leaves it - its slot kept for it (lz_slot); then n_th threads read them back behind the decode (lz_loop) and the
+    // decode thread maps them in (lend_tick).  false: a table write failed (lend_broken: a table may still name a slot)
+    bool borrow_lazy(std::vector<LzJob> jobs, size_t n_th, double t0) {
+        if (lz_slot.empty()) {
+            lz_slot.resize(L.size());
+            for (const Layer& l : L) lz_slot[(size_t) l.il].assign((size_t) l.n_exp, -1);
+        }
+        std::memset(lz_tab, 0, jobs.size() * (size_t) lz_nm * 8);   // (the zero entries; lend_tick's go over them)
+        bool broken = false;
+        size_t bytes = 0;
+        for (size_t i = 0; i < jobs.size() && !broken; ++i) {
+            const LzJob& j = jobs[i];
+            Layer& l = L[(size_t) j.layer];
+            lz_slot[(size_t) l.il][(size_t) j.e] = j.slot;
+            l.slot[(size_t) j.e] = -1;
+            l.host[(size_t) j.e] = (uint8_t*) mx_mat(l, j.e, 0);
+            --l.n_vram;
+            bytes += l.blob;
+            for (int m = 0; m < l.nm && !broken; ++m) {   // (a group's: every member's table)
+                const Layer& x = member(l, m);
+                const Dev& dm = devs[(size_t) x.dev];
+                broken = cudaSetDevice(dm.id) != cudaSuccess ||
+                         cudaMemcpyAsync(x.vram_tab + j.e, lz_tab + i * (size_t) lz_nm + (size_t) m, 8,
+                                         cudaMemcpyHostToDevice, dm.st) != cudaSuccess;
+            }
+        }
+        for (size_t di = 0; di < devs.size() && !broken; ++di)   // (the entries written before the decode's first window)
+            broken = cudaSetDevice(devs[di].id) != cudaSuccess || cudaStreamSynchronize(devs[di].st) != cudaSuccess;
+        if (broken) {
+            lend_broken = true;
+            std::fprintf(stderr, "ds4: the prompt path's room: a table write failed - the device's state unknown; no "
+                                 "further request runs\n");
+            return false;
+        }
+        std::fprintf(stderr, "ds4: the prompt path's room: %zu experts (%.2f GB) on the CPU lane until read back into "
+                             "VRAM behind the decode (DS4_TP_BORROW_LAZY)\n", jobs.size(), bytes / 1e9);
+        lz_jobs = std::move(jobs);
+        lz_state.reset(new std::atomic<int>[lz_jobs.size()]);
+        for (size_t i = 0; i < lz_jobs.size(); ++i) lz_state[i].store(0);
+        lz_dev_bytes.reset(new std::atomic<size_t>[devs.size()]);
+        for (size_t di = 0; di < devs.size(); ++di) lz_dev_bytes[di].store(0);
+        lz_next.store(0);
+        lz_left.store((int) lz_jobs.size());
+        lz_differ.store(0);
+        lz_stop.store(false);
+        lz_broken.store(false);
+        lz_t0 = t0;
+        lz_bytes = bytes;
+        for (size_t t = 0; t < n_th; ++t) lz_th.emplace_back([this, t] { lz_loop(t); });
+        return true;
+    }
+    // (DS4_TP_BORROW_LAZY) a read-back thread: the next job's expert from the file into its kept slot, each member its
+    // part, on this thread's streams - checked against the file with DS4_CHECK_LEND - then its state for lend_tick.  A
+    // read that fails or a part that differs: the CPU lane keeps it (the file has it); a copy or a read back that
+    // fails: lz_broken (lend_tick makes it lend_broken, sticky).  The last job's thread prints the run's line
+    void lz_loop(size_t t) {
+        static const bool check = std::getenv("DS4_CHECK_LEND") != nullptr;
+        uint8_t* stage = rf_stage[t];
+        uint8_t* half = t < rf_half.size() ? rf_half[t] : nullptr;
+        std::vector<uint8_t> back;
+        while (!lz_stop.load(std::memory_order_relaxed)) {
+            const size_t i = lz_next.fetch_add(1);
+            if (i >= lz_jobs.size()) break;
+            const LzJob& j = lz_jobs[i];
+            const Layer& l = L[(size_t) j.layer];
+            bool ok = l.blob <= rf_bytes && read_mx_file(l, j.e, stage), same = true;
+            const bool read = ok;
+            for (int m = 0; m < l.nm && ok; ++m) {
+                const Layer& x = member(l, m);
+                const uint8_t* src = stage;
+                if (l.nm > 1) {   // (DS4_TP_BORROW) each member its part
+                    blob_to_half(l, stage, m, half);
+                    src = half;
+                }
+                cudaStream_t cs = lz_st[t][(size_t) x.dev];
+                ok = cudaSetDevice(devs[(size_t) x.dev].id) == cudaSuccess &&
+                     cudaMemcpyAsync(sat(l, x, j.slot, unit(x)), src, unit(x), cudaMemcpyHostToDevice, cs) ==
+                         cudaSuccess &&
+                     cudaStreamSynchronize(cs) == cudaSuccess;
+                if (!ok) lz_broken.store(true);   // (a runtime failure, not the file's: the slot's bytes unknown)
+                if (ok) lz_dev_bytes[(size_t) x.dev].fetch_add(unit(x));
+                if (ok && check) {
+                    back.resize(unit(x));
+                    const bool got = cudaMemcpyAsync(back.data(), sat(l, x, j.slot, unit(x)), unit(x),
+                                                     cudaMemcpyDeviceToHost, cs) == cudaSuccess &&
+                                     cudaStreamSynchronize(cs) == cudaSuccess;
+                    if (!got) lz_broken.store(true);   // (the read back failed: a runtime failure)
+                    if (!got || std::memcmp(back.data(), src, unit(x)) != 0) {
+                        lz_differ.fetch_add(1);
+                        same = false;
+                    }
+                }
+            }
+            if (read && ok && same)   // (one copy of it once mapped: in VRAM again)
+                for (int r = 0; r < 3; ++r)
+                    os::advise(pk.fds[(size_t) l.mx_file[r]], l.mx_off[r] + (uint64_t) j.e * l.mx_stride[r],
+                               mx_part_bytes(l, r), false);
+            lz_state[i].store(read && ok && same ? 1 : 2, std::memory_order_release);
+            if (lz_left.fetch_sub(1) == 1) lz_report();
+        }
+    }
+    // (DS4_TP_BORROW_LAZY) the run's line once its last job is done - the synchronous hand-back's, its time from the
+    // prompt's end, and where it ran (the runners parse it)
+    void lz_report() {
+        static const bool check = std::getenv("DS4_CHECK_LEND") != nullptr;
+        size_t n_bad = 0;
+        for (size_t i = 0; i < lz_jobs.size(); ++i) {   // (2, or 4 once the decode thread has seen it)
+            const int s = lz_state[i].load(std::memory_order_acquire);
+            n_bad += s == 2 || s == 4;
+        }
+        std::string per;
+        for (size_t di = 0; di < devs.size(); ++di)
+            if (lz_dev_bytes[di].load() > 0) {
+                char b[64];
+                std::snprintf(b, sizeof b, "%sCUDA%d %.2f GB", per.empty() ? "" : ", ", devs[di].id,
+                              lz_dev_bytes[di].load() / 1e9);
+                per += b;
+            }
+        const int differ = lz_differ.load();
+        std::fprintf(stderr, "ds4: the prompt path's room handed back: %zu experts (%.2f GB from the files; %s of "
+                             "their parts) read into VRAM again in %.0f ms (DS4_TP_BORROW)%s%s; behind the decode "
+                             "(DS4_TP_BORROW_LAZY)\n",
+                     lz_jobs.size(), lz_bytes / 1e9, per.empty() ? "none" : per.c_str(), now_ms() - lz_t0,
+                     n_bad > 0 ? (", " + std::to_string(n_bad) + " of them not (to the CPU lane)").c_str() : "",
+                     check ? (differ == 0 ? "; each part matches the model file"
+                                          : ("; MISMATCH: " + std::to_string(differ) +
+                                             " parts differ - their experts to the CPU lane").c_str())
+                           : "");
+    }
+    // (DS4_TP_BORROW_LAZY; the decode thread, at a window's end - nothing reads the tables until the next window) the
+    // experts read back since: each mapped in as the expert cache's swap in does (its slot, its host none, one GPU's
+    // views; a RAM-tier copy freed), its members' table entries on their streams before the next window; one the CPU
+    // lane keeps: its kept slot released.  Every job done: the threads joined, the run counted
+    void lend_tick() {
+        if (lz_jobs.empty() || lend_broken) return;
+        const bool done = lz_left.load() == 0;   // (first: a job's state and any failure are stored before its count)
+        if (lz_broken.load()) {   // (a copy or a read back failed: nothing more is mapped - sticky)
+            lend_broken = true;
+            std::fprintf(stderr, "ds4: the prompt path's room: a read back behind the decode failed - the device's state "
+                                 "unknown; no further request runs\n");
+            return;
+        }
+        for (size_t i = 0; i < lz_jobs.size(); ++i) {
+            const int st_i = lz_state[i].load(std::memory_order_acquire);
+            if (st_i != 1 && st_i != 2) continue;
+            const LzJob& j = lz_jobs[i];
+            Layer& l = L[(size_t) j.layer];
+            if (st_i == 1) {
+                l.slot[(size_t) j.e] = j.slot;
+                if (l.nm == 1) set_vm(l, j.e, j.slot);
+                l.hh[(size_t) j.e] = {nullptr, nullptr, nullptr, nullptr};
+                l.host[(size_t) j.e] = nullptr;
+                ++l.n_vram;
+                if (!l.ram.empty() && l.ram[(size_t) j.e] >= 0) {   // (in VRAM now: its RAM slot for the next hottest)
+                    ram_free.push_back(l.ram[(size_t) j.e]);
+                    l.ram[(size_t) j.e] = -1;
+                }
+                for (int m = 0; m < l.nm; ++m) {
+                    const Layer& x = member(l, m);
+                    const Dev& dm = devs[(size_t) x.dev];
+                    unsigned long long* ent = lz_tab + i * (size_t) lz_nm + (size_t) m;
+                    *ent = (unsigned long long) sat(l, x, j.slot, unit(x));
+                    if (cudaSetDevice(dm.id) != cudaSuccess ||   // (stream order: before the next window)
+                        cudaMemcpyAsync(x.vram_tab + j.e, ent, 8, cudaMemcpyHostToDevice, dm.st) != cudaSuccess) {
+                        lend_broken = true;
+                        std::fprintf(stderr, "ds4: the prompt path's room: a table write failed - the device's state "
+                                             "unknown; no further request runs\n");
+                        return;
+                    }
+                }
+            }
+            lz_state[i].store(st_i == 1 ? 3 : 4, std::memory_order_relaxed);
+            lz_slot[(size_t) l.il][(size_t) j.e] = -1;
+        }
+        if (done) {   // (every job mapped or left to the CPU lane, none failed)
+            for (std::thread& t : lz_th)
+                if (t.joinable()) t.join();
+            lz_th.clear();
+            lent_experts += (int64_t) lz_jobs.size();
+            lent_ms += now_ms() - lz_t0;
+            lz_jobs.clear();
+        }
+    }
+    // (DS4_TP_BORROW_LAZY) before a prompt borrows again: the read back finished (its threads joined - the buffers go
+    // over the kept slots) and mapped in; a wait (the decode was shorter than the read back) said, it is the prompt's
+    void lend_drain() {
+        if (lz_jobs.empty()) return;
+        const double tw = now_ms();
+        const bool busy = lz_left.load() > 0;
+        for (std::thread& t : lz_th)
+            if (t.joinable()) t.join();
+        if (busy)
+            std::fprintf(stderr, "ds4: the prompt path's room: %.0f ms waited for the last prompt's read back "
+                                 "(DS4_TP_BORROW_LAZY)\n", now_ms() - tw);
+        lend_tick();
+    }
     // after the run (every device done with its buffers): the experts under them read back into their slots, in file
     // order by a few threads - one that cannot be read leaves VRAM for the CPU lane (the decode finds every other one
     // where it was).  false: DS4_CHECK_LEND found a part read back different from the file - those experts went to the
     // CPU lane too (nothing reads those slots), and the caller fails the prompt before any decode - or a device
-    // selection, sync, copy into a slot or table write failed: lend_broken (sticky), no later request runs
+    // selection, sync, copy into a slot or table write failed: lend_broken (sticky), no later request runs.  With
+    // DS4_TP_BORROW_LAZY a group's run reads them back behind the decode instead (borrow_lazy)
     bool borrow_end() {
         if (!lent) return true;
         lent = false;
@@ -12104,6 +12375,12 @@ struct Model::Impl {
             rf_half.push_back(p);
         }
         const size_t n_th = tp ? std::min(rf_stage.size(), rf_half.size()) : rf_stage.size();
+        if (lazy_on && tp && !copy_mode && n_th > 0 && lz_ready(jobs.size(), n_th)) {   // (DS4_TP_BORROW_LAZY)
+            std::vector<LzJob> lz;
+            lz.reserve(jobs.size());
+            for (const Job& j : jobs) lz.push_back({j.layer, j.e, L[(size_t) j.layer].slot[(size_t) j.e]});
+            return borrow_lazy(std::move(lz), n_th, t0);
+        }
         std::vector<std::atomic<size_t>> dev_bytes(devs.size());   // (each device's parts read back)
         for (auto& b : dev_bytes) b.store(0);
         std::atomic<size_t> next{0};
