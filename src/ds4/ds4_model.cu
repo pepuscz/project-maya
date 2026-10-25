@@ -609,6 +609,13 @@ struct Chunk {
     static constexpr int kParts = 4;
     uint8_t* ring = nullptr;
     size_t ring_stride = 0;
+    // (DS4_RING_LEND_MB) a borrowing run's ring in its lent room (borrow_begin: ring_lend / ring_lend_n), swapped in at
+    // the run's start (ring / ring_n kept in ring_base / ring_n_base) and back at the hand-back
+    uint8_t* ring_lend = nullptr;
+    int ring_lend_n = 0;
+    uint8_t* ring_base = nullptr;
+    int ring_n_base = 0;
+    int ring_n_max = 0;   // (the most slots any of its rings has: the events' and the batch bounds' size)
     int ring_n = 0;
     cudaStream_t cs = nullptr;
     cudaEvent_t filled[kParts] = {}, freed[kParts] = {};
@@ -3301,14 +3308,15 @@ struct Model::Impl {
                     cp->io = std::make_unique<IoQueue>(n_readers);
                     cp->stage_item.assign((size_t) cp->S, -1);
                     cp->stage_ev.resize((size_t) cp->S);
-                    cp->ring_fill.resize((size_t) cp->ring_n);
-                    cp->ring_free.resize((size_t) cp->ring_n);
+                    cp->ring_n_max = std::max(cp->ring_n, (int) (ring_lend_bytes(*cp) / std::max<size_t>(1, cp->ring_stride)));
+                    cp->ring_fill.resize((size_t) cp->ring_n_max);
+                    cp->ring_free.resize((size_t) cp->ring_n_max);
                     for (auto* v : {&cp->stage_ev, &cp->ring_fill, &cp->ring_free})
                         for (cudaEvent_t& e : *v) CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
                     // (a region is written again only bc_n batches later - more than a layer's items, so after that
                     // layer's bounds wait, which every copy from it precedes)
                     cp->bc_n = n_exp_max + 2;
-                    cp->bc_w = cp->ring_n + 1;
+                    cp->bc_w = cp->ring_n_max + 1;
                     if (!halloc(cp->bc_pin, (size_t) cp->bc_n * cp->bc_w, err) ||
                         !dalloc(devs[di], cp->bc_dev, (size_t) cp->bc_n * cp->bc_w, err))
                         return false;
@@ -5170,7 +5178,7 @@ struct Model::Impl {
                     step += align256(unit(l));
                     min_slots = std::min(min_slots, std::min(l.n_vram, l.n_exp));
                 }
-            const size_t need = lay_chunk(c, chunk, nullptr, 2) + 256;
+            const size_t need = lay_chunk(c, chunk, nullptr, 2) + 256 + ring_lend_bytes(c);   // (DS4_RING_LEND_MB: + its ring)
             const int k = (int) std::min<size_t>((need + step - 1) / step, (size_t) std::max(0, min_slots - 1));
             const size_t cap = (size_t) k * step;
             if (cap < need) {   // (a device with few VRAM slots a layer: chunks as large as its tail holds)
@@ -5223,8 +5231,9 @@ struct Model::Impl {
                     for (size_t i = 0; i < mems.size(); ++i)
                         if (member(l, m).dev == mems[i]) step[i] += align256(unit(member(l, m)));
             }
-            const auto needs = [&](int C) {
-                for (size_t i = 0; i < mems.size(); ++i) need[i] = lay_chunk(*chunks[(size_t) mems[i]], C, nullptr, 2);
+            const auto needs = [&](int C) {   // (DS4_RING_LEND_MB: each member's buffers and its run's ring)
+                for (size_t i = 0; i < mems.size(); ++i)
+                    need[i] = lay_chunk(*chunks[(size_t) mems[i]], C, nullptr, 2) + ring_lend_bytes(*chunks[(size_t) mems[i]]);
             };
             needs(chunk);
             const int k = tp_tail_k(need, step, min_slots - 1);
@@ -5277,6 +5286,19 @@ struct Model::Impl {
                                      "(DS4_TP_BORROW)\n", d.id, cap / 1e9, k, chunk);
             }
         }
+        if (ring_lend_mb() > 0)   // (DS4_RING_LEND_MB: each lending device's line, or why not)
+            for (size_t di = 0; di < chunks.size() && di < devs.size(); ++di) {
+                if (chunks[di] == nullptr) continue;
+                const Chunk& c = *chunks[di];
+                const size_t b = c.borrow && chunk > 0 ? ring_lend_bytes(c) : 0;
+                if (b > 0)
+                    std::fprintf(stderr, "ds4: DS4_RING_LEND_MB=%zu: CUDA%d's borrowing runs stream through a ring in its "
+                                         "lent room - up to %zu slots (%.2f GB), its tail that much larger; its own ring "
+                                         "%d slots\n", ring_lend_mb(), devs[di].id, b / c.ring_stride, b / 1e9, c.ring_n);
+                else if (c.ring_stride > 0)
+                    std::fprintf(stderr, "ds4: DS4_RING_LEND_MB=%zu: CUDA%d lends no room or its own ring is as large - "
+                                         "not used\n", ring_lend_mb(), devs[di].id);
+            }
         for (Layer& l : L) {
             // the hottest experts of the profile first, then by index
             std::vector<int> order((size_t) l.n_exp);
@@ -11627,6 +11649,12 @@ struct Model::Impl {
             CK(cudaStreamSynchronize(c.cs));
             c.items.clear();
             c.base = c.n_read = c.n_dma = c.n_comp = 0;
+            if (c.ring_lend != nullptr && c.ring_n_base == 0) {   // (DS4_RING_LEND_MB: this borrowing run's ring)
+                c.ring_base = c.ring;
+                c.ring_n_base = c.ring_n;
+                c.ring = c.ring_lend;
+                c.ring_n = c.ring_lend_n;
+            }
             c.n_file = 0;
             std::fill(c.stage_item.begin(), c.stage_item.end(), -1);
             c.fl_layers.clear();
@@ -12201,8 +12229,19 @@ struct Model::Impl {
             Dev& d = devs[di];
             Chunk& c = *chunks[di];
             const size_t need = lay_chunk(c, C, nullptr, 2);
-            const size_t b0 = (d.tail_bytes - need) & ~(size_t) 255;
-            lay_chunk(c, C, d.tail + b0, 2);
+            // (DS4_RING_LEND_MB: its ring below the buffers, as large as the tail's room past them allows - whole kParts
+            //  runs, more slots than its own ring's or none)
+            size_t ext = 0;
+            if (const size_t want = ring_lend_bytes(c); want > 0 && c.flow && d.tail_bytes > need + 512) {
+                const size_t run = c.ring_stride * (size_t) Chunk::kParts;
+                ext = std::min(want, ((d.tail_bytes - need - 512) / run) * run);
+                if (ext / c.ring_stride <= (size_t) c.ring_n) ext = 0;
+            }
+            const size_t bb = (d.tail_bytes - need) & ~(size_t) 255;   // (the buffers at the tail's end, as before)
+            lay_chunk(c, C, d.tail + bb, 2);
+            const size_t b0 = ext > 0 ? (bb - ext) & ~(size_t) 255 : bb;   // (the ring below them: [b0, b0 + ext))
+            c.ring_lend = ext > 0 ? d.tail + b0 : nullptr;
+            c.ring_lend_n = ext > 0 ? (int) (ext / c.ring_stride) : 0;
             c.C = C;
             // (the clear writes over slots still mapped: a failure leaves them unknown - sticky, no later request runs;
             //  a device lent before this one is handed back by the caller's guard)
@@ -12606,8 +12645,26 @@ struct Model::Impl {
     // CPU lane too (nothing reads those slots), and the caller fails the prompt before any decode - or a device
     // selection, sync, copy into a slot or table write failed: lend_broken (sticky), no later request runs.  With
     // DS4_TP_BORROW_LAZY a group's run reads them back behind the decode instead (borrow_lazy)
+    // (DS4_RING_LEND_MB) each device's own ring back, once its run's work is done (the lent one is under the slots the
+    // hand-back fills)
+    void prompt_ring_restore() {
+        for (auto& cp : chunks) {
+            if (cp == nullptr) continue;
+            if (cp->ring_n_base > 0) {
+                cp->ring = cp->ring_base;
+                cp->ring_n = cp->ring_n_base;
+                cp->ring_n_base = 0;
+                cp->ring_base = nullptr;
+            }
+            cp->ring_lend = nullptr;
+            cp->ring_lend_n = 0;
+        }
+    }
     bool borrow_end() {
-        if (!lent) return true;
+        if (!lent) {
+            prompt_ring_restore();
+            return true;
+        }
         lent = false;
         std::atomic<bool> broken{false};   // (a runtime failure: the expert tables can no longer be vouched for)
         std::string why;
@@ -12621,6 +12678,7 @@ struct Model::Impl {
                 why = "CUDA" + std::to_string(devs[di].id) + "'s streams: " + cudaGetErrorString(e);
             }
         }
+        if (!broken) prompt_ring_restore();
         if (broken) {   // (the devices may still use the buffers: nothing is read back over them)
             lend_broken = true;
             std::fprintf(stderr, "ds4: the prompt path's room was not handed back (%s) - the device's state unknown; no "
@@ -12931,6 +12989,23 @@ struct Model::Impl {
             return x == 1 || x == 2 ? x : 0;
         }();
         return v;
+    }
+    // DS4_RING_LEND_MB=<MB> (unset / 0: as before): a borrowing run's prompt ring in its lent room instead of the
+    // device's own (DS4_RING_MB, 400 MB) - the tail sized that much larger at the load (its slots hold experts outside a
+    // prompt, as the rest of the tail), each borrowing run lending that much more and its flow's ring there (contiguous,
+    // ring_lend_n slots), so the early reads and the copies can run up to that far ahead of the compute.  100: the 400 MB
+    // ring held ~0.45 GB of a (chunk, layer)'s ~1.6 GB a member at 130K, so the transfers barely ran under the attention;
+    // a larger own ring (DS4_RING_MB=1600) took host RAM the box lacks (its pinned staging) - this one's staging stays
+    // the own ring's.  The lent experts it adds are streamed in the run and handed back after it, as the rest
+    static size_t ring_lend_mb() {
+        static const size_t v = std::getenv("DS4_RING_LEND_MB") ? (size_t) std::max(0, std::atoi(std::getenv("DS4_RING_LEND_MB"))) : 0;
+        return v;
+    }
+    size_t ring_lend_bytes(const Chunk& c) const {   // (whole kParts runs of the device's ring slots; 0: not used)
+        if (ring_lend_mb() == 0 || c.ring_stride == 0) return 0;
+        const size_t run = c.ring_stride * (size_t) Chunk::kParts;
+        const size_t b = ((ring_lend_mb() << 20) / run) * run;
+        return b / c.ring_stride > (size_t) c.ring_n ? b : 0;
     }
     std::unique_ptr<std::atomic<uint8_t>[]> down_reads;   // (DS4_FLOW_DOWN_SHARE) [layer][expert]: members' reads so far
     size_t down_stride = 0;
