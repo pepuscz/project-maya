@@ -3046,10 +3046,29 @@ struct Model::Impl {
                 if (!hmap(G.arb.pflags, (size_t) G.arb.nm * G.arb.slots * kAr2Blocks * 16, err)) return false;
                 G.arb.ar2 = ar2();
             }
+            // DS4_AR2_DECODE=1 (unset: as before): the decode windows' all-reduces of a group of two (G.ar: the
+            // attention output's and the MoE's, a window's rows) in ar2_kernel too - its exact mode only (1: member 0's
+            // partial plus member 1's, ar_sum_kernel's bits), one launch where xfer_put and ar_sum_kernel were two, the
+            // other's rows read 16 bytes a lane.  Its own progress words: G.arb was copied from G.ar before, so it shares
+            // none of them
+            if (G.ar.nm == 2 && ar2_decode()) {
+                if (!hmap(G.ar.pflags, (size_t) G.ar.nm * G.ar.slots * kAr2Blocks * 16, err)) return false;
+                G.ar.ar2 = 1;
+            }
         }
         if (ar2() < 0) {
             err = "DS4_AR2 takes 0, 1 or 2";
             return false;
+        }
+        if (ar2_decode()) {
+            std::string on;
+            for (const Group& G : groups)
+                if (G.ar.ar2 > 0)
+                    for (int m : G.mem) on += (on.empty() ? "CUDA" : ", CUDA") + std::to_string(devs[(size_t) m].id);
+            std::fprintf(stderr, "%s%s%s\n", on.empty() ? "ds4: DS4_AR2_DECODE: no group of two - not used" :
+                                                       "ds4: DS4_AR2_DECODE: the decode windows' all-reduces on ",
+                         on.c_str(), on.empty() ? "" : " in one launch, the other member's rows read 16 bytes a lane; "
+                                                       "the sums bit for bit");
         }
         if (ar2() > 0) {
             std::string on;
@@ -13075,6 +13094,10 @@ struct Model::Impl {
     }
     std::unique_ptr<std::atomic<uint8_t>[]> down_reads;   // (DS4_FLOW_DOWN_SHARE) [layer][expert]: members' reads so far
     size_t down_stride = 0;
+    static bool ar2_decode() {   // (DS4_AR2_DECODE: see the groups' setup)
+        static const bool on = std::getenv("DS4_AR2_DECODE") != nullptr && std::atoi(std::getenv("DS4_AR2_DECODE")) != 0;
+        return on;
+    }
     // DS4_AR_SLAB=<rows> (a multiple of 64; 0 / unset: off): layer_chunk's attention all-reduce in runs of that many rows
     // on a stream of its own, overlapping the next slabs' attention (a group of two)
     static int ar_slab() {
