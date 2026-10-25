@@ -767,6 +767,8 @@ struct Layer {
     std::vector<int> slot;                      // expert -> VRAM slot or -1
     std::vector<int> ram;                       // expert -> RAM-tier slot or -1 (a GGUF's in-place experts; empty: none)
     std::vector<uint8_t*> host;                 // expert -> host (non-null: on the CPU lane; its halves in hh)
+    std::vector<uint8_t*> lend_pool;            // (DS4_LEND_POOL) expert -> a copy in the helper's pool of an expert a
+                                                // run may lend (the tail's at the load), or null; never in helper_tab
     std::vector<uint8_t*> helper;               // expert -> its blob in the helper GPU's pool (DS4_HELPER), or null:
                                                 //   chosen among those without a VRAM slot, never one after (cache_queue)
     unsigned long long* helper_tab = nullptr;   // the same on the helper GPU (0: not its; null: none of the layer's)
@@ -4061,7 +4063,9 @@ struct Model::Impl {
     // helper's pool (flow_push's own tests, for a layer-major cache hit too)
     bool flow_from_file(const Layer& l, int e) const {
         const bool in_ram = !l.ram.empty() && l.ram[(size_t) e] >= 0;
-        const bool from_helper = !in_ram && flow_helper && helper_owned(l, e) &&
+        const bool lp = lent && !l.lend_pool.empty() && (size_t) e < l.lend_pool.size() && l.slot[(size_t) e] >= l.pv_n &&
+                        l.lend_pool[(size_t) e] != nullptr;
+        const bool from_helper = !in_ram && flow_helper && (helper_owned(l, e) || lp) &&
                                  !helper_dead.load(std::memory_order_relaxed) &&
                                  (l.rc_n == 0 || (size_t) e >= l.rc_slot.size() || l.rc_slot[(size_t) e] < 0);
         return !in_ram && !from_helper;
@@ -4087,10 +4091,13 @@ struct Model::Impl {
         if (in_ram)   // (copied into staging by io, then DMA'd; copy_mode: from its NH parts, flow_pump)
             it.ram = copy_mode ? ram_part[(size_t) l.ram[(size_t) e]][0] : ram_slots[(size_t) l.ram[(size_t) e]];
         // (DS4_FLOW_HELPER) one in the helper's pool: copied into staging out of it by io, then DMA'd as a read's
-        const bool from_helper = !in_ram && flow_helper && helper_owned(l, e) &&
+        // (DS4_LEND_POOL: a lent one out of its copy there)
+        uint8_t* const lp = lent && !l.lend_pool.empty() && (size_t) e < l.lend_pool.size() && l.slot[(size_t) e] >= l.pv_n
+                                ? l.lend_pool[(size_t) e] : nullptr;
+        const bool from_helper = !in_ram && flow_helper && (helper_owned(l, e) || lp != nullptr) &&
                                  !helper_dead.load(std::memory_order_relaxed) &&
-                                 (l.rc_n == 0 || (size_t) e >= l.rc_slot.size() || l.rc_slot[(size_t) e] < 0);
-        if (from_helper) it.hsrc = l.helper[(size_t) e];
+                                 (lp != nullptr || l.rc_n == 0 || (size_t) e >= l.rc_slot.size() || l.rc_slot[(size_t) e] < 0);
+        if (from_helper) it.hsrc = lp != nullptr ? lp : l.helper[(size_t) e];
         bool hit = false;
         if (!in_ram && !from_helper && c.lc != nullptr && l.nm == 1) {   // layer-major: from the layer cache, or kept for the chunks after
             const size_t i = c.base + c.items.size() - 1, stride = (l.blob + 63) & ~(size_t) 63;
@@ -5512,6 +5519,9 @@ struct Model::Impl {
                         ok = cudaMemcpy(sat(l, x, l.slot[(size_t) e], unit(x)), l.nm > 1 ? stage2 : stage,
                                         unit(x), cudaMemcpyHostToDevice) == cudaSuccess;
                     }
+                    if (ok && !jobs[i].help && !l.lend_pool.empty() && l.lend_pool[(size_t) e] != nullptr)   // (DS4_LEND_POOL)
+                        ok = cudaSetDevice(helper_id) == cudaSuccess &&
+                             cudaMemcpy(l.lend_pool[(size_t) e], stage, l.blob, cudaMemcpyHostToDevice) == cudaSuccess;
                     if (!ok) {
                         std::lock_guard<std::mutex> lk(emu);
                         ferr = "loading layer " + std::to_string(l.il) + " expert " + std::to_string(e) + " failed";
@@ -7813,6 +7823,23 @@ struct Model::Impl {
                   " MiB) do not fit DS4_HELPER_GB (" + std::to_string(helper_cap >> 20) + " MiB)";
             return false;
         }
+        // (DS4_LEND_POOL: the tail's experts of each helper layer, a region after the recent slots)
+        size_t lp_bytes = 0;
+        int lp_n = 0;
+        if (lend_pool_on() && flow_helper)
+            for (const Layer& l : L)
+                if (helper_layer(l) && l.n_main < l.n_slots)
+                    for (int e = 0; e < l.n_exp; ++e)
+                        if (l.slot[(size_t) e] >= l.n_main) {
+                            lp_bytes += align256(l.blob);
+                            ++lp_n;
+                        }
+        if (lp_bytes > 0 && rc_bytes + lp_bytes >= helper_cap) {
+            err = "DS4_LEND_POOL: the experts a run may lend (" + std::to_string(lp_bytes >> 20) + " MiB) and the recent "
+                  "slots do not fit DS4_HELPER_GB (" + std::to_string(helper_cap >> 20) + " MiB)";
+            return false;
+        }
+        rc_bytes += lp_bytes;   // (below: the profile's experts fit what the recent slots and this region leave)
         double took = 0, left = 0;
         std::vector<std::pair<const Cand*, size_t>> at;   // (the expert, its offset in the pool)
         for (const Cand& x : c) {
@@ -7834,6 +7861,24 @@ struct Model::Impl {
             ok = !helper_fail("pool") && cudaMalloc((void**) &helper_pool, helper_used) == cudaSuccess;
             if (ok) helper_allocs.push_back(helper_pool);
         }
+        if (ok && lp_bytes > 0) {   // (DS4_LEND_POOL: its region after the profile's and the recent slots')
+            size_t off = helper_used - lp_bytes;
+            for (Layer& l : L) {
+                if (!helper_layer(l) || l.n_main >= l.n_slots) continue;
+                l.lend_pool.assign((size_t) l.n_exp, nullptr);
+                for (int e = 0; e < l.n_exp; ++e)
+                    if (l.slot[(size_t) e] >= l.n_main) {
+                        l.lend_pool[(size_t) e] = helper_pool + off;
+                        off += align256(l.blob);
+                    }
+            }
+            std::fprintf(stderr, "ds4: DS4_LEND_POOL: the %d experts a run may lend (%.1f GB) also in the helper's pool, "
+                                 "beside its own - a borrowing run streams them and the hand-back copies them back from "
+                                 "there\n", lp_n, lp_bytes / 1e9);
+        } else if (lend_pool_on())
+            std::fprintf(stderr, "ds4: DS4_LEND_POOL: %s - not used\n",
+                         flow_helper ? "no layer lends the prompt path its tail" : "no DS4_FLOW_HELPER");
+        rc_bytes -= lp_bytes;
         if (ok && rc_bytes > 0) {   // (the recent slots: after the profile's, each layer's rc_want blobs in a row)
             size_t off = helper_prof;
             for (Layer& l : L) {
@@ -12363,7 +12408,7 @@ struct Model::Impl {
                             used[(size_t) s * nd + di] = 0;
                         }
                     uint8_t* stage = hb_buf[t * per + (size_t) s * (1 + (size_t) hb_nm)];
-                    const bool read = l.blob <= rf_bytes && read_mx_file(l, e, stage);
+                    const bool read = l.blob <= rf_bytes && lent_read(l, e, stage);
                     bad[i] = !read;   // (a read that fails: the CPU lane takes it - the file has it)
                     bool ok = read && !broken.load();
                     for (int m = 0; m < l.nm && ok; ++m) {
@@ -12512,7 +12557,7 @@ struct Model::Impl {
             if (i >= lz_jobs.size()) break;
             const LzJob& j = lz_jobs[i];
             const Layer& l = L[(size_t) j.layer];
-            bool ok = l.blob <= rf_bytes && read_mx_file(l, j.e, stage), same = true;
+            bool ok = l.blob <= rf_bytes && lent_read(l, j.e, stage), same = true;
             const bool read = ok;
             for (int m = 0; m < l.nm && ok; ++m) {
                 const Layer& x = member(l, m);
@@ -12759,7 +12804,7 @@ struct Model::Impl {
                     const int e = jobs[i].e;
                     if (l.nm > 1) {   // (DS4_TP_BORROW) each member its part
                         uint8_t* half = rf_half[(size_t) t];
-                        bool ok = l.blob <= rf_bytes && read_mx_file(l, e, stage), same = true;
+                        bool ok = l.blob <= rf_bytes && lent_read(l, e, stage), same = true;
                         const bool read = ok;   // (a read that fails: the CPU lane takes it - the file has it)
                         for (int m = 0; m < l.nm && ok; ++m) {
                             const Layer& x = member(l, m);
@@ -12787,7 +12832,7 @@ struct Model::Impl {
                                            mx_part_bytes(l, r), false);
                         continue;
                     }
-                    const bool read = l.blob <= rf_bytes && read_mx_file(l, e, stage);
+                    const bool read = l.blob <= rf_bytes && lent_read(l, e, stage);
                     const bool put = read && cudaSetDevice(devs[(size_t) l.dev].id) == cudaSuccess &&
                                      cudaMemcpy(sat(l, l, l.slot[(size_t) e], l.blob), stage, l.blob,
                                                 cudaMemcpyHostToDevice) == cudaSuccess;
@@ -13010,6 +13055,23 @@ struct Model::Impl {
         const size_t run = c.ring_stride * (size_t) Chunk::kParts;
         const size_t b = ((ring_lend_mb() << 20) / run) * run;
         return b / c.ring_stride > (size_t) c.ring_n ? b : 0;
+    }
+    // DS4_LEND_POOL=1 (unset: as before; with DS4_HELPER and DS4_FLOW_HELPER): the experts a borrowing run may lend
+    // (each helper layer's tail slots at the load) kept, besides their VRAM slots, in a region of the helper's pool of
+    // their own (lend_pool - not in helper_tab, so the decode never takes them there): a run streams the lent ones out of
+    // the pool as the pool's own (Item::hsrc) and the hand-back copies them back from it (lent_read) - not from the disk
+    // twice (096-102: the hand-back read ~13.9 GB from the files in 4.5-5.0 s inside each long prompt, ~15 % of a 32K
+    // one by 103).  The pool's own experts give way: DS4_HELPER_GB holds the profile's most-routed of the rest, the
+    // recent slots and this region
+    static bool lend_pool_on() {
+        static const bool on = std::getenv("DS4_LEND_POOL") != nullptr && std::atoi(std::getenv("DS4_LEND_POOL")) != 0;
+        return on;
+    }
+    // a lent expert's whole blob into blob: its lend_pool copy (on the helper) when it has one, else the model's files
+    bool lent_read(const Layer& l, int e, uint8_t* blob) const {
+        if (!l.lend_pool.empty() && (size_t) e < l.lend_pool.size() && l.lend_pool[(size_t) e] != nullptr)
+            return (helper_kcopy_on() ? helper_copy_k : helper_copy)(helper_id, blob, l.lend_pool[(size_t) e], l.blob);
+        return read_mx_file(l, e, blob);
     }
     std::unique_ptr<std::atomic<uint8_t>[]> down_reads;   // (DS4_FLOW_DOWN_SHARE) [layer][expert]: members' reads so far
     size_t down_stride = 0;
