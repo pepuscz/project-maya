@@ -676,6 +676,7 @@ struct Chunk {
     uint64_t n_batch = 0;
     double wait_ms = 0;                      // the compute waiting for a read
     uint64_t it_file = 0, it_ram = 0, it_spec = 0, it_spec_unused = 0;
+    uint64_t it_spec_file = 0;   // (DS4_SPEC_FILE_FIRST: the likely ones queued early that the disk reads)
     // (DS4_FLOW_KEEP_GB) a run's items read through the page cache for the decode: how many, their experts' whole
     // bytes (each member of a group the same experts), the bytes this device's reads of them asked for
     uint64_t keep_n = 0, keep_whole = 0, keep_read = 0;
@@ -3972,6 +3973,15 @@ struct Model::Impl {
             if (member(L0, m).dev == c.dev) return m;
         return 0;
     }
+    // an expert of the layer flow_push would read from the model's files: neither in the RAM tier nor taken out of the
+    // helper's pool (flow_push's own tests, for a layer-major cache hit too)
+    bool flow_from_file(const Layer& l, int e) const {
+        const bool in_ram = !l.ram.empty() && l.ram[(size_t) e] >= 0;
+        const bool from_helper = !in_ram && flow_helper && helper_owned(l, e) &&
+                                 !helper_dead.load(std::memory_order_relaxed) &&
+                                 (l.rc_n == 0 || (size_t) e >= l.rc_slot.size() || l.rc_slot[(size_t) e] < 0);
+        return !in_ram && !from_helper;
+    }
     void flow_push(Chunk& c, const Layer& l, int mi, int k, int e, int v, bool cache = false) {
         c.items.emplace_back();
         Chunk::Item& it = c.items.back();
@@ -4068,6 +4078,17 @@ struct Model::Impl {
         std::stable_sort(cand.begin(), cand.end(), [](const std::pair<double, int>& a, const std::pair<double, int>& b) {
             return a.first > b.first;
         });
+        // DS4_SPEC_FILE_FIRST=1: the likely ones the disk reads (neither the RAM tier's nor the helper pool's) first,
+        // likeliest first among them - the cap below then goes to the disk's reads, which take the time, where the
+        // likeliest-first order spent most of it on the pool's copies, which the links bring in fast once the layer
+        // routed (095's prof load, 130K: 11200 early, the compute still waited 36.4 s a member for reads).  The order
+        // is the layer's virtual slots' and so the experts' sums': not the bits of the order before, the same on every
+        // member (the pool's experts are the group's lead's)
+        static const bool file_first = std::getenv("DS4_SPEC_FILE_FIRST") != nullptr &&
+                                       std::atoi(std::getenv("DS4_SPEC_FILE_FIRST")) != 0;
+        if (file_first)
+            std::stable_partition(cand.begin(), cand.end(),
+                                  [&](const std::pair<double, int>& x) { return flow_from_file(l, x.second); });
         if (cand.size() > (size_t) (c.S + c.ring_n)) cand.resize((size_t) (c.S + c.ring_n));
         std::vector<char> is((size_t) l.n_exp, 0);
         int j = 0;
@@ -4080,6 +4101,8 @@ struct Model::Impl {
         for (const auto& x : cand) flow_push(c, l, mi, k, x.second, vs[x.second]);
         c.n_spec = (int) cand.size();
         c.it_spec += cand.size();
+        if (file_first)
+            for (const auto& x : cand) c.it_spec_file += flow_from_file(l, x.second) ? 1u : 0u;
     }
     // (chunk k, layer il) routed (bounds b by virtual slot): the rest of its picks after its likely ones
     void flow_rest(Chunk& c, int k, int il, const std::vector<int>& b) {
@@ -11507,6 +11530,7 @@ struct Model::Impl {
             c.spec_k = c.spec_il = -1;
             c.wait_ms = 0;
             c.it_file = c.it_ram = c.it_spec = c.it_spec_unused = c.it_lc = c.it_helper = c.chk_n = 0;
+            c.it_spec_file = 0;
             c.keep_n = c.keep_whole = c.keep_read = 0;
             c.lc_il = -1;
             c.lc_used = 0;
@@ -12899,6 +12923,10 @@ struct Model::Impl {
                              (unsigned long long) c.it_file, fb, fb / std::max(1e-3, ms / 1000.0), db, bb,
                              (unsigned long long) c.it_ram, rb, (unsigned long long) c.it_helper, hb, lcs,
                              (unsigned long long) c.it_spec, (unsigned long long) c.it_spec_unused, c.wait_ms);
+                if (std::getenv("DS4_SPEC_FILE_FIRST") != nullptr && std::atoi(std::getenv("DS4_SPEC_FILE_FIRST")) != 0)
+                    std::fprintf(stderr, "ds4: DS4_SPEC_FILE_FIRST, CUDA%d: %llu of the %llu likely ones queued early read "
+                                         "from the files\n",
+                                 devs[di].id, (unsigned long long) c.it_spec_file, (unsigned long long) c.it_spec);
             }
         }
         if (flow_check_now)   // (DS4_FLOW_HELPER_CHECK: each member's line, the run's every pool item compared)
