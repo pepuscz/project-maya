@@ -2801,116 +2801,120 @@ class Service:
         produced, cur, left, smp = [], list(ids), max_new, sampling
         segments = []                                   # each slice's DONE (engine.last), summed at the end
         sent = 0                                        # produced[:sent] went to the caller (the guard holds the rest)
-        while True:
-            last0 = getattr(self.engine, "last", None)
-            smp_call, n_call = guard.sampling(smp, len(produced), left) if guard is not None else (smp, left)
-            gen = self.engine.generate(cur, n_call, smp_call, cancel, embeddings=emb) if emb else \
-                self.engine.generate(cur, n_call, smp_call, cancel)
-            slice_s, t0, cut, pausing = fair_slice_seconds(), None, False, False
-            act, got = None, 0                          # the loop guard's action; this call's tokens
-            try:
-                for t in gen:
-                    if guard is None:
-                        yield t
-                    elif t is None:
-                        yield None
-                    if t is None:
-                        continue
-                    produced.append(t)
-                    if guard is not None:
-                        got += 1
-                        act = guard.push(t, len(produced))
-                        if act is not None:
-                            break                       # (gen.close(): STOP + drain, still holding the FIFO)
-                        while sent < len(produced) - guard.hold:
-                            sent += 1
-                            yield produced[sent - 1]
-                    if t0 is None:
-                        t0 = time.monotonic()
-                    if slice_s > 0 and not pausing and not emb and not self.stopping and len(produced) < max_new \
-                            and self.fifo.waiting() and time.monotonic() - t0 >= slice_s:
-                        if getattr(self.engine, "can_pause", False):
-                            # PAUSE: the engine keeps the state with what it wrote; the tokens it still writes
-                            # before its DONE go to the client as usual, so the next prompt continues that state
-                            self.engine.pause(keep=len(cur) == len(ids))   # its first slice
-                            pausing = True
-                        else:
-                            cut = True
-                            break
-                if pausing:
-                    done = getattr(self.engine, "last", None)
-                    cut = len(produced) < max_new and (done is last0 or (done or {}).get("finish") == "cancel")
-            finally:
-                gen.close()                             # STOP + drain to this slice's DONE, still holding the FIFO
-                fresh = getattr(self.engine, "last", None)
-                if fresh is not None and fresh is not last0:
-                    segments.append(fresh)
-            if act is not None:                         # a loop: what is kept, then on from there - or the end
-                del produced[max(sent, len(produced) - act.drop):]   # (what was sent stays: the hold-back covers it)
-                if act.kind == loop_guard.CLOSE_THINKING:
-                    produced.append(guard.think_end)
-                guard.resume(produced, act)
-                self._loop_noted(act, len(produced))
-                if act.kind == loop_guard.STOP or len(produced) >= max_new or cancel.is_set() or self.stopping:
-                    break
-                cur, left = list(ids) + produced, max_new - len(produced)
-                smp = self._resumed_sampling(sampling, produced)
-                continue
-            if not cut:
-                if guard is not None and n_call < left and got >= n_call and produced[-1] not in self.stop_ids \
-                        and not cancel.is_set() and not self.stopping:
-                    # the guard's penalty ended that call: on with the request's own sampling, still holding the FIFO
+        try:
+            while True:
+                last0 = getattr(self.engine, "last", None)
+                smp_call, n_call = guard.sampling(smp, len(produced), left) if guard is not None else (smp, left)
+                gen = self.engine.generate(cur, n_call, smp_call, cancel, embeddings=emb) if emb else \
+                    self.engine.generate(cur, n_call, smp_call, cancel)
+                slice_s, t0, cut, pausing = fair_slice_seconds(), None, False, False
+                act, got = None, 0                          # the loop guard's action; this call's tokens
+                try:
+                    for t in gen:
+                        if guard is None:
+                            yield t
+                        elif t is None:
+                            yield None
+                        if t is None:
+                            continue
+                        produced.append(t)
+                        if guard is not None:
+                            got += 1
+                            act = guard.push(t, len(produced))
+                            if act is not None:
+                                break                       # (gen.close(): STOP + drain, still holding the FIFO)
+                            while sent < len(produced) - guard.hold:
+                                sent += 1
+                                yield produced[sent - 1]
+                        if t0 is None:
+                            t0 = time.monotonic()
+                        if slice_s > 0 and not pausing and not emb and not self.stopping and len(produced) < max_new \
+                                and self.fifo.waiting() and time.monotonic() - t0 >= slice_s:
+                            if getattr(self.engine, "can_pause", False):
+                                # PAUSE: the engine keeps the state with what it wrote; the tokens it still writes
+                                # before its DONE go to the client as usual, so the next prompt continues that state
+                                self.engine.pause(keep=len(cur) == len(ids))   # its first slice
+                                pausing = True
+                            else:
+                                cut = True
+                                break
+                    if pausing:
+                        done = getattr(self.engine, "last", None)
+                        cut = len(produced) < max_new and (done is last0 or (done or {}).get("finish") == "cancel")
+                finally:
+                    gen.close()                             # STOP + drain to this slice's DONE, still holding the FIFO
+                    fresh = getattr(self.engine, "last", None)
+                    if fresh is not None and fresh is not last0:
+                        segments.append(fresh)
+                if act is not None:                         # a loop: what is kept, then on from there - or the end
+                    del produced[max(sent, len(produced) - act.drop):]   # (what was sent stays: the hold-back covers it)
+                    if act.kind == loop_guard.CLOSE_THINKING:
+                        produced.append(guard.think_end)
+                    guard.resume(produced, act)
+                    self._loop_noted(act, len(produced))
+                    if act.kind == loop_guard.STOP or len(produced) >= max_new or cancel.is_set() or self.stopping:
+                        break
                     cur, left = list(ids) + produced, max_new - len(produced)
                     smp = self._resumed_sampling(sampling, produced)
                     continue
-                break
-            with self.status_lock:
-                mine = dict(self.status)
-                stat.clear()                            # queued again: not decoding, so no part of the live rate
-                self.active -= 1
-                hold[1] = False
-                self.status["busy"] = self.active > 0
-                self.status["queued"] += 1
-            waiting = self.fifo.waiting()
-            place = self.fifo.enqueue(units=1)          # in line before letting go: behind whoever waits now
-            hold[0] = False
-            self.fifo.release(units=1)
-            print(f"[maya] fair slice: {len(produced)} tokens written, the engine goes to the next request "
-                  f"({waiting} waiting); this one continues after it", flush=True)
-            try:
-                while not self.fifo.wait_turn(place, timeout=0.1):
-                    if cancel.is_set() or self.stopping:
-                        return
-                    yield None                          # keeps the client's watchdog calm while queued again
-                hold[0] = True
-            finally:
-                if not hold[0]:                         # the client went away while queued again
-                    self.fifo.leave(place)
+                if not cut:
+                    if guard is not None and n_call < left and got >= n_call and produced[-1] not in self.stop_ids \
+                            and not cancel.is_set() and not self.stopping:
+                        # the guard's penalty ended that call: on with the request's own sampling, still holding the FIFO
+                        cur, left = list(ids) + produced, max_new - len(produced)
+                        smp = self._resumed_sampling(sampling, produced)
+                        continue
+                    break
                 with self.status_lock:
-                    self.status["queued"] -= 1
-            with self.status_lock:
-                self.active += 1
-                hold[1] = True
-                self.status.update({k: mine[k] for k in ("busy", "phase", "prompt_tokens", "started", "tool", "tail",
-                                                         "max_tokens") if k in mine},
-                                   generated=len(produced))
-            if self.stopping or cancel.is_set():
-                break
-            if hasattr(self.engine, "alive") and not self.engine.alive():   # it died in the request in between
-                print("[maya] the engine had stopped; starting it again (a minute or two) ...", flush=True)
-                self.engine.restart()
-            cur, left = list(ids) + produced, max_new - len(produced)
-            smp = self._resumed_sampling(sampling, produced)   # (the thinking budget counts from where it got to)
-        if len(segments) > 1:                           # the request's figures, over all its slices
-            first, last = segments[0], segments[-1]
-            merged = dict(last, prompt_tokens=first.get("prompt_tokens"), reused=first.get("reused"))
-            for k in ("generated", "prompt_ms", "decode_ms", "drafts_accepted", "drafts_offered", "hits", "lookups"):
-                if all(k in sg for sg in segments):
-                    merged[k] = sum(sg[k] for sg in segments)
-            self.engine.last = merged
-        lastd = getattr(self.engine, "last", None)
-        if isinstance(lastd, dict) and (lastd.get("prompt_tokens") or 0) > len(ids):
-            self.engine.last = own_prompt_figures(lastd, len(ids))   # (the first call's DONE was not seen)
+                    mine = dict(self.status)
+                    stat.clear()                            # queued again: not decoding, so no part of the live rate
+                    self.active -= 1
+                    hold[1] = False
+                    self.status["busy"] = self.active > 0
+                    self.status["queued"] += 1
+                waiting = self.fifo.waiting()
+                place = self.fifo.enqueue(units=1)          # in line before letting go: behind whoever waits now
+                hold[0] = False
+                self.fifo.release(units=1)
+                print(f"[maya] fair slice: {len(produced)} tokens written, the engine goes to the next request "
+                      f"({waiting} waiting); this one continues after it", flush=True)
+                try:
+                    while not self.fifo.wait_turn(place, timeout=0.1):
+                        if cancel.is_set() or self.stopping:
+                            return
+                        yield None                          # keeps the client's watchdog calm while queued again
+                    hold[0] = True
+                finally:
+                    if not hold[0]:                         # the client went away while queued again
+                        self.fifo.leave(place)
+                    with self.status_lock:
+                        self.status["queued"] -= 1
+                with self.status_lock:
+                    self.active += 1
+                    hold[1] = True
+                    self.status.update({k: mine[k] for k in ("busy", "phase", "prompt_tokens", "started", "tool", "tail",
+                                                             "max_tokens") if k in mine},
+                                       generated=len(produced))
+                if self.stopping or cancel.is_set():
+                    break
+                if hasattr(self.engine, "alive") and not self.engine.alive():   # it died in the request in between
+                    print("[maya] the engine had stopped; starting it again (a minute or two) ...", flush=True)
+                    self.engine.restart()
+                cur, left = list(ids) + produced, max_new - len(produced)
+                smp = self._resumed_sampling(sampling, produced)   # (the thinking budget counts from where it got to)
+        finally:
+            # A stop token or disconnected client closes this generator before its normal tail.
+            # gen.close() above drains the current DONE first; merge every segment even on that path.
+            if len(segments) > 1:                           # the request's figures, over all its slices
+                first, last = segments[0], segments[-1]
+                merged = dict(last, prompt_tokens=first.get("prompt_tokens"), reused=first.get("reused"))
+                for k in ("generated", "prompt_ms", "decode_ms", "drafts_accepted", "drafts_offered", "hits", "lookups"):
+                    if all(k in sg for sg in segments):
+                        merged[k] = sum(sg[k] for sg in segments)
+                self.engine.last = merged
+            lastd = getattr(self.engine, "last", None)
+            if segments and isinstance(lastd, dict) and (lastd.get("prompt_tokens") or 0) > len(ids):
+                self.engine.last = own_prompt_figures(lastd, len(ids))   # (the first call's DONE was not seen)
         if guard is not None and not cancel.is_set():   # the end: what the guard still held back
             while sent < len(produced):
                 sent += 1
