@@ -657,6 +657,51 @@ class GuardedUsage(unittest.TestCase):
     """After the guard, the engine goes on from prompt + the kept tokens: the request reports its own prompt's
     figures, not that call's (a guarded MiniMax answer said 5,919 cached tokens of a 246-token prompt)."""
 
+    def test_closed_resumed_stream_keeps_initial_prompt_cache(self):
+        class TimedEngine(LoopingEngine):
+            def __init__(self, initial_cache):
+                super().__init__(Tok(), HEAD, BLOCK, escape=ESCAPE)
+                self.initial_cache, self.last = initial_cache, {}
+
+            def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+                first, made = not self.calls, 0
+                try:
+                    for token in super().generate(ids, max_new, sampling, cancel, embeddings):
+                        made += 1
+                        yield token
+                finally:  # the native engine's DONE is parsed while generate.close() drains it
+                    self.last = dict(prompt_tokens=len(ids), reused=self.initial_cache if first else len(self.base),
+                                     generated=made, prompt_ms=100.0, decode_ms=100.0, finish="cancel")
+
+        for cached in (0, 17):
+            with self.subTest(initial_cached=cached):
+                engine = TimedEngine(cached)
+                svc = Service(engine, engine.tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+                stream = svc._sliced([42] * 125, 3000, {"temperature": 0}, threading.Event(), None,
+                                     [True, True], {}, LG.LoopGuard(svc.think_end_id, False))
+                for token in stream:
+                    if len(engine.calls) >= 2:
+                        break  # Service.run does this on a stop token, tool stop, or client disconnect
+                stream.close()
+                self.assertEqual(len(engine.calls), 2)
+                self.assertEqual((engine.last["prompt_tokens"], engine.last["reused"]), (125, cached))
+                self.assertEqual((engine.last["prompt_ms"], engine.last["decode_ms"]), (200.0, 200.0))
+                self.assertGreater(engine.last["generated"], 2)  # includes the first segment too
+
+    def test_error_before_done_does_not_relabel_prior_request(self):
+        class FailedEngine(LoopingEngine):
+            def generate(self, *args, **kwargs):
+                raise ValueError("before any DONE")
+                yield
+        engine = FailedEngine(Tok(), HEAD, BLOCK)
+        prior = dict(prompt_tokens=1000, reused=700)
+        engine.last = prior
+        svc = Service(engine, engine.tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        stream = svc._sliced([42] * 125, 3000, {}, threading.Event(), None, [True, True], {}, None)
+        with self.assertRaises(ValueError):
+            list(stream)
+        self.assertIs(engine.last, prior)
+
     def test_the_request_prompt_not_the_resumed_call(self):
         from serve.server import own_prompt_figures
         got = own_prompt_figures({"prompt_tokens": 246 + 5546, "reused": 5546 + 127, "prompt_ms": 9.5}, 246)
