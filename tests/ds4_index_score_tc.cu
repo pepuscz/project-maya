@@ -30,6 +30,15 @@ int main() {
     const int HD = 128, H = 32, k = 512;
     const size_t RB = kv_row_bytes(kKvFp4p, HD);   // (the cache's rows: codes, scales, padded to 16)
     int fails = 0;
+    int dev = 0;
+    cudaDeviceProp prop{};
+    cudaGetDevice(&dev);
+    cudaGetDeviceProperties(&prop, dev);
+#if defined(STRATA_USE_HIP)
+    std::printf("device %d: %s (%s)\n", dev, prop.name, prop.gcnArchName);
+#else
+    std::printf("device %d: %s (compute capability %d.%d)\n", dev, prop.name, prop.major, prop.minor);
+#endif
     struct Case { int n, T; bool cand, edge = false; };
     std::vector<Case> cases = {Case{1000, 1, false}, Case{65536, 3, false}, Case{131072, 6, false}, Case{20000, 64, false},
                                Case{65536, 3, true}, Case{40000, 16, true}};
