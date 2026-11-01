@@ -970,8 +970,10 @@ __device__ __forceinline__ void rows_at(const Rows& r, int t, int& n, int& k) {
 // RDNA 3 (gfx11, wave32): the same integers through v_wmma_i32_16x16x16_iu8, a block's 32 values two WMMAs; the heads
 // are A (lane m and m + 16 head m's 16 values), the keys B (lane n and n + 16 key n's), so D's element i is head
 // 2i + lane / 16 of key lane % 16 - a warp 16 keys, a lane's 8 heads summed in place and the other 8 a shuffle away.
-// The powers of two as floats (sq: the query blocks', in D's head order; ek: the keys'), their product exact.
-#if defined(STRATA_USE_HIP) && defined(__GFX11__)
+// The powers of two as floats (sq: the query blocks', in D's head order; ek: the keys' - ue8m0_val's, a scale byte 0
+// a zero block), their product exact.
+#if defined(STRATA_USE_HIP) && (defined(__GFX11__) || defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || \
+                                defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__))
 #define DS4_INDEX_WMMA 1
 typedef int ds4_i4 __attribute__((ext_vector_type(4)));
 typedef int ds4_i8 __attribute__((ext_vector_type(8)));
@@ -1020,7 +1022,7 @@ __global__ void __launch_bounds__(256) index_score_tc_kernel(const float* __rest
 #if defined(DS4_INDEX_WMMA)   // (2^(e - 4) at [block][16 heads' tile][head % 2][head % 16 / 2]: D's order)
             const int r = r0 + u;
             if ((lane & 7) == 0)
-                ((float*) eq)[lane / 8 * NQ + (r & ~15) + (r & 1) * 8 + (r & 15) / 2] = __int_as_float((127 + e - 4) << 23);
+                ((float*) eq)[lane / 8 * NQ + (r & ~15) + (r & 1) * 8 + (r & 15) / 2] = ldexpf(1.0f, e - 4);
 #else
             if ((lane & 7) == 0) eq[(r0 + u) * NB + lane / 8] = e - 4;
 #endif
@@ -1078,8 +1080,8 @@ __global__ void __launch_bounds__(256) index_score_tc_kernel(const float* __rest
                 else hi |= byte << (8 * (e - 4));
             }
             *(uint2*) (Ks + j * LD + c) = make_uint2(lo, hi);
-#if defined(DS4_INDEX_WMMA)   // (2^(sb - 128))
-            if ((c & 31) == 0) ek[j * NB + c / 32] = (int) ((sb[u] - 1u) << 23);
+#if defined(DS4_INDEX_WMMA)   // (2^(sb - 128): ue8m0_val(sb) / 2 - 0 for a byte 0, subnormal for 1)
+            if ((c & 31) == 0) ek[j * NB + c / 32] = __float_as_int(sb[u] != 0u ? ldexpf(1.0f, (int) sb[u] - 128) : 0.0f);
 #else
             if ((c & 31) == 0) ek[j * NB + c / 32] = (int) sb[u] - 128;
 #endif
