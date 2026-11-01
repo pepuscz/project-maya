@@ -41,7 +41,7 @@ int main() {
 #endif
     struct Case { int n, T; bool cand, edge = false; };
     std::vector<Case> cases = {Case{1000, 1, false}, Case{65536, 3, false}, Case{131072, 6, false}, Case{20000, 64, false},
-                               Case{65536, 3, true}, Case{40000, 16, true}};
+                               Case{65536, 3, true}, Case{40000, 16, true}, Case{131072, 64, false}};
 #if defined(STRATA_USE_HIP)
     // (edge: a quarter of the key blocks' scale bytes 0 - a zero block, as ue8m0_val reads it - 1 (the cache's for an
     // all-zero block) or 2, beside ordinary blocks in the same rows: RDNA 3's kernel takes the scales as ue8m0_val
