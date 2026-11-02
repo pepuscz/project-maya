@@ -3913,15 +3913,15 @@ void index_score(const float* q, const float* w, const void* k, int heads, int h
             cudaDeviceGetAttribute(&sms[dev & 63], cudaDevAttrMultiProcessorCount, dev);
             opted.fetch_or(1ull << dev);
         }
-#if defined(STRATA_USE_HIP)
-        constexpr int qt_most = 4;   // (RDNA 3: a window of 5 or 6 queries - 10 or 12 head tiles' accumulators a lane - ties
-                                     //  or loses to the CUDA cores' kernel, measured on an RX 7900 XTX; those stay there)
-#else
-        constexpr int qt_most = 6;
-#endif
         // queries a block: 1 with candidates (each its own rows); else a decode window's all (up to 6), a slab's 4
+#if defined(STRATA_USE_HIP)
+        // (RDNA 3: a window of 5 or 6 queries in one block - 10 or 12 head tiles' accumulators a lane - ties or loses to
+        //  the CUDA cores' kernel, measured on an RX 7900 XTX; it goes as two blocks of up to 3 queries instead)
+        const int qt = cand != nullptr ? 1 : T <= 4 ? T : T <= 6 ? 3 : 4;
+#else
         const int qt = cand != nullptr ? 1 : T <= 6 ? T : 4;
-        if ((capable.load(std::memory_order_relaxed) >> dev & 1u) && qt <= qt_most) {   // (else the CUDA cores' kernel below)
+#endif
+        if (capable.load(std::memory_order_relaxed) >> dev & 1u) {   // (else the CUDA cores' kernel below)
             const int qg = (T + qt - 1) / qt, ntiles = (n + 127) / 128;
             const int gx = std::max(1, std::min(ntiles, 2 * sms[dev & 63] / qg));
             const uint8_t* kp = (const uint8_t*) k;

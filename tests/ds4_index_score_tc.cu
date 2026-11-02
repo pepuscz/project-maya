@@ -48,6 +48,10 @@ int main() {
     // does; the sm80 kernel's 2^(ea + eq) assumes normal powers of two)
     cases.push_back(Case{20000, 6, false, true});
     cases.push_back(Case{20000, 1, true, true});
+    // (decode windows of 5 and 6 queries: two blocks of up to 3 there - a 130K prompt's 32768 keys, a 512K one's)
+    cases.push_back(Case{32768, 6, false});
+    cases.push_back(Case{32768, 5, false});
+    cases.push_back(Case{131072, 5, false});
 #endif
     for (Case cs : cases) {
         const int n = cs.n, T = cs.T, blk = 8, nb = (n + blk - 1) / blk;
