@@ -1618,6 +1618,7 @@ struct Model::Impl {
     cudaStream_t hr_st = nullptr;    // (on the helper GPU: the fills' copies)
     cudaEvent_t hr_fill_ev = nullptr, hr_tab_ev = nullptr;   // a fill's copy done; the last 'tables' job's copies done
     uint8_t* hr_stage = nullptr;     // pinned: a fill's blob on its way
+    std::vector<uint8_t> hr_region;  // (an EXL3 layer's fill) the expert's file region, repacked into hr_stage
     size_t hr_host = 0;              // the recent slots' pinned host bytes (the staging, the layers' mirrors)
     std::atomic<bool> hr_busy{false};      // a fill's copy that did not finish: no more fills, the stage and pool kept
     std::atomic<bool> hr_tab_rec{true};    // the last 'tables' job has run (recorded hr_tab_ev); false while queued
@@ -13477,6 +13478,11 @@ struct Model::Impl {
     bool helper_layer(const Layer& l) const {
         return !l.mtp && (l.nm == 1 || tp_uneven) && l.lay.fmt == gg::kFmtMXFP4;
     }
+    // a layer the helper may take experts of (helper_select): a GGUF's helper_layer, or a uniform EXL3 layer
+    // (DS4_HELPER_EXL3) - the layers that get recent slots (DS4_HELPER_RECENT) too
+    bool helper_takes(const Layer& l) const {
+        return pk.gguf ? helper_layer(l) : !l.mtp && l.n_cls == 1 && l.lay.fmt == 0;
+    }
     // any of the helper's state on a Layer (a group's members other than 0 must hold none)
     static bool helper_state(const Layer& x) {
         return !x.helper.empty() || x.helper_tab != nullptr || x.hr_n != 0 || x.hr_base != nullptr ||
@@ -13578,11 +13584,6 @@ struct Model::Impl {
                   std::to_string(hr_win) + ")";
             return false;
         }
-        // Upstream's recent-helper fills read GGUF blobs; EXL3 uses its repacked static pool only.
-        if (!pk.gguf && hr_want > 0) {
-            err = "DS4_HELPER_RECENT: EXL3 helpers currently support the static pool only";
-            return false;
-        }
         helper_id = (int) id;
         helper_cap = (size_t) (gb * 1e9) & ~(size_t) 255;
         return true;
@@ -13673,9 +13674,7 @@ struct Model::Impl {
         };
         std::vector<Cand> c;
         for (const Layer& l : L) {
-            const bool supported = pk.gguf ? helper_layer(l)
-                                            : !l.mtp && l.n_cls == 1 && l.lay.fmt == 0;
-            if (!supported) continue;
+            if (!helper_takes(l)) continue;
             const uint32_t* p = prof.data() + (size_t) l.il * g.n_exp;
             double sum = 0;
             for (int e = 0; e < l.n_exp; ++e) sum += p[e];
@@ -13688,7 +13687,7 @@ struct Model::Impl {
         size_t hr_bytes = 0;
         if (hr_want > 0)
             for (const Layer& l : L)
-                if (helper_layer(l)) hr_bytes += align256(l.blob) * (size_t) hr_want;
+                if (helper_takes(l)) hr_bytes += align256(l.blob) * (size_t) hr_want;
         if (hr_bytes >= helper_cap) {
             err = "DS4_HELPER_RECENT=" + std::to_string(hr_want) + ": its slots (" + std::to_string(hr_bytes >> 20) +
                   " MiB) do not fit DS4_HELPER_GB (" + std::to_string(helper_cap >> 20) + " MiB)";
@@ -13720,7 +13719,7 @@ struct Model::Impl {
         if (ok && hr_bytes > 0) {   // (the recent slots: after the profile's, each layer's hr_want blobs in a row)
             size_t off = helper_prof;
             for (Layer& l : L) {
-                if (!helper_layer(l)) continue;
+                if (!helper_takes(l)) continue;
                 if (l.helper.empty()) l.helper.assign((size_t) l.n_exp, nullptr);
                 l.hr_n = hr_want;
                 l.hr_base = helper_pool + off;
@@ -13841,10 +13840,15 @@ struct Model::Impl {
     // (DS4_HELPER_RECENT, once its pool is in) the fills' stream and events on the helper, the pinned stage (the
     // largest blob of a layer with recent slots), the fill thread
     bool hr_open(std::string& err) {
-        size_t maxb = 0;
+        size_t maxb = 0, maxr = 0;
         for (const Layer& l : L)
-            if (l.hr_n > 0) maxb = std::max(maxb, l.blob);
+            if (l.hr_n > 0) {
+                maxb = std::max(maxb, l.blob);
+                if (l.lay.fmt != gg::kFmtMXFP4)   // (an EXL3 layer's fill: its expert's file region first)
+                    for (uint64_t r : l.region_bytes) maxr = std::max<size_t>(maxr, r);
+            }
         if (maxb == 0) return true;
+        hr_region.resize(maxr);
         int cur = 0;
         cudaGetDevice(&cur);
         void* m = nullptr;
@@ -13866,9 +13870,20 @@ struct Model::Impl {
         return true;
     }
     // the fill thread: each fill's expert read into the pinned stage (read_mx: its file parts, resident - the CPU lane
-    // just used it) and copied into its slot on hr_st; the copy's end waited for by polling hr_fill_ev, bounded
+    // just used it; an EXL3 layer's: its file region repacked to its blob, the static pool's layout - hr_read) and copied
+    // into its slot on hr_st; the copy's end waited for by polling hr_fill_ev, bounded
     // (kHelperWaitMs), on quit too - a copy still under way after the bound: hr_busy (no more fills; the stage and the
     // pool kept at the end, as the helper's own memory is when its stream does not finish)
+    bool hr_read(const Layer& l, int e) {   // (the fill thread's) expert e of l into hr_stage as its blob
+        if (l.lay.fmt == gg::kFmtMXFP4) return read_mx(l, e, hr_stage);
+        if (hr_region.size() < l.region_bytes[(size_t) e]) return false;
+        const bool read = e < (int) l.esplit.size() && l.esplit[(size_t) e]
+                              ? read_split(l, e, hr_region.data())
+                              : pk.read_at(l.region_file[(size_t) e], l.region_off[(size_t) e], l.region_bytes[(size_t) e],
+                                           hr_region.data());
+        if (read) repack(l, e, hr_region.data(), hr_stage);
+        return read;
+    }
     void hr_loop() {
         for (;;) {
             HrFill f;
@@ -13881,7 +13896,7 @@ struct Model::Impl {
             }
             const Layer& l = L[(size_t) f.layer];
             f.ok = false;
-            if (!helper_dead.load(std::memory_order_relaxed) && !hr_busy.load() && read_mx(l, f.e, hr_stage)) {
+            if (!helper_dead.load(std::memory_order_relaxed) && !hr_busy.load() && hr_read(l, f.e)) {
                 int cur = 0;
                 cudaGetDevice(&cur);
                 // (the copy once submitted reads the stage until it ends: its end is waited for by its event - or, if
@@ -13924,8 +13939,10 @@ struct Model::Impl {
         if (hr_want <= 0 || helper_id < 0) return 0;
         uint64_t maxb = 0, mirrors = 0;
         for (const Layer& l : L)
-            if (helper_layer(l)) {
+            if (helper_takes(l)) {
                 maxb = std::max<uint64_t>(maxb, l.blob);
+                if (l.lay.fmt != gg::kFmtMXFP4)   // (an EXL3 layer's fill: its file region too - hr_region)
+                    for (uint64_t r : l.region_bytes) maxb = std::max<uint64_t>(maxb, r);
                 mirrors += (uint64_t) l.n_exp * 8;
             }
         return maxb + mirrors;
