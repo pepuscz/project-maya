@@ -937,7 +937,9 @@ void test_mv_n(int k, int n, int k2, int cb, bool q8, int ncol) {
 // moe_gate_up + moe_down: the same bits.  T tokens, k plan entries each over a few experts (shared ones, a skipped
 // entry, a token whose CPU-lane flag is off)
 // mixed: a mixed-precision layer instead - each expert its own class, its gate / up / down at K 1-4 by expert and part
-void test_win(int k2, int cb, int T, int kd = 0, bool mixed = false) {
+// um (a uniform layer as a mixed one of one class, EXL3_UNIFORM_MIX's dispatch): 1 the window path as that, 2 the
+// token path as that - each against the other path's one-layout kernels, bit for bit
+void test_win(int k2, int cb, int T, int kd = 0, bool mixed = false, int um = 0) {
     if (kd <= 0) kd = k2;
     const int E = 512, F = 384, k = 4, NX = 5;
     const float limit = 1.5f;
@@ -970,6 +972,11 @@ void test_win(int k2, int cb, int T, int kd = 0, bool mixed = false) {
             mix.hi[e] = mix.lo[e] + b.size();
         }
     }
+    ex::MixedLayouts one;   // (um: every expert one class - the uniform layout - whatever its address)
+    one.n = 1;
+    one.lay[0] = lay;
+    one.lo[0] = 0ull;
+    one.hi[0] = ~0ull;
     // plans [T][8]: entry i of token t on expert (t + 2 i) % NX, entry 1 of every third token skipped
     std::vector<unsigned long long> plan((size_t) T * 8, 0ull);
     std::vector<float> pw((size_t) T * 8, 0.0f);
@@ -1023,7 +1030,7 @@ void test_win(int k2, int cb, int T, int kd = 0, bool mixed = false) {
         a.cpu_part = d_cpu + (size_t) t * E;
         a.cpu_flag = d_flag + t;
         a.lay = lay;
-        a.mix = mix;
+        a.mix = um == 2 ? one : mix;
         a.k = k;
         a.n_embd = E;
         a.n_ff = F;
@@ -1048,7 +1055,7 @@ void test_win(int k2, int cb, int T, int kd = 0, bool mixed = false) {
     w.out = d_on;
     w.out_stride = E;
     w.lay = lay;
-    w.mix = mix;
+    w.mix = um == 1 ? one : mix;
     w.T = T;
     w.k = k;
     w.n_embd = E;
@@ -1061,7 +1068,7 @@ void test_win(int k2, int cb, int T, int kd = 0, bool mixed = false) {
     for (size_t i = 0; i < a.size(); ++i) diff += std::memcmp(&a[i], &b[i], sizeof(float)) != 0;
     const std::string what = (mixed ? std::string("win mixed K1-4") : "win K" + kname3(k2, kd)) + " cb" +
                              std::to_string(cb) + " " + std::to_string(T) + " tokens, " + std::to_string(gp.size()) +
-                             " experts";
+                             " experts" + (um == 1 ? " (win as 1 class)" : um == 2 ? " (token as 1 class)" : "");
     std::printf("  %-44s %zu of %zu differ from the token path  %s\n", what.c_str(), diff, a.size(),
                 diff == 0 ? "ok" : "FAIL");
     if (diff != 0) ++g_fail;
@@ -2023,6 +2030,8 @@ int main(int argc, char** argv) {
     test_set(5, 2, 8);
     for (int cb : {0, 2}) test_mixed(cb);   // (a mixed-precision layer)
     for (int T : {2, 7, 16}) test_win(4, 2, T, 0, true);   // (a mixed layer's window: the token path's bits too)
+    for (int k2 : {2, 4, 6, 8})   // (EXL3_UNIFORM_MIX: a uniform layer as one class - the one-layout kernels' bits)
+        for (int um : {1, 2}) test_win(k2, 2, 7, 0, false, um);
     test_win(4, 0, 7, 0, true);
     if (cpu_lane) {
         for (int k2 : {3, 5, 7}) test_cpu(512, 256, k2);

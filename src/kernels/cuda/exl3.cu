@@ -2863,6 +2863,29 @@ bool mixed_supported(const ExpertLayout& lay) {
         if (lay.k2[r] != 2 && lay.k2[r] != 4 && lay.k2[r] != 6 && lay.k2[r] != 8) return false;
     return true;
 }
+// EXL3_UNIFORM_MIX=1 (HIP, opt-in): a uniform layer's decode kernels (moe_gate_up / moe_down / win_experts) run as a
+// mixed layer of one class - the mixed kernels' own copy of block_gemv (kTag 1), the same arithmetic, which AMD
+// compiles faster: one decode token's 6 experts at DeepSeek-V4.1's geometry and K2 4, exl3_test --bench, 0.258 -> 0.194
+// ms on an RX 7900 XTX, 0.470 -> 0.380 on a Radeon 8060S.  K 1-4 (K2 2, 4, 6, 8) only, as the mixed kernels take
+static bool uniform_as_mix(const ExpertLayout& lay, MixedLayouts& m) {
+#if defined(STRATA_USE_HIP)
+    static const bool on = [] {
+        const char* v = std::getenv("EXL3_UNIFORM_MIX");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    if (!on || !mixed_supported(lay)) return false;
+    m = MixedLayouts{};
+    m.n = 1;
+    m.lay[0] = lay;
+    m.lo[0] = 0ull;
+    m.hi[0] = ~0ull;
+    return true;
+#else
+    (void) lay;
+    (void) m;
+    return false;
+#endif
+}
 static bool mixed_ok(const MixedLayouts& mx, const char* what) {
     bool ok = mx.n >= 1 && mx.n <= kMaxClasses;
     for (int c = 0; ok && c < mx.n; ++c) ok = mixed_supported(mx.lay[c]) && mx.lay[c].cb == mx.lay[0].cb;
@@ -2874,6 +2897,10 @@ static bool mixed_ok(const MixedLayouts& mx, const char* what) {
 }
 
 void moe_gate_up(const MoeArgs& a, const float* x, float* h, cudaStream_t s) {
+    if (a.mix.n == 0) {   // (EXL3_UNIFORM_MIX)
+        MoeArgs b = a;
+        if (uniform_as_mix(a.lay, b.mix)) return moe_gate_up(b, x, h, s);
+    }
     if (a.mix.n > 0) {   // (a mixed layer: the same arithmetic on every GPU, no legacy kernels)
         KMoe m;
         if (!mixed_ok(a.mix, "moe_gate_up") || !moe_args(a, m, s)) return;
@@ -2902,6 +2929,10 @@ void moe_gate_up(const MoeArgs& a, const float* x, float* h, cudaStream_t s) {
 }
 
 void moe_down(const MoeArgs& a, const float* h, const float* sh_out, float* out, cudaStream_t s) {
+    if (a.mix.n == 0) {   // (EXL3_UNIFORM_MIX)
+        MoeArgs b = a;
+        if (uniform_as_mix(a.lay, b.mix)) return moe_down(b, h, sh_out, out, s);
+    }
     if (a.mix.n > 0) {
         KMoe m;
         if (!mixed_ok(a.mix, "moe_down") || !moe_args(a, m, s)) return;
@@ -2928,6 +2959,10 @@ void moe_down(const MoeArgs& a, const float* h, const float* sh_out, float* out,
 }
 
 bool win_experts(const WinArgs& a, cudaStream_t s) {
+    if (a.mix.n == 0) {   // (EXL3_UNIFORM_MIX)
+        WinArgs b = a;
+        if (uniform_as_mix(a.lay, b.mix)) return win_experts(b, s);
+    }
     if (a.mix.n == 0) EXL3_LEGACY_MOE(a, win_experts(a, s));
     if (a.mix.n > 0 && !mixed_ok(a.mix, "win_experts")) return false;
     if (a.T < 1 || a.k < 1 || a.k > 8 || a.n_embd % kCols != 0 || a.n_ff % kCols != 0 || a.n_embd > kMaxMoeK ||

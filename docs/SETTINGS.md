@@ -1294,6 +1294,7 @@ these kernel switches do not use the `MAYA_*` alias convention.
 | `EXL3_WMMA_GFX12` | off | `1`: allow RDNA4 matrix instructions; unset or `0`: portable grouped EXL3 prefill on gfx12 |
 | `EXL3_WMMA_ROWS` | `16` | `16` or `32`: routed rows processed per block |
 | `EXL3_WMMA` | enabled where supported | `0`: disable matrix prefill, overriding the gfx12 setting; `1`: allow it |
+| `EXL3_UNIFORM_MIX` | off | AMD: `1` runs a uniform EXL3 layer's decode kernels (a token's experts, a verify window's) as a mixed layer of one class - the same arithmetic and bits (exl3_test checks them against the one-layout kernels), a copy of the GEMV that AMD compiles faster: a decode token's 6 experts at DeepSeek-V4.1's K2 4, `exl3_test --bench`, 0.258 -> 0.194 ms on an RX 7900 XTX, 0.470 -> 0.380 on a Radeon 8060S. K 1-4 only (K2 2, 4, 6, 8); other layers as before |
 
 Restart after changing these settings. Decode/verification kernels retain
 their existing arithmetic, but prefill rounding can change subsequent routing
