@@ -1326,8 +1326,8 @@ lead's requests take them and each pick's sum joins the lead's CPU part once, be
 
 Uniform EXL3 layers can also use the helper, including layers sharded across a target TP group. Enable
 `MAYA_DS4_HELPER_EXL3=1` explicitly; the helper stores complete experts and executes their contributions while
-the CPU handles the remaining misses. Mixed-format EXL3 layers are not selected. EXL3 does not support nonzero `MAYA_DS4_HELPER_RECENT`;
-its static helper pool remains available. CPU backing remains available
+the CPU handles the remaining misses. Mixed-format EXL3 layers are not selected. `MAYA_DS4_HELPER_RECENT` works for EXL3 layers too: a fill reads the
+expert's file region and repacks it to the static pool's layout. CPU backing remains available
 for fallback, and CPU versus GPU floating-point arithmetic can change model outputs.
 
 | Setting | Default | |
