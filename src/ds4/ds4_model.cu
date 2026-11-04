@@ -6100,11 +6100,17 @@ struct Model::Impl {
                     err = "streaming layer " + std::to_string(l0.il) + " expert " + std::to_string(e) + " out of the pool failed";
                     return false;
                 }
-                if (flow_check_now) {   // (DS4_FLOW_HELPER_CHECK: the slot as copied, read back, against the files)
-                    std::vector<uint8_t> got(unit(member(l0, mi)));
-                    if (cudaStreamSynchronize(c.cs) != cudaSuccess ||
-                        cudaMemcpy(got.data(), dst, got.size(), cudaMemcpyDeviceToHost) != cudaSuccess ||
-                        !pool_same(l0, mi, e, got.data())) {
+                if (flow_check_now) {   // (DS4_FLOW_HELPER_CHECK: the slot as copied, read back, against the files - into
+                                        //  pinned memory: a pageable read can come back short, see DS4_HELPER_CHECK)
+                    thread_local uint8_t* got = nullptr;
+                    thread_local size_t got_n = 0;
+                    const size_t n = unit(member(l0, mi));
+                    if (got_n < n) {
+                        if (got != nullptr) cudaFreeHost(got);
+                        got_n = cudaHostAlloc((void**) &got, n, cudaHostAllocPortable) == cudaSuccess ? n : 0;
+                    }
+                    if (got_n < n || cudaStreamSynchronize(c.cs) != cudaSuccess ||
+                        cudaMemcpy(got, dst, n, cudaMemcpyDeviceToHost) != cudaSuccess || !pool_same(l0, mi, e, got)) {
                         err = "DS4_FLOW_HELPER_CHECK: layer " + std::to_string(l0.il) + " expert " + std::to_string(e) +
                               " copied out of the host pool differs from the model's files";
                         return false;
@@ -9152,13 +9158,15 @@ struct Model::Impl {
                             failed.store(true); break;
                         }
                         if (ds4_env("DS4_HELPER_CHECK") != nullptr) {
-                            // each upload read back: a mismatch is read once more (the memory, or only that read?),
-                            // its first bytes logged, and the blob uploaded again - at most three times before the
-                            // load fails (175: one load in ~15 had a run of 4 KB pages wrong, SDMA on or off)
-                            std::vector<uint8_t> got(l.blob);
+                            // each upload read back into the thread's pinned stage2 (not before the slot copies below):
+                            // a read into pageable memory from twelve threads at once came back with a 28-128 KiB run
+                            // never written (171c: zeros, the same read again right - HIP stages pageable copies);
+                            // a mismatch is read once more, its first bytes logged, and the blob uploaded again - at
+                            // most three times before the load fails
+                            uint8_t* got = stage2;
                             std::string why;
                             for (int attempt = 0;; ++attempt) {
-                                const cudaError_t ce = cudaMemcpy(got.data(), l.helper[(size_t) e], l.blob,
+                                const cudaError_t ce = cudaMemcpy(got, l.helper[(size_t) e], l.blob,
                                                                   pool_kind(cudaMemcpyDeviceToHost));
                                 size_t bad = 0, first = 0;
                                 if (ce == cudaSuccess)
@@ -9174,17 +9182,18 @@ struct Model::Impl {
                                                         : std::to_string(bad) + " of " + std::to_string(l.blob) +
                                                               " bytes differ, the first at " + std::to_string(first);
                                 if (ce == cudaSuccess) {   // (read again: the same bytes wrong = the memory)
-                                    std::vector<uint8_t> again(l.blob);
+                                    std::vector<uint8_t> was(got + (first & ~(size_t) 15),
+                                                             got + std::min(l.blob, (first & ~(size_t) 15) + 16));
                                     size_t bad2 = 0;
-                                    if (cudaMemcpy(again.data(), l.helper[(size_t) e], l.blob,
-                                                   pool_kind(cudaMemcpyDeviceToHost)) == cudaSuccess)
-                                        for (size_t k = 0; k < l.blob; ++k) bad2 += again[k] != stage[k];
+                                    if (cudaMemcpy(got, l.helper[(size_t) e], l.blob, pool_kind(cudaMemcpyDeviceToHost)) ==
+                                        cudaSuccess)
+                                        for (size_t k = 0; k < l.blob; ++k) bad2 += got[k] != stage[k];
                                     else bad2 = SIZE_MAX;
                                     char hx[200];
                                     const size_t a = first & ~(size_t) 15;
                                     int o = std::snprintf(hx, sizeof hx, " at %zu got", a);
-                                    for (size_t k = a; k < a + 16 && k < l.blob; ++k)
-                                        o += std::snprintf(hx + o, sizeof hx - o, " %02x", got[k]);
+                                    for (size_t k = 0; k < was.size(); ++k)
+                                        o += std::snprintf(hx + o, sizeof hx - o, " %02x", was[k]);
                                     o += std::snprintf(hx + o, sizeof hx - o, " want");
                                     for (size_t k = a; k < a + 16 && k < l.blob; ++k)
                                         o += std::snprintf(hx + o, sizeof hx - o, " %02x", stage[k]);
@@ -9198,7 +9207,7 @@ struct Model::Impl {
                                         cudaSuccess)
                                     break;
                             }
-                            if (!why.empty() && std::memcmp(got.data(), stage, l.blob) != 0) {
+                            if (!why.empty() && std::memcmp(got, stage, l.blob) != 0) {
                                 std::lock_guard<std::mutex> lk(emu);
                                 ferr = "helper expert byte check failed: layer " + std::to_string(l.il) + " expert " +
                                        std::to_string(e) + ": " + why;
