@@ -113,7 +113,7 @@ template <int cb, int kTag = 0>
 __device__ __forceinline__ __half2 decode2h(uint32_t s0, uint32_t s1) {
     if constexpr (cb == 2) {
 #if defined(STRATA_USE_HIP)
-        const uint32_t x0 = kTag == 2 ? mul1_native(s0) : s0 * 0x83DCD12Du;
+        const uint32_t x0 = kTag == 2 ? mul1_native(s0) : s0 * 0x83DCD12Du;   // (block_gemv's kTag 2 and 3)
         const uint32_t x1 = kTag == 2 ? mul1_native(s1) : s1 * 0x83DCD12Du;
 #else
         const uint32_t x0 = s0 * 0x83DCD12Du, x1 = s1 * 0x83DCD12Du;
@@ -261,19 +261,52 @@ __device__ __forceinline__ void decode8(const uint32_t* w, int lane, float* v) {
 }
 
 // ---------------------------------------------------------------- the rotation
+#if defined(STRATA_USE_HIP) && (defined(__GFX10__) || defined(__GFX11__) || defined(__GFX12__))
+#define EXL3_DPP 1
+// lane ^ m's value (wave32) in AMD's own cross-lane moves, for EXL3_WIN_V2=2 (kTag 3): DPP row_xmask within a row of
+// 16 lanes, v_permlanex16 across the two rows - where __shfl_xor_sync is an LDS ds_bpermute round trip
+template <int m>
+__device__ __forceinline__ float lane_xor(float v) {
+    const int i = __float_as_int(v);
+    if constexpr (m < 16) return __int_as_float(__builtin_amdgcn_update_dpp(0, i, 0x160 | m, 0xf, 0xf, false));
+    else return __int_as_float((int) __builtin_amdgcn_permlanex16((unsigned) i, (unsigned) i, 0x76543210u, 0xfedcba98u,
+                                                                  false, false));
+}
+template <int m>
+__device__ __forceinline__ void had_step(float* v, int lane) {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const float o = lane_xor<m>(v[i]);
+        v[i] = (lane & m) ? o - v[i] : v[i] + o;
+    }
+}
+#endif
+
 // the 128-point transform of the 128 values a warp holds 4 per lane (value lane * 4 + i), over sqrt(128)
+template <int kTag = 0>
 __device__ __forceinline__ void had128(float* v, int lane) {
     const float s0 = v[0] + v[1], d0 = v[0] - v[1], s1 = v[2] + v[3], d1 = v[2] - v[3];
     v[0] = s0 + s1;
     v[1] = d0 + d1;
     v[2] = s0 - s1;
     v[3] = d0 - d1;
+#if defined(EXL3_DPP)
+    if constexpr (kTag == 3) {
+        had_step<1>(v, lane);
+        had_step<2>(v, lane);
+        had_step<4>(v, lane);
+        had_step<8>(v, lane);
+        had_step<16>(v, lane);
+    } else
+#endif
+    {
 #pragma unroll
-    for (int m = 1; m < 32; m <<= 1) {
+        for (int m = 1; m < 32; m <<= 1) {
 #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            const float o = __shfl_xor_sync(0xffffffffu, v[i], m);
-            v[i] = (lane & m) ? o - v[i] : v[i] + o;
+            for (int i = 0; i < 4; ++i) {
+                const float o = __shfl_xor_sync(0xffffffffu, v[i], m);
+                v[i] = (lane & m) ? o - v[i] : v[i] + o;
+            }
         }
     }
 #pragma unroll
@@ -315,10 +348,11 @@ __device__ __forceinline__ void chunk_load(const XinHalf& x, const uint16_t* suh
     }
 }
 // ... and H(x * suh) of the chunk, FP16, into dst[0..127]
+template <int kTag = 0>
 __device__ __forceinline__ void chunk_store(float (&v)[4], const float (&s)[4], int lane, __half* dst) {
 #pragma unroll
     for (int i = 0; i < 4; ++i) v[i] *= s[i];
-    had128(v, lane);
+    had128<kTag>(v, lane);
     __half2* d = reinterpret_cast<__half2*>(dst + lane * 4);
     d[0] = __floats2half2_rn(v[0], v[1]);
     d[1] = __floats2half2_rn(v[2], v[3]);
@@ -472,8 +506,14 @@ __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int
     const int nq = (k1 - k0) / kCols;
     uint32_t wc[8][R], wn[8][R];
     float xv[4], xs4[4];
+    // kTag 3 (EXL3_WIN_V2=2): chunk 0 rotated before the loop, chunk q + 1 after chunk q's decode - into the buffer the
+    // other warps finished reading before this chunk's barrier - so no warp waits at the barrier on the rotation
+    constexpr bool kAhead = kTag == 3;
+    constexpr int kRot = kTag == 3 ? 3 : 0;
     load_tiles<K2>(tile, sstride, lane, wc);
     if (rot) chunk_load(x, suh, k0, lane, xv, xs4);
+    if constexpr (kAhead)
+        if (rot) chunk_store<kRot>(xv, xs4, lane, sm.xb + warp * kCols);
 #if defined(EXL3_TC)
     float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 #else
@@ -483,7 +523,8 @@ __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int
 #endif
     for (int q = 0; q < nq; ++q) {
         __half* xq = sm.xb + (q & 1) * (Tokens * kCols);
-        if (rot) chunk_store(xv, xs4, lane, xq + warp * kCols);
+        if constexpr (!kAhead)
+            if (rot) chunk_store<kRot>(xv, xs4, lane, xq + warp * kCols);
         __syncthreads();
         if (q + 1 < nq) {
             load_tiles<K2>(tile + (size_t) (q + 1) * 8 * sstride, sstride, lane, wn);
@@ -492,7 +533,7 @@ __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int
 #pragma unroll
         for (int s = 0; s < 8; ++s) {
             uint32_t f[4];
-            slice_frags<K2, cb, kTag == 2 ? 2 : 0>(wc[s], st, lane, f);
+            slice_frags<K2, cb, kTag >= 2 ? 2 : 0>(wc[s], st, lane, f);
 #if defined(EXL3_TC)
             uint32_t b0 = 0u, b1 = 0u;
             if (g < nc) {
@@ -540,6 +581,9 @@ __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int
                 }
 #endif
         }
+        if constexpr (kAhead)
+            if (rot && q + 1 < nq)
+                chunk_store<kRot>(xv, xs4, lane, sm.xb + ((q + 1) & 1) * (Tokens * kCols) + warp * kCols);
 #pragma unroll
         for (int s = 0; s < 8; ++s)
 #pragma unroll
@@ -563,6 +607,13 @@ __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int
         if (cc < nc) {
 #pragma unroll
             for (int h = 0; h < 2; ++h) {
+#if defined(EXL3_DPP)
+                if constexpr (kTag == 3) {
+                    acc[cc][h] += lane_xor<1>(acc[cc][h]);
+                    acc[cc][h] += lane_xor<2>(acc[cc][h]);
+                    continue;
+                }
+#endif
                 acc[cc][h] += __shfl_xor_sync(0xffffffffu, acc[cc][h], 1);
                 acc[cc][h] += __shfl_xor_sync(0xffffffffu, acc[cc][h], 2);
             }
@@ -740,12 +791,13 @@ struct KMoe {
 
 // the pieces the token's experts (moe_*_kernel) and a window's grouped experts (win_*_kernel) share, so each window
 // token gets the token path's bits: one warp's output block of 128 (H, then svh) ...
+template <int kTag = 0>
 __device__ __forceinline__ void block_out(const float* red, const uint16_t* svh, float* dst) {
     const int lane = threadIdx.x & 31;
     float v[4];
 #pragma unroll
     for (int i = 0; i < 4; ++i) v[i] = red[lane * 4 + i];
-    had128(v, lane);
+    had128<kTag>(v, lane);
 #pragma unroll
     for (int i = 0; i < 4; ++i) dst[lane * 4 + i] = __fmul_rn(v[i], h2f(svh[lane * 4 + i]));
 }
@@ -925,16 +977,18 @@ struct KWin {
 #endif
 };
 
-// the window kernels' block_gemv.  kTag 2 (EXL3_WIN_V2, HIP): its own copy, inlined into the kernel - called as a
+// the window kernels' block_gemv.  kTag 2 (EXL3_WIN_V2=1, HIP): its own copy, inlined into the kernel - called as a
 // function, as the compiler leaves it, its arguments arrive in vector registers, so the block's entry count nc reads as
 // per-lane and every token's `cc < nc` becomes a branch on the lane mask (162: 159 branches in the decode loop) - and
-// mul1's multiply in v_mul_u32_u24 / v_mad_u32_u24 (mul1_native).  The same arithmetic, the same bits.
+// mul1's multiply in v_mul_u32_u24 / v_mad_u32_u24 (mul1_native).  kTag 3 (EXL3_WIN_V2=2): also the rotations' and
+// the reductions' cross-lane steps in DPP / v_permlanex16 (lane_xor), and each chunk rotated after the previous one's
+// decode (block_gemv's kAhead).  The same arithmetic, the same bits.
 template <int K2, int cb, int kTag>
 __device__ __forceinline__ void win_gemv(const uint32_t* tr, int ld, int tc0, int k0, int k1, const Xin& x,
                                          const uint16_t* suh, int nc, BlockSmem<K2>& sm) {
 #if defined(STRATA_USE_HIP)
-    if constexpr (kTag == 2) {
-        [[clang::always_inline]] block_gemv<K2, cb, Xin, 2>(tr, ld, tc0, k0, k1, x, suh, nc, sm);
+    if constexpr (kTag >= 2) {
+        [[clang::always_inline]] block_gemv<K2, cb, Xin, kTag>(tr, ld, tc0, k0, k1, x, suh, nc, sm);
         return;
     }
 #endif
@@ -974,7 +1028,7 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) win_gu_kernel(const KWin a) {
                                (const uint16_t*) (blob + a.suh[r]), nc, sm);
         if (warp < nc)
 #endif
-            block_out(sm.out + warp * kCols, (const uint16_t*) (blob + a.svh[r]) + g * kCols,
+            block_out<kTag == 3 ? 3 : 0>(sm.out + warp * kCols, (const uint16_t*) (blob + a.svh[r]) + g * kCols,
                       dst + (size_t) a.grp_ent[mm + warp] * a.n_ff + g * kCols);
         __syncthreads();
     }
@@ -1015,7 +1069,7 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) win_down_kernel(const KWin a) {
                                (const uint16_t*) (blob + a.suh[2]), nc, sm);
         if (warp < nc)
 #endif
-            block_out(sm.out + warp * kCols, (const uint16_t*) (blob + a.svh[2]) + g * kCols,
+            block_out<kTag == 3 ? 3 : 0>(sm.out + warp * kCols, (const uint16_t*) (blob + a.svh[2]) + g * kCols,
                       a.part + (size_t) a.grp_ent[mm + warp] * a.n_embd + g * kCols);
         __syncthreads();
     }
@@ -2557,20 +2611,22 @@ template <int K2, int cb> struct RunMv {
 #define EXL3_XS_RED(on, kernel, grid, a, s) (void) 0
 #endif
 #if defined(STRATA_USE_HIP)
-// EXL3_WIN_V2=1 (HIP, opt-in): a window's experts through the kTag 2 kernels (win_gemv) - the same bits.  Not with the
-// input split (EXL3_XSPLIT: gfx942 / gfx950), whose device code keeps its own path.
-static bool win_v2(const KWin& a) {
-    static const bool on = [] {
+// EXL3_WIN_V2 (HIP, opt-in): a window's experts through the kTag 2 (=1) or kTag 3 (=2) kernels (win_gemv) - the same
+// bits.  Not with the input split (EXL3_XSPLIT: gfx942 / gfx950), whose device code keeps its own path.  -> 0, 1, 2
+static int win_v2(const KWin& a) {
+    static const int level = [] {
         const char* v = std::getenv("EXL3_WIN_V2");
-        return v != nullptr && std::atoi(v) != 0;
+        return v == nullptr ? 0 : std::max(0, std::min(2, std::atoi(v)));
     }();
-    return on && a.gS == 1 && a.dS == 1;
+    return a.gS == 1 && a.dS == 1 ? level : 0;
 }
 #endif
 template <int K2, int cb> struct RunWin {
     static void run(const KWin& a, int groups, cudaStream_t s) {
 #if defined(STRATA_USE_HIP)
-        if (win_v2(a))
+        if (win_v2(a) == 2)
+            win_gu_kernel<K2, cb, 3><<<dim3((unsigned) (a.n_ff / kCols), (unsigned) groups, 2u), kThreads, 0, s>>>(a);
+        else if (win_v2(a) == 1)
             win_gu_kernel<K2, cb, 2><<<dim3((unsigned) (a.n_ff / kCols), (unsigned) groups, 2u), kThreads, 0, s>>>(a);
         else
 #endif
@@ -2582,7 +2638,9 @@ template <int K2, int cb> struct RunWin {
 template <int K2, int cb> struct RunWinDown {
     static void run(const KWin& a, int groups, cudaStream_t s) {
 #if defined(STRATA_USE_HIP)
-        if (win_v2(a))
+        if (win_v2(a) == 2)
+            win_down_kernel<K2, cb, 3><<<dim3((unsigned) (a.n_embd / kCols), (unsigned) groups, 1u), kThreads, 0, s>>>(a);
+        else if (win_v2(a) == 1)
             win_down_kernel<K2, cb, 2><<<dim3((unsigned) (a.n_embd / kCols), (unsigned) groups, 1u), kThreads, 0, s>>>(a);
         else
 #endif
