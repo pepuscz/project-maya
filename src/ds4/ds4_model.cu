@@ -5743,9 +5743,10 @@ struct Model::Impl {
         if (pool != nullptr) {   // (the readers' pool runs items on the device's own thread too: its device kept)
             int cur = 0;
             const bool got = cudaGetDevice(&cur) == cudaSuccess;
-            const bool copied = helper_copy(helper_id, si, pool, l.blob);
+            const bool part = l.nm > 1 && flow_helper_cut;
+            const bool copied = part ? pool_part(l, mi, pool, si) : helper_copy(helper_id, si, pool, l.blob);
             if (!got || cudaSetDevice(cur) != cudaSuccess || !copied) return false;
-            if (l.nm > 1) {
+            if (l.nm > 1 && !part) {
                 thread_local std::vector<uint8_t> half;
                 half.resize(unit(member(l, mi)));
                 blob_to_half(l, si, mi, half.data());
@@ -5759,6 +5760,32 @@ struct Model::Impl {
         }
         if (l.lay.fmt == gg::kFmtMXFP4) return l.nm > 1 ? read_mx_part(l, e, mi, si) : read_mx(l, e, si);
         return pk.read_at(l.region_file[(size_t) e], l.region_off[(size_t) e], l.region_bytes[(size_t) e], si);
+    }
+    // DS4_FLOW_HELPER_CUT=1 (tensor parallel EXL3, opt-in): member mi's part of a pool blob copied straight out of the
+    // helper's memory into staging as blob_to_half lays it out - the gate / up trellis as one 2D copy each (dim / 16
+    // rows of the member's tiles), down's rows as one run, the scales - instead of the whole blob copied and then cut on
+    // the host: half the bytes and no host pass over them (163b: an 8K prompt staged 190 GB out of the pool and cut
+    // ~95 GB on the CPU; its cards and their links both idle ~4.3 s of 17.7).  The same bytes (DS4_FLOW_HELPER_CHECK).
+    const bool flow_helper_cut = ds4_env("DS4_FLOW_HELPER_CUT") != nullptr && std::atoi(ds4_env("DS4_FLOW_HELPER_CUT")) != 0;
+    bool pool_part(const Layer& l, int mi, const uint8_t* pool, uint8_t* si) const {
+        const Layer& x = member(l, mi);
+        const int f0 = x.ff0, fn = x.ffn;
+        if (cudaSetDevice(helper_id) != cudaSuccess) return false;
+        auto run = [](uint8_t* to, const uint8_t* from, size_t n) {
+            return cudaMemcpy(to, from, n, cudaMemcpyDeviceToHost) == cudaSuccess;
+        };
+        for (int r = 0; r < 2; ++r) {
+            const size_t tile = (size_t) 16 * l.lay.k2[r], nt = (size_t) g.ff / 16, nth = (size_t) fn / 16;
+            if (cudaMemcpy2D(si + x.hlay.trellis[r], nth * tile, pool + l.lay.trellis[r] + (size_t) (f0 / 16) * tile,
+                             nt * tile, nth * tile, (size_t) g.dim / 16, cudaMemcpyDeviceToHost) != cudaSuccess ||
+                !run(si + x.hlay.suh[r], pool + l.lay.suh[r], (size_t) g.dim * 2) ||
+                !run(si + x.hlay.svh[r], pool + l.lay.svh[r] + (size_t) f0 * 2, (size_t) fn * 2))
+                return false;
+        }
+        const size_t row = (size_t) (g.dim / 16) * 16 * l.lay.k2[2];
+        return run(si + x.hlay.trellis[2], pool + l.lay.trellis[2] + (size_t) (f0 / 16) * row, (size_t) (fn / 16) * row) &&
+               run(si + x.hlay.suh[2], pool + l.lay.suh[2] + (size_t) f0 * 2, (size_t) fn * 2) &&
+               run(si + x.hlay.svh[2], pool + l.lay.svh[2], (size_t) g.dim * 2);
     }
     // (DS4_FLOW_HELPER_CHECK) an EXL3 item staged out of the pool against its file region repacked the same way
     bool pool_same(const Layer& l, int mi, int e, const uint8_t* si) const {

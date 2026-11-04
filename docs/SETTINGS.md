@@ -1359,6 +1359,7 @@ model's files (each read again, so those prompts are not timed); a difference fa
 | --- | --- | --- |
 | `MAYA_DS4_FLOW_HELPER` | off | `1`: a prompt's streamed experts the helper's pool holds copied out of it instead of read from the files (the same bytes) |
 | `MAYA_DS4_FLOW_HELPER_CHECK` | 0 | N: the load's first N prompts compare every expert copied out of the pool with the model's files; a difference fails the prompt |
+| `MAYA_DS4_FLOW_HELPER_CUT` | off | `1` (tensor-parallel EXL3, with `MAYA_DS4_FLOW_HELPER`): each card's part of a pooled expert copied straight out of the pool (2D copies of its tiles) instead of the whole expert copied and then cut on the host - half the bytes, no host pass; the same bytes (`MAYA_DS4_FLOW_HELPER_CHECK`) |
 | `MAYA_DS4_HELPER_RECENT` | 0 (off) | N (up to 64): N slots a layer in the helper's pool (inside `MAYA_DS4_HELPER_GB`, carved first) for the CPU lane's experts the layer used lately - one used `MAYA_DS4_HELPER_RECENT_NEED` times in the layer's last `MAYA_DS4_HELPER_RECENT_WIN` decode steps is copied in, the least recently used goes; such an expert is summed on the helper, so the answers can differ in the last bits |
 | `MAYA_DS4_HELPER_RECENT_NEED` | 2 | its uses in the window that bring an expert to a recent slot (1-64, at most `_WIN`) |
 | `MAYA_DS4_HELPER_RECENT_WIN` | 8 | the decode steps a layer's uses are counted over (1-64) |
