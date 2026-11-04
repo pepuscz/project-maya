@@ -463,10 +463,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       add_test(NAME exl3_win_v2_dpp_test COMMAND ${CMAKE_COMMAND} -E env EXL3_WIN_V2=2 $<TARGET_FILE:exl3_test>)
       add_test(NAME exl3_win_v2_occ_test COMMAND ${CMAKE_COMMAND} -E env EXL3_WIN_V2=7 $<TARGET_FILE:exl3_test>)
       add_test(NAME exl3_win_v2_occ9_test COMMAND ${CMAKE_COMMAND} -E env EXL3_WIN_V2=9 $<TARGET_FILE:exl3_test>)
+      add_test(NAME exl3_win_v2_perm_test COMMAND ${CMAKE_COMMAND} -E env EXL3_WIN_V2=12 $<TARGET_FILE:exl3_test>)
       # EXL3_WMMA_V2's prompt kernels against the CPU reference (--bench-set prints their bits against the default's)
       add_test(NAME exl3_wmma_v2_test COMMAND ${CMAKE_COMMAND} -E env EXL3_WMMA_V2=1 $<TARGET_FILE:exl3_test> --prefill-only)
       set_tests_properties(exl3_mv1_test exl3_mv_generic_test exl3_win_v2_test exl3_win_v2_dpp_test exl3_win_v2_occ_test
-                           exl3_win_v2_occ9_test exl3_wmma_v2_test PROPERTIES TIMEOUT 120)
+                           exl3_win_v2_occ9_test exl3_win_v2_perm_test exl3_wmma_v2_test PROPERTIES TIMEOUT 120)
     endif()
     # the same decoders against exllamav3 itself (tools/exl3_exllamav3_fixture.py's tiles): the same bits
     add_test(NAME exl3_exllamav3 COMMAND exl3_test --exllamav3 ${CMAKE_CURRENT_SOURCE_DIR}/data/exl3-exllamav3)

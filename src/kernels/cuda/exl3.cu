@@ -436,8 +436,27 @@ __device__ __forceinline__ void load_tiles(const uint32_t* __restrict__ tile0, s
 // one slice's fragment from the lane's words: K = 4 straight from the registers (the lane's steps end in its own word,
 // the first three reach into the previous lane's), other K (a half-integer one too) through the warp's stage (4 K2
 // words)
-template <int K2, int cb, int kTag = 0>
+template <int K2, int cb, int kTag = 0, bool Perm = false>
 __device__ __forceinline__ void slice_frags(const uint32_t (&w)[Words<K2>::R], uint32_t* st, int lane, uint32_t (&f)[4]) {
+#if defined(STRATA_USE_HIP) && (defined(__GFX10__) || defined(__GFX11__) || defined(__GFX12__))
+    if constexpr (Perm && K2 == 4) {
+        // K = 2 without the stage (EXL3_WIN_V2 11-13): lane l's steps are in words l / 2 and l / 2 - 1 (frag8_int's
+        // i1, i0), which lanes 0-15 hold - v_permlane16 within a row of 16 lanes, v_permlanex16 from the other row
+        // for lanes 16-31; no LDS round trip a slice.  The same words, so the same states and bits
+        const uint32_t v = w[0];
+        const uint32_t a0 = __builtin_amdgcn_permlane16(v, v, 0x33221100u, 0x77665544u, false, false);
+        const uint32_t a1 = __builtin_amdgcn_permlanex16(v, v, 0xBBAA9988u, 0xFFEEDDCCu, false, false);
+        const uint32_t b0 = __builtin_amdgcn_permlane16(v, v, 0x221100FFu, 0x66554433u, false, false);
+        const uint32_t b1 = __builtin_amdgcn_permlanex16(v, v, 0xAA998877u, 0xEEDDCCBBu, false, false);
+        const bool row1 = lane >= 16;
+        const uint32_t b = fsh(row1 ? a1 : a0, row1 ? b1 : b0, (1 - (lane & 1)) * 16);
+        uint32_t s[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) s[j] = b >> ((7 - j) * 2);
+        decode_states<cb, kTag>(s, f);
+        return;
+    }
+#endif
     if constexpr (K2 == 8) {
         uint32_t s[8];
         states4(__shfl_sync(0xffffffffu, w[0], (lane + 31) & 31), w[0], s);
@@ -508,7 +527,8 @@ __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int
     float xv[4], xs4[4];
     // kTag 3 (EXL3_WIN_V2=2): chunk 0 rotated before the loop, chunk q + 1 after chunk q's decode - into the buffer the
     // other warps finished reading before this chunk's barrier - so no warp waits at the barrier on the rotation
-    constexpr bool kAhead = kTag == 3 || kTag == 4;   // (kTag 4: kTag 3 without mul1_native)
+    constexpr bool kAhead = kTag == 3 || kTag == 4 || kTag == 6;   // (kTag 4: kTag 3 without mul1_native)
+    constexpr bool kPerm = kTag == 5 || kTag == 6;   // (slice_frags' K = 2 words by permlane, no stage)
     constexpr int kRot = kAhead ? 3 : 0;
     load_tiles<K2>(tile, sstride, lane, wc);
     if (rot) chunk_load(x, suh, k0, lane, xv, xs4);
@@ -533,7 +553,7 @@ __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int
 #pragma unroll
         for (int s = 0; s < 8; ++s) {
             uint32_t f[4];
-            slice_frags<K2, cb, kTag == 2 || kTag == 3 ? 2 : 0>(wc[s], st, lane, f);
+            slice_frags<K2, cb, kTag == 2 || kTag == 3 ? 2 : 0, kPerm>(wc[s], st, lane, f);
 #if defined(EXL3_TC)
             uint32_t b0 = 0u, b1 = 0u;
             if (g < nc) {
@@ -1100,7 +1120,7 @@ __global__ void __launch_bounds__(kThreads) __attribute__((amdgpu_waves_per_eu(W
                                                                     g * 8, 0, a.n_embd, x,
                                                                     (const uint16_t*) (blob + a.suh[r]), nc, sm);
         if (warp < nc)
-            block_out<kTag == 4 ? 3 : 0>(sm.out + warp * kCols, (const uint16_t*) (blob + a.svh[r]) + g * kCols,
+            block_out<kTag == 4 || kTag == 6 ? 3 : 0>(sm.out + warp * kCols, (const uint16_t*) (blob + a.svh[r]) + g * kCols,
                                          dst + (size_t) a.grp_ent[mm + warp] * a.n_ff + g * kCols);
         __syncthreads();
     }
@@ -1127,14 +1147,16 @@ __global__ void __launch_bounds__(kThreads) __attribute__((amdgpu_waves_per_eu(W
                                                                     g * 8, 0, a.n_ff, x,
                                                                     (const uint16_t*) (blob + a.suh[2]), nc, sm);
         if (warp < nc)
-            block_out<kTag == 4 ? 3 : 0>(sm.out + warp * kCols, (const uint16_t*) (blob + a.svh[2]) + g * kCols,
+            block_out<kTag == 4 || kTag == 6 ? 3 : 0>(sm.out + warp * kCols, (const uint16_t*) (blob + a.svh[2]) + g * kCols,
                                          a.part + (size_t) a.grp_ent[mm + warp] * a.n_embd + g * kCols);
         __syncthreads();
     }
 }
 // the occupancy variants by EXL3_WIN_V2 level: 3 (kTag 0, 8 entries, 12 waves), 4 (0, 8, 16), 5 (0, 4, 12),
 // 6 (4, 8, 12), 7 (4, 4, 12), and without a register target (WPE 1: no spills - 167's counters: at 12 waves the
-// spills add ~9 % VALU and L2 traffic) 8 (4, 8), 9 (4, 4), 10 (0, 4); false: not one of them (or not K 2 / 2.5 mul1)
+// spills add ~9 % VALU and L2 traffic) 8 (4, 8), 9 (4, 4), 10 (0, 4); and K 2's tile words by permlane instead of
+// the LDS stage (kTag 5: the default arithmetic, 6: with kTag 4's) 11 (5, 8), 12 (6, 8), 13 (6, 4); false: not one of
+// them (or not K 2 / 2.5 mul1)
 template <int K2, int cb>
 static bool win_occ(int level, const KWin& a, int groups, bool gate_up, cudaStream_t s) {
     if constexpr ((K2 == 4 || K2 == 5) && cb == 2) {
@@ -1150,6 +1172,8 @@ static bool win_occ(int level, const KWin& a, int groups, bool gate_up, cudaStre
         using I12 = std::integral_constant<int, 12>;
         using I16 = std::integral_constant<int, 16>;
         using I1 = std::integral_constant<int, 1>;
+        using I5 = std::integral_constant<int, 5>;
+        using I6 = std::integral_constant<int, 6>;
         switch (level) {
         case 3: go(I0{}, I8{}, I12{}); return true;
         case 4: go(I0{}, I8{}, I16{}); return true;
@@ -1159,6 +1183,9 @@ static bool win_occ(int level, const KWin& a, int groups, bool gate_up, cudaStre
         case 8: go(I4{}, I8{}, I1{}); return true;
         case 9: go(I4{}, I4{}, I1{}); return true;
         case 10: go(I0{}, I4{}, I1{}); return true;
+        case 11: go(I5{}, I8{}, I1{}); return true;
+        case 12: go(I6{}, I8{}, I1{}); return true;
+        case 13: go(I6{}, I4{}, I1{}); return true;
         default: return false;
         }
     }
@@ -2712,12 +2739,12 @@ template <int K2, int cb> struct RunMv {
 #endif
 #if defined(STRATA_USE_HIP)
 // EXL3_WIN_V2 (HIP, opt-in): a window's experts through the kTag 2 (=1) or kTag 3 (=2) kernels (win_gemv), or the
-// occupancy variants (=3..10, win_occ) - the same bits.  Not with the input split (EXL3_XSPLIT: gfx942 / gfx950), whose
-// device code keeps its own path.  -> 0..10
+// occupancy variants (=3..13, win_occ) - the same bits.  Not with the input split (EXL3_XSPLIT: gfx942 / gfx950), whose
+// device code keeps its own path.  -> 0..13
 static int win_v2(const KWin& a) {
     static const int level = [] {
         const char* v = std::getenv("EXL3_WIN_V2");
-        return v == nullptr ? 0 : std::max(0, std::min(10, std::atoi(v)));
+        return v == nullptr ? 0 : std::max(0, std::min(13, std::atoi(v)));
     }();
     return a.gS == 1 && a.dS == 1 ? level : 0;
 }
