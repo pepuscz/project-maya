@@ -5755,8 +5755,19 @@ struct Model::Impl {
     };
     struct Streamer {
         std::vector<Batch> b;
-        size_t cp = 0, kp = 0;        // the next batch to copy, to compute
-        std::atomic<size_t> done{0};  // cp, for read_ahead's thread
+        size_t cp = 0;                // the next batch to copy
+        std::atomic<size_t> kp{0};    // the next to compute
+        std::atomic<size_t> done{0};  // cp, for read_ahead's thread (and DS4_RING_THREAD's device thread)
+        // (DS4_RING_THREAD) the copies ahead on a thread of their own (copy_thread): it and the device's thread wake
+        // each other on mu / cv - stop, bad and err under mu
+        bool thread = false, stop = false, bad = false;
+        std::string err;
+        std::mutex mu;
+        std::condition_variable cv;
+        void wake() {
+            { std::lock_guard<std::mutex> lk(mu); }
+            cv.notify_all();
+        }
         const bool collect_prefill = std::getenv("DS4_PREFILL_STATS") != nullptr &&
                                      std::atoi(std::getenv("DS4_PREFILL_STATS")) != 0;
         PrefillCounts prefill;
@@ -5936,64 +5947,117 @@ struct Model::Impl {
         }();
         return n;
     }
+    // DS4_RING_THREAD=1: a device's streamed experts staged and copied on a thread of their own (copy_thread), where
+    // its own thread staged each batch between its layers' compute - the GPU and its copies idle while the readers
+    // read (an EXL3 pack in place: two RX 7900 XTX, an 8K prompt's ~4.3 s of 17.7 with neither running).  Not on
+    // Windows (WDDM submits queued copies when the host waits on the GPU: kick)
+    static bool ring_thread() {
+#if defined(_WIN32)
+        return false;
+#else
+        static const bool on = [] {
+            const char* v = ds4_env("DS4_RING_THREAD");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
+        return on;
+#endif
+    }
     bool copy_ahead(Dev& d, Chunk& c, Streamer& S, int di, std::string& err) {
-        const int P = Chunk::kParts;
-        while (S.cp < S.b.size() && S.cp < S.kp + P) {
+        if (S.thread) {   // (the copy thread's: woken, it runs as far ahead as the ring lets it)
+            S.wake();
+            return true;
+        }
+        while (S.cp < S.b.size() && S.cp < S.kp + Chunk::kParts) {
             const Batch& bt = S.b[S.cp];
             // Wait for this layer's routing rather than staging every expert
             // speculatively. Copies still overlap compute within the layer.
-            const bool skip_unpicked = S.skips(bt.k);
-            if (skip_unpicked && (bt.il != S.routed_layer || bt.k != S.routed_chunk)) break;
-            const int half = (int) (S.cp % P);
-            const Layer& l0 = L[(size_t) bt.il];
-            // Preserve the original virtual slots, batches and accumulation order.
-            const auto picked = [&](int i) {
-                if (!skip_unpicked || bt.il != S.routed_layer || bt.k != S.routed_chunk) return true;
-                const size_t v = (size_t) l0.pv_n + bt.j0 + i;   // (the streamed ones' virtual slots: from pv_n - slots lent
-                                                                  //  to a prompt's buffers stream too, plan_streams)
-                return S.routed_bounds[v + 1] > S.routed_bounds[v];
-            };
-            int mi = 0;
-            for (int m = 0; m < l0.nm; ++m)
-                if (member(l0, m).dev == di) mi = m;
-            if (S.cp >= (size_t) P) CK(cudaStreamWaitEvent(c.cs, c.freed[half], 0));
-            uint8_t* sb = nullptr;   // in place: the batch's regions in the part's staging slots
-            bool staged = false;     // (a batch of copies in place, alone: nothing to stage)
-            for (int i = 0; i < bt.n && !staged; ++i)
-                staged = stage_needed(l0, l0.host_list[(size_t) (bt.j0 + i)]);
-            // (DS4_FLOW_HELPER, EXL3: each item's source decided once - its staging and its copy must agree)
-            std::vector<const uint8_t*> pool((size_t) bt.n, nullptr);
-            if (c.stage != nullptr && staged) {
-                if (S.cp >= (size_t) P) CK(cudaEventSynchronize(c.filled[half]));   // (its last batch's copies out)
-                sb = c.stage + (size_t) half * (c.ring_n / P) * c.stage_stride;
-                for (int i = 0; i < bt.n; ++i) pool[(size_t) i] = x3_pool(l0, l0.host_list[(size_t) (bt.j0 + i)]);
-                std::atomic<bool> bad{false};
-                c.readers->run(bt.n, [&](int i) {
-                    if (!picked(i)) return;   // (DS4_SKIP_UNPICKED: an expert no token routed to)
-                    if (!stage_streamed(l0, mi, l0.host_list[(size_t) (bt.j0 + i)], sb + (size_t) i * c.stage_stride,
-                                        pool[(size_t) i]))
-                        bad.store(true);
-                });
-                if (bad.load()) {
-                    err = "reading layer " + std::to_string(l0.il) + "'s experts from the model's files failed";
-                    return false;
-                }
-            }
-            for (int i = 0; i < bt.n; ++i) {
-                if (!picked(i)) { ++S.skipped; continue; }
-                if (skip_unpicked) ++S.copied;
-                uint8_t* dst = c.ring + ((size_t) half * (c.ring_n / P) + i) * c.ring_stride;
-                if (!copy_streamed(l0, mi, l0.host_list[(size_t) (bt.j0 + i)], sb != nullptr ? sb + (size_t) i * c.stage_stride
-                                                                                             : nullptr,
-                                   dst, c.cs, err, pool[(size_t) i] != nullptr))
-                    return false;
-                S.pooled += pool[(size_t) i] != nullptr;
-                c.stream_bytes += (double) unit(member(l0, mi));
-            }
-            CK(cudaEventRecord(c.filled[half], c.cs));
-            ++S.cp;
-            S.done.store(S.cp, std::memory_order_relaxed);
+            if (S.skips(bt.k) && (bt.il != S.routed_layer || bt.k != S.routed_chunk)) break;
+            if (!copy_batch(d, c, S, di, err)) return false;
         }
+        return true;
+    }
+    // (DS4_RING_THREAD) each batch staged and its copies queued once the ring has its part back, until the run's last
+    void copy_thread(Dev& d, Chunk& c, Streamer& S, int di) {
+        cudaSetDevice(d.id);
+        std::string err;
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> lk(S.mu);
+                S.cv.wait(lk, [&] { return S.stop || S.cp >= S.b.size() || S.cp < S.kp + Chunk::kParts; });
+                if (S.stop || S.cp >= S.b.size()) return;
+            }
+            const bool ok = copy_batch(d, c, S, di, err);
+            {
+                std::lock_guard<std::mutex> lk(S.mu);
+                if (!ok) S.bad = true, S.err = err;
+            }
+            S.cv.notify_all();
+            if (!ok) return;
+        }
+    }
+    // (DS4_RING_THREAD) the device's thread before batch q's compute: the copy thread has queued its copies
+    bool wait_copied(Streamer& S, size_t q, std::string& err) {
+        if (!S.thread) return true;
+        std::unique_lock<std::mutex> lk(S.mu);
+        S.cv.wait(lk, [&] { return S.bad || S.done.load() > q; });
+        if (S.done.load() > q) return true;
+        err = S.err;
+        return false;
+    }
+    // batch S.cp: its experts staged (in place: by the readers) and their copies into its part of the ring queued
+    bool copy_batch(Dev& d, Chunk& c, Streamer& S, int di, std::string& err) {
+        const int P = Chunk::kParts;
+        const Batch& bt = S.b[S.cp];
+        const bool skip_unpicked = S.skips(bt.k);
+        const int half = (int) (S.cp % P);
+        const Layer& l0 = L[(size_t) bt.il];
+        // Preserve the original virtual slots, batches and accumulation order.
+        const auto picked = [&](int i) {
+            if (!skip_unpicked || bt.il != S.routed_layer || bt.k != S.routed_chunk) return true;
+            const size_t v = (size_t) l0.pv_n + bt.j0 + i;   // (the streamed ones' virtual slots: from pv_n - slots lent
+                                                              //  to a prompt's buffers stream too, plan_streams)
+            return S.routed_bounds[v + 1] > S.routed_bounds[v];
+        };
+        int mi = 0;
+        for (int m = 0; m < l0.nm; ++m)
+            if (member(l0, m).dev == di) mi = m;
+        if (S.cp >= (size_t) P) CK(cudaStreamWaitEvent(c.cs, c.freed[half], 0));
+        uint8_t* sb = nullptr;   // in place: the batch's regions in the part's staging slots
+        bool staged = false;     // (a batch of copies in place, alone: nothing to stage)
+        for (int i = 0; i < bt.n && !staged; ++i)
+            staged = stage_needed(l0, l0.host_list[(size_t) (bt.j0 + i)]);
+        // (DS4_FLOW_HELPER, EXL3: each item's source decided once - its staging and its copy must agree)
+        std::vector<const uint8_t*> pool((size_t) bt.n, nullptr);
+        if (c.stage != nullptr && staged) {
+            if (S.cp >= (size_t) P) CK(cudaEventSynchronize(c.filled[half]));   // (its last batch's copies out)
+            sb = c.stage + (size_t) half * (c.ring_n / P) * c.stage_stride;
+            for (int i = 0; i < bt.n; ++i) pool[(size_t) i] = x3_pool(l0, l0.host_list[(size_t) (bt.j0 + i)]);
+            std::atomic<bool> bad{false};
+            c.readers->run(bt.n, [&](int i) {
+                if (!picked(i)) return;   // (DS4_SKIP_UNPICKED: an expert no token routed to)
+                if (!stage_streamed(l0, mi, l0.host_list[(size_t) (bt.j0 + i)], sb + (size_t) i * c.stage_stride,
+                                    pool[(size_t) i]))
+                    bad.store(true);
+            });
+            if (bad.load()) {
+                err = "reading layer " + std::to_string(l0.il) + "'s experts from the model's files failed";
+                return false;
+            }
+        }
+        for (int i = 0; i < bt.n; ++i) {
+            if (!picked(i)) { ++S.skipped; continue; }
+            if (skip_unpicked) ++S.copied;
+            uint8_t* dst = c.ring + ((size_t) half * (c.ring_n / P) + i) * c.ring_stride;
+            if (!copy_streamed(l0, mi, l0.host_list[(size_t) (bt.j0 + i)], sb != nullptr ? sb + (size_t) i * c.stage_stride
+                                                                                         : nullptr,
+                               dst, c.cs, err, pool[(size_t) i] != nullptr))
+                return false;
+            S.pooled += pool[(size_t) i] != nullptr;
+            c.stream_bytes += (double) unit(member(l0, mi));
+        }
+        CK(cudaEventRecord(c.filled[half], c.cs));
+        ++S.cp;
+        S.done.store(S.cp, std::memory_order_release);
         return true;
     }
 
@@ -17943,6 +18007,7 @@ struct Model::Impl {
         for (int bi = 0; bi < nb; ++bi) {
             const Batch& bt = S.b[S.kp];
             const int half = (int) (S.kp % P);
+            if (!wait_copied(S, S.kp, err)) return false;
             CK(cudaStreamWaitEvent(s, c.filled[half], 0));
             const int v0 = L0.pv_n + bt.j0;
             if (!run_set(d, c, l, c.ring + (size_t) half * (c.ring_n / P) * c.ring_stride, v0, c.ring_stride, c.bounds,
@@ -18433,6 +18498,24 @@ struct Model::Impl {
                 if (th.joinable()) th.join();
             }
         } ra_join{ra_stop, ra};
+        // (DS4_RING_THREAD: the copies ahead on a thread of their own - not where a chunk streams only its picks, its
+        //  copies waiting for its routing)
+        S.thread = ring_thread() && !S.b.empty() &&
+                   std::none_of(S.skip_k.begin(), S.skip_k.end(), [](char x) { return x != 0; });
+        std::thread ct;
+        if (S.thread) ct = std::thread([this, &d, &c, &S, di] { copy_thread(d, c, S, di); });
+        struct JoinCopies {   // (every way out of the run: the copy thread stopped before S ends)
+            Streamer& S;
+            std::thread& th;
+            ~JoinCopies() {
+                {
+                    std::lock_guard<std::mutex> lk(S.mu);
+                    S.stop = true;
+                }
+                S.cv.notify_all();
+                if (th.joinable()) th.join();
+            }
+        } ct_join{S, ct};
         if (!copy_ahead(d, c, S, di, err)) return false;
         // this device's Engram layers: chunk k's rows read on a helper thread while chunk k - 1 runs (slot k % 2, once
         // chunk k - 2's copy of it is done)
