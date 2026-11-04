@@ -1604,7 +1604,7 @@ struct Model::Impl {
         return true;
     }
     // (the pool's copies: their kind from the pointers when it is host memory)
-    cudaMemcpyKind pool_kind(cudaMemcpyKind k) const { return helper_pool_host ? cudaMemcpyDefault : k; }
+    decltype(cudaMemcpyDefault) pool_kind(decltype(cudaMemcpyDefault) k) const { return helper_pool_host ? cudaMemcpyDefault : k; }
     cudaStream_t helper_st = nullptr;
     unsigned long long* helper_plan = nullptr;    // device [kWin][kPicks]: a request's picks it holds (0: not its)
     float *helper_w = nullptr, *helper_x = nullptr, *helper_h = nullptr;   // device: their weights, the tokens' x, h
