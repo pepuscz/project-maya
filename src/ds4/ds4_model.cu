@@ -9152,20 +9152,56 @@ struct Model::Impl {
                             failed.store(true); break;
                         }
                         if (ds4_env("DS4_HELPER_CHECK") != nullptr) {
+                            // each upload read back: a mismatch is read once more (the memory, or only that read?),
+                            // its first bytes logged, and the blob uploaded again - at most three times before the
+                            // load fails (175: one load in ~15 had a run of 4 KB pages wrong, SDMA on or off)
                             std::vector<uint8_t> got(l.blob);
-                            const cudaError_t ce = cudaMemcpy(got.data(), l.helper[(size_t) e], l.blob,
-                                                              pool_kind(cudaMemcpyDeviceToHost));
-                            size_t bad = 0, first = 0;
-                            if (ce == cudaSuccess)
-                                for (size_t k = 0; k < l.blob; ++k)
-                                    if (got[k] != stage[k] && bad++ == 0) first = k;
-                            if (ce != cudaSuccess || bad > 0) {   // (which: the read back failed, or its bytes differ)
+                            std::string why;
+                            for (int attempt = 0;; ++attempt) {
+                                const cudaError_t ce = cudaMemcpy(got.data(), l.helper[(size_t) e], l.blob,
+                                                                  pool_kind(cudaMemcpyDeviceToHost));
+                                size_t bad = 0, first = 0;
+                                if (ce == cudaSuccess)
+                                    for (size_t k = 0; k < l.blob; ++k)
+                                        if (got[k] != stage[k] && bad++ == 0) first = k;
+                                if (ce == cudaSuccess && bad == 0) {
+                                    if (attempt > 0)
+                                        std::fprintf(stderr, "ds4: DS4_HELPER_CHECK: layer %d expert %d right after %d "
+                                                             "upload(s) more\n", l.il, e, attempt);
+                                    break;
+                                }
+                                why = ce != cudaSuccess ? std::string("its read back failed: ") + cudaGetErrorString(ce)
+                                                        : std::to_string(bad) + " of " + std::to_string(l.blob) +
+                                                              " bytes differ, the first at " + std::to_string(first);
+                                if (ce == cudaSuccess) {   // (read again: the same bytes wrong = the memory)
+                                    std::vector<uint8_t> again(l.blob);
+                                    size_t bad2 = 0;
+                                    if (cudaMemcpy(again.data(), l.helper[(size_t) e], l.blob,
+                                                   pool_kind(cudaMemcpyDeviceToHost)) == cudaSuccess)
+                                        for (size_t k = 0; k < l.blob; ++k) bad2 += again[k] != stage[k];
+                                    else bad2 = SIZE_MAX;
+                                    char hx[200];
+                                    const size_t a = first & ~(size_t) 15;
+                                    int o = std::snprintf(hx, sizeof hx, " at %zu got", a);
+                                    for (size_t k = a; k < a + 16 && k < l.blob; ++k)
+                                        o += std::snprintf(hx + o, sizeof hx - o, " %02x", got[k]);
+                                    o += std::snprintf(hx + o, sizeof hx - o, " want");
+                                    for (size_t k = a; k < a + 16 && k < l.blob; ++k)
+                                        o += std::snprintf(hx + o, sizeof hx - o, " %02x", stage[k]);
+                                    why += "; read again: " + (bad2 == SIZE_MAX ? std::string("failed")
+                                                                                : std::to_string(bad2) + " differ") + ";" + hx;
+                                }
+                                std::fprintf(stderr, "ds4: DS4_HELPER_CHECK: layer %d expert %d, upload %d: %s\n", l.il, e,
+                                             attempt + 1, why.c_str());
+                                if (attempt == 2 ||
+                                    cudaMemcpy(l.helper[(size_t) e], stage, l.blob, pool_kind(cudaMemcpyHostToDevice)) !=
+                                        cudaSuccess)
+                                    break;
+                            }
+                            if (!why.empty() && std::memcmp(got.data(), stage, l.blob) != 0) {
                                 std::lock_guard<std::mutex> lk(emu);
                                 ferr = "helper expert byte check failed: layer " + std::to_string(l.il) + " expert " +
-                                       std::to_string(e) +
-                                       (ce != cudaSuccess ? std::string(": its read back failed: ") + cudaGetErrorString(ce)
-                                                          : ": " + std::to_string(bad) + " of " + std::to_string(l.blob) +
-                                                                " bytes differ, the first at " + std::to_string(first));
+                                       std::to_string(e) + ": " + why;
                                 failed.store(true); break;
                             }
                         }
