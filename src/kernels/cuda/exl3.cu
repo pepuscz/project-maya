@@ -95,22 +95,31 @@ __device__ __forceinline__ uint32_t bytesum_plus(uint32_t x, uint32_t acc) {
     return __dp4a(x, 0x01010101u, acc);
 #endif
 }
-// a 16-bit state times mul1's multiplier, mod 2^32.  EXL3_HIP_MUL24 (HIP, built in): as two 24-bit multiplies, s x
-// 0xDCD12D + (s x 0x83) << 24 - the same bits; AMD runs the 24-bit multiply at full rate, the 32-bit one at a quarter
-__device__ __forceinline__ uint32_t mul1_state(uint32_t s) {
-#if defined(STRATA_USE_HIP) && defined(EXL3_HIP_MUL24)
-    return __umul24(s, 0xDCD12Du) + (__umul24(s, 0x83u) << 24);
-#else
-    return s * 0x83DCD12Du;
-#endif
+#if defined(STRATA_USE_HIP)
+// mul1's state multiply in AMD's own instructions (the EXL3_WIN_V2 kernels, kTag 2): a 16-bit state s times 0x83DCD12D,
+// mod 2^32, is s x 0xDCD12D + (s x 0x83) << 24 - v_mul_u32_u24 and v_mad_u32_u24, both full rate, where the 32-bit
+// product is a quarter-rate v_mul_lo_u32.  The same bits.  (Inline assembly: written in C the compiler folds the two
+// 24-bit multiplies back into the one 32-bit multiply.)
+__device__ __forceinline__ uint32_t mul1_native(uint32_t s) {
+    uint32_t t, x;
+    asm("v_mul_u32_u24 %0, %1, %2" : "=v"(t) : "s"(0x83u), "v"(s));
+    asm("v_mad_u32_u24 %0, %1, %2, %3" : "=v"(x) : "v"(s), "s"(0xDCD12Du), "v"(t << 24));
+    return x;
 }
+#endif
 
 // two states -> two values, FP16 arithmetic as exllamav3's decode_3inst_2 (the tensor-core kernels take the half2)
-template <int cb>
+template <int cb, int kTag = 0>
 __device__ __forceinline__ __half2 decode2h(uint32_t s0, uint32_t s1) {
     if constexpr (cb == 2) {
-        const uint32_t a = bytesum_plus(mul1_state(s0), 0x6400u);
-        const uint32_t b = bytesum_plus(mul1_state(s1), 0x6400u);
+#if defined(STRATA_USE_HIP)
+        const uint32_t x0 = kTag == 2 ? mul1_native(s0) : s0 * 0x83DCD12Du;
+        const uint32_t x1 = kTag == 2 ? mul1_native(s1) : s1 * 0x83DCD12Du;
+#else
+        const uint32_t x0 = s0 * 0x83DCD12Du, x1 = s1 * 0x83DCD12Du;
+#endif
+        const uint32_t a = bytesum_plus(x0, 0x6400u);
+        const uint32_t b = bytesum_plus(x1, 0x6400u);
         const __half2 h = __halves2half2(__ushort_as_half((unsigned short) a), __ushort_as_half((unsigned short) b));
         return __hfma2(h, __half2half2(__ushort_as_half(0x1eee)), __half2half2(__ushort_as_half(0xc931)));
     } else {
@@ -145,10 +154,10 @@ __device__ __forceinline__ uint32_t fsh(uint32_t lo, uint32_t hi, int s) {
 // exllamav3's grouping per K (exl3_dq.cuh: dq8_aligned_*bits, dq8, dq4, dq2x2, dq8_half), which the steps' fixed
 // offsets keep within two words.  f[i]: steps 2i, 2i + 1 as FP16 values.
 // Step lane * 8 + j sits at tile row (lane & 3) * 2 + (j & 1) + 8 (j >> 1 & 1), column (lane >> 2) + 8 (j >> 2).
-template <int cb>
+template <int cb, int kTag = 0>
 __device__ __forceinline__ void decode_states(const uint32_t (&s)[8], uint32_t (&f)[4]) {
 #pragma unroll
-    for (int i = 0; i < 4; ++i) f[i] = h2u(decode2h<cb>(s[2 * i] & 0xffffu, s[2 * i + 1] & 0xffffu));
+    for (int i = 0; i < 4; ++i) f[i] = h2u(decode2h<cb, kTag>(s[2 * i] & 0xffffu, s[2 * i + 1] & 0xffffu));
 }
 // K = 4: the lane's steps end in its own word b (word lane), the first three reach into a (word lane - 1)
 __device__ __forceinline__ void states4(uint32_t a, uint32_t b, uint32_t (&s)[8]) {
@@ -173,7 +182,7 @@ __device__ __forceinline__ void states_group(const uint32_t* w, int p, uint32_t*
     for (int j = 0; j < G; ++j) s[G - 1 - j] = fsh(b, a, s2 + j * K);
 }
 // an integer K
-template <int K, int cb>
+template <int K, int cb, int kTag = 0>
 __device__ __forceinline__ void frag8_int(const uint32_t* w, int lane, uint32_t (&f)[4]) {
     const int p = lane * 8;
     uint32_t s[8];
@@ -205,12 +214,12 @@ __device__ __forceinline__ void frag8_int(const uint32_t* w, int lane, uint32_t 
         states_group<K, 4>(w, p, s);
         states_group<K, 4>(w, p + 4, s + 4);
     }
-    decode_states<cb>(s, f);
+    decode_states<cb, kTag>(s, f);
 }
 // a half-integer K (K2 = 2 KA + 1, mul1): exllamav3's dq8_half.  The lane's steps start even, so their windows end at
 // S(p + 7) = (p / 2 + 4) K2 and then KA + 1, KA, KA + 1, ... bits earlier; four windows span 18 + 3 KA <= 27 bits, one
 // funnel shift of two words each (steps 4..7 from window 7's end, 0..3 from window 3's, 2 K2 bits earlier)
-template <int K2, int cb>
+template <int K2, int cb, int kTag = 0>
 __device__ __forceinline__ void frag8_half(const uint32_t* w, int lane, uint32_t (&f)[4]) {
     constexpr int KA = K2 / 2, NW = 4 * K2, span = 18 + 3 * KA;
     const int e7 = (lane * 4 + 4) * K2 + 128 * K2;   // one ring on: no negative bit index
@@ -225,16 +234,16 @@ __device__ __forceinline__ void frag8_half(const uint32_t* w, int lane, uint32_t
         s[4 * g + 1] = x >> (2 * KA + 1);
         s[4 * g + 0] = x >> (3 * KA + 2);
     }
-    decode_states<cb>(s, f);
+    decode_states<cb, kTag>(s, f);
 }
 // K2 = 2 K: an even K2 is the integer K2 / 2, an odd one a half-integer K (mul1 only: exllamav3 has no other)
-template <int K2, int cb>
+template <int K2, int cb, int kTag = 0>
 __device__ __forceinline__ void frag8(const uint32_t* w, int lane, uint32_t (&f)[4]) {
     if constexpr ((K2 & 1) != 0) {
         static_assert(cb == 2 && K2 >= 3 && K2 <= 7, "a half-integer K: 1.5, 2.5 or 3.5, mul1");
-        frag8_half<K2, cb>(w, lane, f);
+        frag8_half<K2, cb, kTag>(w, lane, f);
     } else {
-        frag8_int<K2 / 2, cb>(w, lane, f);
+        frag8_int<K2 / 2, cb, kTag>(w, lane, f);
     }
 }
 
@@ -393,12 +402,12 @@ __device__ __forceinline__ void load_tiles(const uint32_t* __restrict__ tile0, s
 // one slice's fragment from the lane's words: K = 4 straight from the registers (the lane's steps end in its own word,
 // the first three reach into the previous lane's), other K (a half-integer one too) through the warp's stage (4 K2
 // words)
-template <int K2, int cb>
+template <int K2, int cb, int kTag = 0>
 __device__ __forceinline__ void slice_frags(const uint32_t (&w)[Words<K2>::R], uint32_t* st, int lane, uint32_t (&f)[4]) {
     if constexpr (K2 == 8) {
         uint32_t s[8];
         states4(__shfl_sync(0xffffffffu, w[0], (lane + 31) & 31), w[0], s);
-        decode_states<cb>(s, f);
+        decode_states<cb, kTag>(s, f);
     } else {
         constexpr int W = Words<K2>::W, R = Words<K2>::R;
         __syncwarp();
@@ -406,7 +415,7 @@ __device__ __forceinline__ void slice_frags(const uint32_t (&w)[Words<K2>::R], u
         for (int r = 0; r < R; ++r)
             if (W % 32 == 0 || lane + 32 * r < W) st[lane + 32 * r] = w[r];
         __syncwarp();
-        frag8<K2, cb>(st, lane, f);
+        frag8<K2, cb, kTag>(st, lane, f);
     }
 }
 
@@ -483,7 +492,7 @@ __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int
 #pragma unroll
         for (int s = 0; s < 8; ++s) {
             uint32_t f[4];
-            slice_frags<K2, cb>(wc[s], st, lane, f);
+            slice_frags<K2, cb, kTag == 2 ? 2 : 0>(wc[s], st, lane, f);
 #if defined(EXL3_TC)
             uint32_t b0 = 0u, b1 = 0u;
             if (g < nc) {
@@ -916,9 +925,25 @@ struct KWin {
 #endif
 };
 
+// the window kernels' block_gemv.  kTag 2 (EXL3_WIN_V2, HIP): its own copy, inlined into the kernel - called as a
+// function, as the compiler leaves it, its arguments arrive in vector registers, so the block's entry count nc reads as
+// per-lane and every token's `cc < nc` becomes a branch on the lane mask (162: 159 branches in the decode loop) - and
+// mul1's multiply in v_mul_u32_u24 / v_mad_u32_u24 (mul1_native).  The same arithmetic, the same bits.
+template <int K2, int cb, int kTag>
+__device__ __forceinline__ void win_gemv(const uint32_t* tr, int ld, int tc0, int k0, int k1, const Xin& x,
+                                         const uint16_t* suh, int nc, BlockSmem<K2>& sm) {
+#if defined(STRATA_USE_HIP)
+    if constexpr (kTag == 2) {
+        [[clang::always_inline]] block_gemv<K2, cb, Xin, 2>(tr, ld, tc0, k0, k1, x, suh, nc, sm);
+        return;
+    }
+#endif
+    EXL3_DECODE_INLINE block_gemv<K2, cb>(tr, ld, tc0, k0, k1, x, suh, nc, sm);
+}
+
 // grid (n_ff / 128, groups at most, 2): group blockIdx.y's gate (z 0, into h) or up (z 1, into u) for 128 h values of
 // each of its entries, kTok entries a pass; the pair's second block to finish turns them into the clamped swiglu
-template <int K2, int cb>
+template <int K2, int cb, int kTag = 0>
 __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) win_gu_kernel(const KWin a) {
     __shared__ __align__(16) BlockSmem<K2> sm;
     __shared__ int last;
@@ -945,8 +970,8 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) win_gu_kernel(const KWin a) {
             });
         else if (warp < nc)
 #else
-        EXL3_DECODE_INLINE block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[r]), a.n_ff / 16, g * 8, 0, a.n_embd, x,
-                                             (const uint16_t*) (blob + a.suh[r]), nc, sm);
+        win_gemv<K2, cb, kTag>((const uint32_t*) (blob + a.tr[r]), a.n_ff / 16, g * 8, 0, a.n_embd, x,
+                               (const uint16_t*) (blob + a.suh[r]), nc, sm);
         if (warp < nc)
 #endif
             block_out(sm.out + warp * kCols, (const uint16_t*) (blob + a.svh[r]) + g * kCols,
@@ -962,7 +987,7 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) win_gu_kernel(const KWin a) {
 }
 
 // grid (n_embd / 128, groups at most): group blockIdx.y's down rows for 128 outputs of each entry into its part rows
-template <int K2, int cb>
+template <int K2, int cb, int kTag = 0>
 __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) win_down_kernel(const KWin a) {
     __shared__ __align__(16) BlockSmem<K2> sm;
     const int grp = blockIdx.y, g = blockIdx.x;
@@ -986,8 +1011,8 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) win_down_kernel(const KWin a) {
             });
         else if (warp < nc)
 #else
-        EXL3_DECODE_INLINE block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[2]), a.n_embd / 16, g * 8, 0, a.n_ff, x,
-                                             (const uint16_t*) (blob + a.suh[2]), nc, sm);
+        win_gemv<K2, cb, kTag>((const uint32_t*) (blob + a.tr[2]), a.n_embd / 16, g * 8, 0, a.n_ff, x,
+                               (const uint16_t*) (blob + a.suh[2]), nc, sm);
         if (warp < nc)
 #endif
             block_out(sm.out + warp * kCols, (const uint16_t*) (blob + a.svh[2]) + g * kCols,
@@ -2531,8 +2556,24 @@ template <int K2, int cb> struct RunMv {
 #define EXL3_XS(n) 1u
 #define EXL3_XS_RED(on, kernel, grid, a, s) (void) 0
 #endif
+#if defined(STRATA_USE_HIP)
+// EXL3_WIN_V2=1 (HIP, opt-in): a window's experts through the kTag 2 kernels (win_gemv) - the same bits.  Not with the
+// input split (EXL3_XSPLIT: gfx942 / gfx950), whose device code keeps its own path.
+static bool win_v2(const KWin& a) {
+    static const bool on = [] {
+        const char* v = std::getenv("EXL3_WIN_V2");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    return on && a.gS == 1 && a.dS == 1;
+}
+#endif
 template <int K2, int cb> struct RunWin {
     static void run(const KWin& a, int groups, cudaStream_t s) {
+#if defined(STRATA_USE_HIP)
+        if (win_v2(a))
+            win_gu_kernel<K2, cb, 2><<<dim3((unsigned) (a.n_ff / kCols), (unsigned) groups, 2u), kThreads, 0, s>>>(a);
+        else
+#endif
         win_gu_kernel<K2, cb><<<dim3((unsigned) (a.n_ff / kCols), (unsigned) groups, 2u * EXL3_XS(a.gS)), kThreads, 0, s>>>(a);
         EXL3_XS_RED(a.gS > 1, win_gu_red_kernel, dim3((unsigned) (a.n_ff / kCols), (unsigned) groups), a, s);
         EXL3_WIN_SWIGLU(a, groups, s);
@@ -2540,6 +2581,11 @@ template <int K2, int cb> struct RunWin {
 };
 template <int K2, int cb> struct RunWinDown {
     static void run(const KWin& a, int groups, cudaStream_t s) {
+#if defined(STRATA_USE_HIP)
+        if (win_v2(a))
+            win_down_kernel<K2, cb, 2><<<dim3((unsigned) (a.n_embd / kCols), (unsigned) groups, 1u), kThreads, 0, s>>>(a);
+        else
+#endif
         win_down_kernel<K2, cb><<<dim3((unsigned) (a.n_embd / kCols), (unsigned) groups, EXL3_XS((unsigned) a.dS)), kThreads, 0, s>>>(a);
         EXL3_XS_RED(a.dS > 1, win_down_red_kernel, dim3((unsigned) (a.n_embd / kCols), (unsigned) groups), a, s);
     }
