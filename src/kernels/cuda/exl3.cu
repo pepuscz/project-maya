@@ -95,13 +95,22 @@ __device__ __forceinline__ uint32_t bytesum_plus(uint32_t x, uint32_t acc) {
     return __dp4a(x, 0x01010101u, acc);
 #endif
 }
+// a 16-bit state times mul1's multiplier, mod 2^32.  EXL3_HIP_MUL24 (HIP, built in): as two 24-bit multiplies, s x
+// 0xDCD12D + (s x 0x83) << 24 - the same bits; AMD runs the 24-bit multiply at full rate, the 32-bit one at a quarter
+__device__ __forceinline__ uint32_t mul1_state(uint32_t s) {
+#if defined(STRATA_USE_HIP) && defined(EXL3_HIP_MUL24)
+    return __umul24(s, 0xDCD12Du) + (__umul24(s, 0x83u) << 24);
+#else
+    return s * 0x83DCD12Du;
+#endif
+}
 
 // two states -> two values, FP16 arithmetic as exllamav3's decode_3inst_2 (the tensor-core kernels take the half2)
 template <int cb>
 __device__ __forceinline__ __half2 decode2h(uint32_t s0, uint32_t s1) {
     if constexpr (cb == 2) {
-        const uint32_t a = bytesum_plus(s0 * 0x83DCD12Du, 0x6400u);
-        const uint32_t b = bytesum_plus(s1 * 0x83DCD12Du, 0x6400u);
+        const uint32_t a = bytesum_plus(mul1_state(s0), 0x6400u);
+        const uint32_t b = bytesum_plus(mul1_state(s1), 0x6400u);
         const __half2 h = __halves2half2(__ushort_as_half((unsigned short) a), __ushort_as_half((unsigned short) b));
         return __hfma2(h, __half2half2(__ushort_as_half(0x1eee)), __half2half2(__ushort_as_half(0xc931)));
     } else {
