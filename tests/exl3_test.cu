@@ -1855,8 +1855,9 @@ void bench_win() {
     CK(cudaGetDevice(&dev));
     CK(cudaGetDeviceProperties(&prop, dev));
     if (cudaDeviceGetAttribute(&khz, cudaDevAttrClockRate, dev) != cudaSuccess) khz = 0;
-    std::printf("  bench win: %s, %d CUs, clock %d MHz, %d copies, %d calls a case\n", prop.name,
-                prop.multiProcessorCount, khz / 1000, NB, iters);
+    const char* v2 = std::getenv("EXL3_WIN_V2");
+    std::printf("  bench win: %s, %d CUs, clock %d MHz, %d copies, %d calls a case, EXL3_WIN_V2=%s\n", prop.name,
+                prop.multiProcessorCount, khz / 1000, NB, iters, v2 != nullptr ? v2 : "unset");
     unsigned* d_sink = nullptr;
     CK(cudaMalloc(&d_sink, 4));
     cudaEvent_t ev0, ev1;

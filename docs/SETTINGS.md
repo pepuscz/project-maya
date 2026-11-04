@@ -1423,6 +1423,12 @@ documented defaults. They are starting points from a small R9700 study, not tuni
 Serving configs use `MAYA_*`; native launches also accept `STRATA_*` or the unprefixed `EXL3_*` names. See
 [EXL3_HIP_SCALAR_ROWS.md](EXL3_HIP_SCALAR_ROWS.md) for the measured scope and reproducer.
 
+### EXL3 decode windows on AMD: `EXL3_WIN_V2`
+
+| Setting | Default | |
+| --- | --- | --- |
+| `EXL3_WIN_V2` | off | `1` (HIP): a verify window's routed experts (`win_experts`, the DeepSeek helper's decode) through their own copy of the trellis GEMV, inlined into the kernel, with mul1's multiply as `v_mul_u32_u24` + `v_mad_u32_u24` instead of the quarter-rate `v_mul_lo_u32`. The same bits as the default kernels (`exl3_test` with `EXL3_WIN_V2=1`; `exl3_test --bench-win` prints the outputs' bits). Not with `EXL3_XSPLIT` |
+
 ## DeepSeek: packed EXL3 tensor-parallel cache transfers
 
 `DS4_EXL3_PACKED_HOST=1` stores resident EXL3 host experts as GPU-ready member blobs;
