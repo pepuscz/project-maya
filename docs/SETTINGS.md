@@ -1399,6 +1399,8 @@ Serving configs use `MAYA_*`; native launches also accept `STRATA_*` or the unpr
 | --- | --- | --- |
 | `EXL3_WIN_V2` | off | `1` (HIP): a verify window's routed experts (`win_experts`, the DeepSeek helper's decode) through their own copy of the trellis GEMV, inlined into the kernel, with mul1's multiply as `v_mul_u32_u24` + `v_mad_u32_u24` instead of the quarter-rate `v_mul_lo_u32`. `2`: also the rotations' and the reductions' cross-lane steps as DPP `row_xmask` / `v_permlanex16` (RDNA, wave32) instead of `ds_bpermute` shuffles, each input chunk rotated after the previous chunk's decode instead of before the barrier. The same bits as the default kernels (`exl3_test` with `EXL3_WIN_V2=1` / `2`; `exl3_test --bench-win` prints the outputs' bits). Not with `EXL3_XSPLIT` |
 
+| `EXL3_WMMA_V2` | off | `1` (HIP gfx11): the matrix-core prompt kernels (`set_gate_up` / `set_down` with WMMA) decode their tiles with mul1's multiply as `v_mul_u32_u24` + `v_mad_u32_u24`, their GEMM inlined into the kernel. The same bits as the default prompt kernels (`exl3_test --bench-set` prints them) |
+
 ## DeepSeek: packed EXL3 tensor-parallel cache transfers
 
 `DS4_EXL3_PACKED_HOST=1` stores resident EXL3 host experts as GPU-ready member blobs;
