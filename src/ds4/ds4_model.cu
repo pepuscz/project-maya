@@ -9153,10 +9153,20 @@ struct Model::Impl {
                         }
                         if (ds4_env("DS4_HELPER_CHECK") != nullptr) {
                             std::vector<uint8_t> got(l.blob);
-                            if (cudaMemcpy(got.data(), l.helper[(size_t) e], l.blob, pool_kind(cudaMemcpyDeviceToHost)) != cudaSuccess ||
-                                std::memcmp(got.data(), stage, l.blob) != 0) {
+                            const cudaError_t ce = cudaMemcpy(got.data(), l.helper[(size_t) e], l.blob,
+                                                              pool_kind(cudaMemcpyDeviceToHost));
+                            size_t bad = 0, first = 0;
+                            if (ce == cudaSuccess)
+                                for (size_t k = 0; k < l.blob; ++k)
+                                    if (got[k] != stage[k] && bad++ == 0) first = k;
+                            if (ce != cudaSuccess || bad > 0) {   // (which: the read back failed, or its bytes differ)
                                 std::lock_guard<std::mutex> lk(emu);
-                                ferr = "helper expert byte check failed"; failed.store(true); break;
+                                ferr = "helper expert byte check failed: layer " + std::to_string(l.il) + " expert " +
+                                       std::to_string(e) +
+                                       (ce != cudaSuccess ? std::string(": its read back failed: ") + cudaGetErrorString(ce)
+                                                          : ": " + std::to_string(bad) + " of " + std::to_string(l.blob) +
+                                                                " bytes differ, the first at " + std::to_string(first));
+                                failed.store(true); break;
                             }
                         }
                     }
