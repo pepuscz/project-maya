@@ -1133,7 +1133,8 @@ __global__ void __launch_bounds__(kThreads) __attribute__((amdgpu_waves_per_eu(W
     }
 }
 // the occupancy variants by EXL3_WIN_V2 level: 3 (kTag 0, 8 entries, 12 waves), 4 (0, 8, 16), 5 (0, 4, 12),
-// 6 (4, 8, 12), 7 (4, 4, 12); false: not one of them (or not K 2 / 2.5 mul1) - the caller's kernels
+// 6 (4, 8, 12), 7 (4, 4, 12), and without a register target (WPE 1: no spills - 167's counters: at 12 waves the
+// spills add ~9 % VALU and L2 traffic) 8 (4, 8), 9 (4, 4), 10 (0, 4); false: not one of them (or not K 2 / 2.5 mul1)
 template <int K2, int cb>
 static bool win_occ(int level, const KWin& a, int groups, bool gate_up, cudaStream_t s) {
     if constexpr ((K2 == 4 || K2 == 5) && cb == 2) {
@@ -1148,12 +1149,16 @@ static bool win_occ(int level, const KWin& a, int groups, bool gate_up, cudaStre
         using I8 = std::integral_constant<int, 8>;
         using I12 = std::integral_constant<int, 12>;
         using I16 = std::integral_constant<int, 16>;
+        using I1 = std::integral_constant<int, 1>;
         switch (level) {
         case 3: go(I0{}, I8{}, I12{}); return true;
         case 4: go(I0{}, I8{}, I16{}); return true;
         case 5: go(I0{}, I4{}, I12{}); return true;
         case 6: go(I4{}, I8{}, I12{}); return true;
         case 7: go(I4{}, I4{}, I12{}); return true;
+        case 8: go(I4{}, I8{}, I1{}); return true;
+        case 9: go(I4{}, I4{}, I1{}); return true;
+        case 10: go(I0{}, I4{}, I1{}); return true;
         default: return false;
         }
     }
@@ -2707,12 +2712,12 @@ template <int K2, int cb> struct RunMv {
 #endif
 #if defined(STRATA_USE_HIP)
 // EXL3_WIN_V2 (HIP, opt-in): a window's experts through the kTag 2 (=1) or kTag 3 (=2) kernels (win_gemv), or the
-// occupancy variants (=3..7, win_occ) - the same bits.  Not with the input split (EXL3_XSPLIT: gfx942 / gfx950), whose
-// device code keeps its own path.  -> 0..7
+// occupancy variants (=3..10, win_occ) - the same bits.  Not with the input split (EXL3_XSPLIT: gfx942 / gfx950), whose
+// device code keeps its own path.  -> 0..10
 static int win_v2(const KWin& a) {
     static const int level = [] {
         const char* v = std::getenv("EXL3_WIN_V2");
-        return v == nullptr ? 0 : std::max(0, std::min(7, std::atoi(v)));
+        return v == nullptr ? 0 : std::max(0, std::min(10, std::atoi(v)));
     }();
     return a.gS == 1 && a.dS == 1 ? level : 0;
 }
