@@ -1585,6 +1585,26 @@ struct Model::Impl {
     int helper_n = 0;                             // experts it holds
     std::atomic<bool> helper_dead{false};
     uint8_t* helper_pool = nullptr;
+    // (DS4_HELPER_POOL_HOST=1, an integrated helper) the pool in pinned, mapped host memory: the helper's kernels read
+    // it as fast as their own (a Radeon 8060S: 233 GB/s either way) and a prompt's copies leave for the other GPUs
+    // straight out of it (copy_pool_part) - not through the helper's copy into staging and a cut on the host
+    bool helper_pool_host = false;
+    bool helper_pool_alloc(size_t n, bool integrated) {
+        static const bool want = ds4_env("DS4_HELPER_POOL_HOST") != nullptr && std::atoi(ds4_env("DS4_HELPER_POOL_HOST")) != 0;
+        if (!want || !integrated) return cudaMalloc((void**) &helper_pool, n) == cudaSuccess;
+        void* d = nullptr;
+        if (cudaHostAlloc((void**) &helper_pool, n, cudaHostAllocPortable | cudaHostAllocMapped) != cudaSuccess) return false;
+        if (cudaHostGetDevicePointer(&d, helper_pool, 0) != cudaSuccess || d != helper_pool) {   // (one address for all)
+            cudaFreeHost(helper_pool);
+            helper_pool = nullptr;
+            return false;
+        }
+        helper_pool_host = true;
+        std::fprintf(stderr, "ds4: helper pool in pinned host memory (DS4_HELPER_POOL_HOST): %.1f GB\n", n / 1e9);
+        return true;
+    }
+    // (the pool's copies: their kind from the pointers when it is host memory)
+    cudaMemcpyKind pool_kind(cudaMemcpyKind k) const { return helper_pool_host ? cudaMemcpyDefault : k; }
     cudaStream_t helper_st = nullptr;
     unsigned long long* helper_plan = nullptr;    // device [kWin][kPicks]: a request's picks it holds (0: not its)
     float *helper_w = nullptr, *helper_x = nullptr, *helper_h = nullptr;   // device: their weights, the tokens' x, h
@@ -5884,6 +5904,29 @@ struct Model::Impl {
                              "the model's files\n", l.il, e, mi);
         return false;
     }
+    // (DS4_HELPER_POOL_HOST) member mi's part of a pool blob straight into its ring slot, laid out as blob_to_half cuts
+    // it: the gate / up trellis as one 2D copy each (dim / 16 rows of the member's tiles), down's rows as one run, the
+    // scales; alone (nm 1) the whole blob in one copy
+    bool copy_pool_part(const Layer& l, int mi, const uint8_t* pool, uint8_t* dst, cudaStream_t cs) const {
+        auto run = [&](uint8_t* to, const uint8_t* from, size_t n) {
+            return cudaMemcpyAsync(to, from, n, cudaMemcpyHostToDevice, cs) == cudaSuccess;
+        };
+        if (l.nm == 1) return run(dst, pool, l.blob);
+        const Layer& x = member(l, mi);
+        const int f0 = x.ff0, fn = x.ffn;
+        for (int r = 0; r < 2; ++r) {
+            const size_t tile = (size_t) 16 * l.lay.k2[r], nt = (size_t) g.ff / 16, nth = (size_t) fn / 16;
+            if (cudaMemcpy2DAsync(dst + x.hlay.trellis[r], nth * tile, pool + l.lay.trellis[r] + (size_t) (f0 / 16) * tile,
+                                  nt * tile, nth * tile, (size_t) g.dim / 16, cudaMemcpyHostToDevice, cs) != cudaSuccess ||
+                !run(dst + x.hlay.suh[r], pool + l.lay.suh[r], (size_t) g.dim * 2) ||
+                !run(dst + x.hlay.svh[r], pool + l.lay.svh[r] + (size_t) f0 * 2, (size_t) fn * 2))
+                return false;
+        }
+        const size_t row = (size_t) (g.dim / 16) * 16 * l.lay.k2[2];
+        return run(dst + x.hlay.trellis[2], pool + l.lay.trellis[2] + (size_t) (f0 / 16) * row, (size_t) (fn / 16) * row) &&
+               run(dst + x.hlay.suh[2], pool + l.lay.suh[2] + (size_t) f0 * 2, (size_t) fn * 2) &&
+               run(dst + x.hlay.svh[2], pool + l.lay.svh[2], (size_t) g.dim * 2);
+    }
     bool copy_streamed(const Layer& l, int mi, int e, const uint8_t* si, uint8_t* dst, cudaStream_t cs,
                        std::string& err, bool pooled = false) {
         auto cp = [&](uint8_t* to, const uint8_t* from, size_t n) {
@@ -6023,18 +6066,21 @@ struct Model::Impl {
             if (member(l0, m).dev == di) mi = m;
         if (S.cp >= (size_t) P) CK(cudaStreamWaitEvent(c.cs, c.freed[half], 0));
         uint8_t* sb = nullptr;   // in place: the batch's regions in the part's staging slots
+        // (DS4_FLOW_HELPER, EXL3: each item's source decided once - its staging and its copy must agree; with the pool
+        //  in host memory, DS4_HELPER_POOL_HOST, a pool item is copied straight out of it: nothing to stage)
+        std::vector<const uint8_t*> pool((size_t) bt.n, nullptr);
+        if (c.stage != nullptr)
+            for (int i = 0; i < bt.n; ++i) pool[(size_t) i] = x3_pool(l0, l0.host_list[(size_t) (bt.j0 + i)]);
+        const auto direct = [&](int i) { return helper_pool_host && pool[(size_t) i] != nullptr; };
         bool staged = false;     // (a batch of copies in place, alone: nothing to stage)
         for (int i = 0; i < bt.n && !staged; ++i)
-            staged = stage_needed(l0, l0.host_list[(size_t) (bt.j0 + i)]);
-        // (DS4_FLOW_HELPER, EXL3: each item's source decided once - its staging and its copy must agree)
-        std::vector<const uint8_t*> pool((size_t) bt.n, nullptr);
+            staged = stage_needed(l0, l0.host_list[(size_t) (bt.j0 + i)]) && !direct(i);
         if (c.stage != nullptr && staged) {
             if (S.cp >= (size_t) P) CK(cudaEventSynchronize(c.filled[half]));   // (its last batch's copies out)
             sb = c.stage + (size_t) half * (c.ring_n / P) * c.stage_stride;
-            for (int i = 0; i < bt.n; ++i) pool[(size_t) i] = x3_pool(l0, l0.host_list[(size_t) (bt.j0 + i)]);
             std::atomic<bool> bad{false};
             c.readers->run(bt.n, [&](int i) {
-                if (!picked(i)) return;   // (DS4_SKIP_UNPICKED: an expert no token routed to)
+                if (!picked(i) || direct(i)) return;   // (DS4_SKIP_UNPICKED: an expert no token routed to)
                 if (!stage_streamed(l0, mi, l0.host_list[(size_t) (bt.j0 + i)], sb + (size_t) i * c.stage_stride,
                                     pool[(size_t) i]))
                     bad.store(true);
@@ -6048,6 +6094,26 @@ struct Model::Impl {
             if (!picked(i)) { ++S.skipped; continue; }
             if (skip_unpicked) ++S.copied;
             uint8_t* dst = c.ring + ((size_t) half * (c.ring_n / P) + i) * c.ring_stride;
+            if (direct(i)) {
+                const int e = l0.host_list[(size_t) (bt.j0 + i)];
+                if (!copy_pool_part(l0, mi, pool[(size_t) i], dst, c.cs)) {
+                    err = "streaming layer " + std::to_string(l0.il) + " expert " + std::to_string(e) + " out of the pool failed";
+                    return false;
+                }
+                if (flow_check_now) {   // (DS4_FLOW_HELPER_CHECK: the slot as copied, read back, against the files)
+                    std::vector<uint8_t> got(unit(member(l0, mi)));
+                    if (cudaStreamSynchronize(c.cs) != cudaSuccess ||
+                        cudaMemcpy(got.data(), dst, got.size(), cudaMemcpyDeviceToHost) != cudaSuccess ||
+                        !pool_same(l0, mi, e, got.data())) {
+                        err = "DS4_FLOW_HELPER_CHECK: layer " + std::to_string(l0.il) + " expert " + std::to_string(e) +
+                              " copied out of the host pool differs from the model's files";
+                        return false;
+                    }
+                }
+                ++S.pooled;
+                c.stream_bytes += (double) unit(member(l0, mi));
+                continue;
+            }
             if (!copy_streamed(l0, mi, l0.host_list[(size_t) (bt.j0 + i)], sb != nullptr ? sb + (size_t) i * c.stage_stride
                                                                                          : nullptr,
                                dst, c.cs, err, pool[(size_t) i] != nullptr))
@@ -8070,7 +8136,7 @@ struct Model::Impl {
                     bool ok = stage != nullptr && stage2 != nullptr && read_mx(l, e, stage);
                     if (jobs[i].help)
                         ok = ok && cudaSetDevice(helper_id) == cudaSuccess &&
-                             cudaMemcpy(l.helper[(size_t) e], stage, l.blob, cudaMemcpyHostToDevice) == cudaSuccess;
+                             cudaMemcpy(l.helper[(size_t) e], stage, l.blob, pool_kind(cudaMemcpyHostToDevice)) == cudaSuccess;
                     for (int m = 0; m < l.nm && ok && !jobs[i].help; ++m) {   // (a group: each member its part)
                         const Layer& x = member(l, m);
                         cudaSetDevice(devs[(size_t) x.dev].id);
@@ -9080,14 +9146,14 @@ struct Model::Impl {
                         repack(l, e, region.data(), stage);
                         cudaSetDevice(helper_id);
                         cur_dev = helper_id;
-                        if (cudaMemcpy(l.helper[(size_t) e], stage, l.blob, cudaMemcpyHostToDevice) != cudaSuccess) {
+                        if (cudaMemcpy(l.helper[(size_t) e], stage, l.blob, pool_kind(cudaMemcpyHostToDevice)) != cudaSuccess) {
                             std::lock_guard<std::mutex> lk(emu);
                             ferr = "uploading helper layer " + std::to_string(l.il) + " expert " + std::to_string(e);
                             failed.store(true); break;
                         }
                         if (ds4_env("DS4_HELPER_CHECK") != nullptr) {
                             std::vector<uint8_t> got(l.blob);
-                            if (cudaMemcpy(got.data(), l.helper[(size_t) e], l.blob, cudaMemcpyDeviceToHost) != cudaSuccess ||
+                            if (cudaMemcpy(got.data(), l.helper[(size_t) e], l.blob, pool_kind(cudaMemcpyDeviceToHost)) != cudaSuccess ||
                                 std::memcmp(got.data(), stage, l.blob) != 0) {
                                 std::lock_guard<std::mutex> lk(emu);
                                 ferr = "helper expert byte check failed"; failed.store(true); break;
@@ -14124,7 +14190,7 @@ struct Model::Impl {
             // Allocate the full requested budget before layer/expert placement. Every later mem_info sees it,
             // including the drafter's independent pool; no optimistic free0 reservation can be counted twice.
             cudaSetDevice(helper_id);
-            const bool allocated = !helper_fail("pool") && cudaMalloc((void**) &helper_pool, helper_cap) == cudaSuccess;
+            const bool allocated = !helper_fail("pool") && helper_pool_alloc(helper_cap, pr.integrated != 0);
             cudaSetDevice(cur);
             if (!allocated) { err = "DS4_HELPER_SHARED: cannot reserve its requested expert pool"; return false; }
             helper_allocs.push_back(helper_pool);
@@ -14192,7 +14258,7 @@ struct Model::Impl {
         cudaGetDevice(&cur);
         bool ok = cudaSetDevice(helper_id) == cudaSuccess;
         if (ok && helper_used > 0 && helper_pool == nullptr) {   // shared pool was reserved before placement
-            ok = !helper_fail("pool") && cudaMalloc((void**) &helper_pool, helper_used) == cudaSuccess;
+            ok = !helper_fail("pool") && helper_pool_alloc(helper_used, helper_integrated);
             if (ok) helper_allocs.push_back(helper_pool);
         }
         if (ok && hr_bytes > 0) {   // (the recent slots: after the profile's, each layer's hr_want blobs in a row)
@@ -14367,7 +14433,7 @@ struct Model::Impl {
                 //  fills and keeps the stage and the pool)
                 const bool submitted = cudaSetDevice(helper_id) == cudaSuccess &&
                                        cudaMemcpyAsync(l.hr_base + (size_t) f.slot * align256(l.blob), hr_stage, l.blob,
-                                                       cudaMemcpyHostToDevice, hr_st) == cudaSuccess;
+                                                       pool_kind(cudaMemcpyHostToDevice), hr_st) == cudaSuccess;
                 const bool recorded = submitted && cudaEventRecord(hr_fill_ev, hr_st) == cudaSuccess;
                 if (submitted) {
                     const double t0 = now_ms();
@@ -14928,7 +14994,9 @@ struct Model::Impl {
             return;
         }
         if (helper_keep) return;   // (kept already: a recent slot's fill still copying into it - DS4_HELPER_RECENT)
-        for (void* p : helper_allocs) cudaFree(p);
+        for (void* p : helper_allocs)
+            if (p == helper_pool && helper_pool_host) cudaFreeHost(p);
+            else cudaFree(p);
         helper_allocs.clear();
         cudaStreamDestroy(helper_st);
         helper_st = nullptr;
