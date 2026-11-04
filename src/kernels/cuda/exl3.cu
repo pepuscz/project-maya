@@ -500,8 +500,8 @@ __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int
     float xv[4], xs4[4];
     // kTag 3 (EXL3_WIN_V2=2): chunk 0 rotated before the loop, chunk q + 1 after chunk q's decode - into the buffer the
     // other warps finished reading before this chunk's barrier - so no warp waits at the barrier on the rotation
-    constexpr bool kAhead = kTag == 3;
-    constexpr int kRot = kTag == 3 ? 3 : 0;
+    constexpr bool kAhead = kTag == 3 || kTag == 4;   // (kTag 4: kTag 3 without mul1_native)
+    constexpr int kRot = kAhead ? 3 : 0;
     load_tiles<K2>(tile, sstride, lane, wc);
     if (rot) chunk_load(x, suh, k0, lane, xv, xs4);
     if constexpr (kAhead)
@@ -525,7 +525,7 @@ __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int
 #pragma unroll
         for (int s = 0; s < 8; ++s) {
             uint32_t f[4];
-            slice_frags<K2, cb, kTag >= 2 ? 2 : 0>(wc[s], st, lane, f);
+            slice_frags<K2, cb, kTag == 2 || kTag == 3 ? 2 : 0>(wc[s], st, lane, f);
 #if defined(EXL3_TC)
             uint32_t b0 = 0u, b1 = 0u;
             if (g < nc) {
@@ -600,7 +600,7 @@ __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int
 #pragma unroll
             for (int h = 0; h < 2; ++h) {
 #if defined(EXL3_DPP)
-                if constexpr (kTag == 3) {
+                if constexpr (kAhead) {
                     acc[cc][h] += lane_xor<1>(acc[cc][h]);
                     acc[cc][h] += lane_xor<2>(acc[cc][h]);
                     continue;
@@ -1066,6 +1066,93 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) win_down_kernel(const KWin a) {
         __syncthreads();
     }
 }
+
+#if defined(STRATA_USE_HIP)
+// EXL3_WIN_V2=3..7 (HIP, opt-in; K 2 and 2.5 mul1, turboderp's DeepSeek layers): the window kernels for occupancy.  163
+// on the Radeon 8060S: at ~163 VGPRs a lane the window kernels reach 55-70 % of the read roof, and from cache they are
+// only 5-10 % faster - the decode waits on latency with few waves to hide it.  WPE: the waves a SIMD must hold
+// (amdgpu_waves_per_eu: the compiler fits the registers to it), Tok: a pass's entries (4: half the accumulators and
+// shared memory, a group of more entries in two passes), kTag 0 the default arithmetic or 4 (block_gemv's DPP and
+// rotate-ahead, mul_lo kept).  block_gemv inlined.  Every entry's arithmetic is the token path's: the same bits.
+template <int K2, int cb, int kTag, int Tok, int WPE>
+__global__ void __launch_bounds__(kThreads) __attribute__((amdgpu_waves_per_eu(WPE))) win_gu_occ_kernel(const KWin a) {
+    __shared__ __align__(16) BlockSmem<K2, Tok> sm;
+    __shared__ int last;
+    const int grp = blockIdx.y, g = blockIdx.x, r = blockIdx.z;
+    if (grp >= *a.n_groups) return;
+    const uint8_t* blob = (const uint8_t*) a.grp_ptr[grp];
+    const int warp = threadIdx.x >> 5;
+    const int m0 = a.grp_start[grp], m1 = a.grp_start[grp + 1];
+    float* dst = r == 0 ? a.h : a.u;
+    for (int mm = m0; mm < m1; mm += Tok) {
+        const int nc = min(Tok, m1 - mm);
+        Xin x;
+        if (warp < nc) x.f = a.x + (size_t) (a.grp_ent[mm + warp] >> 3) * a.x_stride;
+        [[clang::always_inline]] block_gemv<K2, cb, Xin, kTag, Tok>((const uint32_t*) (blob + a.tr[r]), a.n_ff / 16,
+                                                                    g * 8, 0, a.n_embd, x,
+                                                                    (const uint16_t*) (blob + a.suh[r]), nc, sm);
+        if (warp < nc)
+            block_out<kTag == 4 ? 3 : 0>(sm.out + warp * kCols, (const uint16_t*) (blob + a.svh[r]) + g * kCols,
+                                         dst + (size_t) a.grp_ent[mm + warp] * a.n_ff + g * kCols);
+        __syncthreads();
+    }
+    if (!pair_last(a.cnt_gu + grp * (a.n_ff / kCols) + g, last)) return;
+    if (threadIdx.x < kCols)
+        for (int m = m0; m < m1; ++m) {
+            const size_t row = (size_t) a.grp_ent[m] * a.n_ff + g * kCols + threadIdx.x;
+            a.h[row] = swiglu(*(volatile const float*) &a.h[row], *(volatile const float*) &a.u[row], a.limit);
+        }
+}
+template <int K2, int cb, int kTag, int Tok, int WPE>
+__global__ void __launch_bounds__(kThreads) __attribute__((amdgpu_waves_per_eu(WPE))) win_down_occ_kernel(const KWin a) {
+    __shared__ __align__(16) BlockSmem<K2, Tok> sm;
+    const int grp = blockIdx.y, g = blockIdx.x;
+    if (grp >= *a.n_groups) return;
+    const uint8_t* blob = (const uint8_t*) a.grp_ptr[grp];
+    const int warp = threadIdx.x >> 5;
+    const int m0 = a.grp_start[grp], m1 = a.grp_start[grp + 1];
+    for (int mm = m0; mm < m1; mm += Tok) {
+        const int nc = min(Tok, m1 - mm);
+        Xin x;
+        if (warp < nc) x.f = a.h + (size_t) a.grp_ent[mm + warp] * a.n_ff;
+        [[clang::always_inline]] block_gemv<K2, cb, Xin, kTag, Tok>((const uint32_t*) (blob + a.tr[2]), a.n_embd / 16,
+                                                                    g * 8, 0, a.n_ff, x,
+                                                                    (const uint16_t*) (blob + a.suh[2]), nc, sm);
+        if (warp < nc)
+            block_out<kTag == 4 ? 3 : 0>(sm.out + warp * kCols, (const uint16_t*) (blob + a.svh[2]) + g * kCols,
+                                         a.part + (size_t) a.grp_ent[mm + warp] * a.n_embd + g * kCols);
+        __syncthreads();
+    }
+}
+// the occupancy variants by EXL3_WIN_V2 level: 3 (kTag 0, 8 entries, 12 waves), 4 (0, 8, 16), 5 (0, 4, 12),
+// 6 (4, 8, 12), 7 (4, 4, 12); false: not one of them (or not K 2 / 2.5 mul1) - the caller's kernels
+template <int K2, int cb>
+static bool win_occ(int level, const KWin& a, int groups, bool gate_up, cudaStream_t s) {
+    if constexpr ((K2 == 4 || K2 == 5) && cb == 2) {
+        const dim3 grid((unsigned) ((gate_up ? a.n_ff : a.n_embd) / kCols), (unsigned) groups, gate_up ? 2u : 1u);
+        auto go = [&](auto kt, auto tok, auto wpe) {
+            constexpr int T = decltype(kt)::value, N = decltype(tok)::value, W = decltype(wpe)::value;
+            if (gate_up) win_gu_occ_kernel<K2, cb, T, N, W><<<grid, kThreads, 0, s>>>(a);
+            else win_down_occ_kernel<K2, cb, T, N, W><<<grid, kThreads, 0, s>>>(a);
+        };
+        using I0 = std::integral_constant<int, 0>;
+        using I4 = std::integral_constant<int, 4>;
+        using I8 = std::integral_constant<int, 8>;
+        using I12 = std::integral_constant<int, 12>;
+        using I16 = std::integral_constant<int, 16>;
+        switch (level) {
+        case 3: go(I0{}, I8{}, I12{}); return true;
+        case 4: go(I0{}, I8{}, I16{}); return true;
+        case 5: go(I0{}, I4{}, I12{}); return true;
+        case 6: go(I4{}, I8{}, I12{}); return true;
+        case 7: go(I4{}, I4{}, I12{}); return true;
+        default: return false;
+        }
+    }
+    (void) level; (void) a; (void) groups; (void) gate_up; (void) s;
+    return false;
+}
+#endif
 
 // grid (n_embd / 128, T): each token's outputs, moe_down_kernel's combine (an entry off the device adds 0)
 __global__ void __launch_bounds__(kCols) win_combine_kernel(const KWin a) {
@@ -2531,12 +2618,13 @@ template <int K2, int cb> struct RunMv {
 #define EXL3_XS_RED(on, kernel, grid, a, s) (void) 0
 #endif
 #if defined(STRATA_USE_HIP)
-// EXL3_WIN_V2 (HIP, opt-in): a window's experts through the kTag 2 (=1) or kTag 3 (=2) kernels (win_gemv) - the same
-// bits.  Not with the input split (EXL3_XSPLIT: gfx942 / gfx950), whose device code keeps its own path.  -> 0, 1, 2
+// EXL3_WIN_V2 (HIP, opt-in): a window's experts through the kTag 2 (=1) or kTag 3 (=2) kernels (win_gemv), or the
+// occupancy variants (=3..7, win_occ) - the same bits.  Not with the input split (EXL3_XSPLIT: gfx942 / gfx950), whose
+// device code keeps its own path.  -> 0..7
 static int win_v2(const KWin& a) {
     static const int level = [] {
         const char* v = std::getenv("EXL3_WIN_V2");
-        return v == nullptr ? 0 : std::max(0, std::min(2, std::atoi(v)));
+        return v == nullptr ? 0 : std::max(0, std::min(7, std::atoi(v)));
     }();
     return a.gS == 1 && a.dS == 1 ? level : 0;
 }
@@ -2544,7 +2632,8 @@ static int win_v2(const KWin& a) {
 template <int K2, int cb> struct RunWin {
     static void run(const KWin& a, int groups, cudaStream_t s) {
 #if defined(STRATA_USE_HIP)
-        if (win_v2(a) == 2)
+        if (win_v2(a) >= 3 && win_occ<K2, cb>(win_v2(a), a, groups, true, s)) {
+        } else if (win_v2(a) == 2)
             win_gu_kernel<K2, cb, 3><<<dim3((unsigned) (a.n_ff / kCols), (unsigned) groups, 2u), kThreads, 0, s>>>(a);
         else if (win_v2(a) == 1)
             win_gu_kernel<K2, cb, 2><<<dim3((unsigned) (a.n_ff / kCols), (unsigned) groups, 2u), kThreads, 0, s>>>(a);
@@ -2558,7 +2647,8 @@ template <int K2, int cb> struct RunWin {
 template <int K2, int cb> struct RunWinDown {
     static void run(const KWin& a, int groups, cudaStream_t s) {
 #if defined(STRATA_USE_HIP)
-        if (win_v2(a) == 2)
+        if (win_v2(a) >= 3 && win_occ<K2, cb>(win_v2(a), a, groups, false, s)) {
+        } else if (win_v2(a) == 2)
             win_down_kernel<K2, cb, 3><<<dim3((unsigned) (a.n_embd / kCols), (unsigned) groups, 1u), kThreads, 0, s>>>(a);
         else if (win_v2(a) == 1)
             win_down_kernel<K2, cb, 2><<<dim3((unsigned) (a.n_embd / kCols), (unsigned) groups, 1u), kThreads, 0, s>>>(a);
