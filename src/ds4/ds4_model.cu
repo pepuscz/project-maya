@@ -11334,6 +11334,21 @@ struct Model::Impl {
         c.accd = c_accd.data();
         c.yd = c_yd.data();
         if (!c.cnt) c.alloc_counters(2);
+        // (os::prefetch_cold, as the GGUF paths: an expert read in place has its whole region asked for at once, so a
+        //  cold one comes in as large reads side by side instead of a read-ahead window at a time under the trellis
+        //  walk.  DS4_EXL3_PF=0: none, as before)
+        static const bool x3_pf = [] {
+            const char* v = ds4_env("DS4_EXL3_PF");
+            return v == nullptr || std::atoi(v) != 0;
+        }();
+        if (x3_pf && file_experts) {
+            std::vector<std::pair<const void*, size_t>> want;
+            for (const Ent& en : ents)
+                if (!(en.e < (int) l.esplit.size() && l.esplit[(size_t) en.e]) &&
+                    l.hh[(size_t) en.e][0] == file_part(l, en.e))   // (in place: not a VRAM, RAM or split one)
+                    want.push_back({file_part(l, en.e), (size_t) l.region_bytes[(size_t) en.e]});
+            os::prefetch_cold(want);
+        }
         // DS4_CPU_SPLIT_COLS=1 (MAYA_DS4_CPU_SPLIT_COLS): a call of few entries (a decoded token's one or two experts a
         // layer) has its gate / up and down pieces cut by columns too, so more of the lane's threads share it
         // (ds4_cpu_exl3.hpp, exl3_split_runs: the threads of the smallest node's batch) - every sum the same, bit for
