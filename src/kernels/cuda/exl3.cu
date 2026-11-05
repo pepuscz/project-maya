@@ -456,6 +456,28 @@ __device__ __forceinline__ void slice_frags(const uint32_t (&w)[Words<K2>::R], u
         decode_states<cb, kTag>(s, f);
         return;
     }
+    if constexpr (Perm && (K2 & 1) != 0 && Words<K2>::R == 1) {
+        // a half-integer K without the stage: frag8_half's four words fetched from the lanes holding them (lane i
+        // holds word i) by ds_bpermute - no LDS write, no syncs.  The same words, so the same states and bits
+        constexpr int KA = K2 / 2, NW = 4 * K2, span = 18 + 3 * KA;
+        const int v = (int) w[0];
+        const int e7 = (lane * 4 + 4) * K2 + 128 * K2;   // (frag8_half's: one ring on, no negative bit index)
+        uint32_t s[8];
+#pragma unroll
+        for (int g = 0; g < 2; ++g) {
+            const int e = e7 - (1 - g) * 2 * K2;
+            const int hi = (e - 1) >> 5, lo = (e - span) >> 5, sh = ((hi + 1) << 5) - e;
+            const uint32_t whi = (uint32_t) __builtin_amdgcn_ds_bpermute((hi % NW) << 2, v);
+            const uint32_t wlo = (uint32_t) __builtin_amdgcn_ds_bpermute((lo % NW) << 2, v);
+            const uint32_t x = fsh(whi, wlo, sh);
+            s[4 * g + 3] = x;
+            s[4 * g + 2] = x >> (KA + 1);
+            s[4 * g + 1] = x >> (2 * KA + 1);
+            s[4 * g + 0] = x >> (3 * KA + 2);
+        }
+        decode_states<cb, kTag>(s, f);
+        return;
+    }
 #endif
     if constexpr (K2 == 8) {
         uint32_t s[8];
@@ -2329,7 +2351,7 @@ __device__ void block_gemm_w(const uint32_t* __restrict__ tr, int ld, int tc0, i
         for (int s = 0; s < 8; ++s) {
             uint32_t f[4];
             // (kTag 3, EXL3_SET_VAR=3 / 8: K = 2's words by permlane, no stage - the window kernels' levels 11-13)
-            slice_frags<K2, cb, kTag == 2 ? 2 : 0, kTag == 3>(wc[s], st, lane, f);
+            slice_frags<K2, cb, kTag == 2 ? 2 : 0, kTag == 3 || kTag == 4>(wc[s], st, lane, f);
             // f: outputs g (f[0], f[1]) and g + 8 (f[2], f[3]), inputs 2t, 2t + 1 (f[0], f[2]) / 2t + 8, 2t + 9
             wt[g * kWtP11 + t] = f[0];
             wt[g * kWtP11 + 4 + t] = f[1];
@@ -3438,9 +3460,27 @@ static int set_var() {
     return 0;
 #endif
 }
+// EXL3_SET_VAR 10 / 11: every K2 with its words between lanes (K2 4 permlane, half-integer K bpermute) and 8 waves,
+// 32 rows a block from 64 rows a set (10: K2 4 only, 11: every K2), else 16
+template <int K2, int NRx, class F>
+static void set_rows_by(int max_rows, F&& f) {
+    if (max_rows >= 64) f(std::integral_constant<int, NRx>{});
+    else f(std::integral_constant<int, 16>{});
+}
 template <int K2, int cb> struct RunWmmaGateUp {
     static void run(const SetArgs& a, const float* x, int ldx, const int* idx, uint16_t* h, int ldh, cudaStream_t s) {
 #if defined(STRATA_USE_HIP)
+        if (set_var() == 10 || set_var() == 11) {
+            constexpr bool big = K2 == 4;
+            auto go = [&](auto nr) {
+                constexpr int NR = decltype(nr)::value;
+                const dim3 grid((a.max_rows + NR - 1) / NR, a.n_ff / kCols, a.n_exp);
+                wmma_set_occ_kernel<K2, cb, true, NR, 4><<<grid, kThreads, 0, s>>>(a, x, ldx, idx, h, ldh, nullptr, 0);
+            };
+            if (big || set_var() == 11) set_rows_by<K2, 32>(a.max_rows, go);
+            else go(std::integral_constant<int, 16>{});
+            return;
+        }
         if (set_var() == 9) {
             constexpr int NR = K2 == 4 ? 32 : 16;
             const dim3 grid((a.max_rows + NR - 1) / NR, a.n_ff / kCols, a.n_exp);
@@ -3470,6 +3510,18 @@ template <int K2, int cb> struct RunWmmaGateUp {
 template <int K2, int cb> struct RunWmmaDown {
     static void run(const SetArgs& a, const uint16_t* h, int ldh, float* y, int ldy, cudaStream_t s) {
 #if defined(STRATA_USE_HIP)
+        if (set_var() == 10 || set_var() == 11) {
+            constexpr bool big = K2 == 4;
+            auto go = [&](auto nr) {
+                constexpr int NR = decltype(nr)::value;
+                const dim3 grid((a.max_rows + NR - 1) / NR, a.n_embd / kCols, a.n_exp);
+                wmma_set_occ_kernel<K2, cb, false, NR, 4><<<grid, kThreads, 0, s>>>(
+                    a, nullptr, 0, nullptr, const_cast<uint16_t*>(h), ldh, y, ldy);
+            };
+            if (big || set_var() == 11) set_rows_by<K2, 32>(a.max_rows, go);
+            else go(std::integral_constant<int, 16>{});
+            return;
+        }
         if (set_var() == 9) {
             constexpr int NR = K2 == 4 ? 32 : 16;
             const dim3 grid((a.max_rows + NR - 1) / NR, a.n_embd / kCols, a.n_exp);
