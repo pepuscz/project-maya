@@ -2328,7 +2328,8 @@ __device__ void block_gemm_w(const uint32_t* __restrict__ tr, int ld, int tc0, i
 #pragma unroll
         for (int s = 0; s < 8; ++s) {
             uint32_t f[4];
-            slice_frags<K2, cb, kTag >= 2 ? 2 : 0>(wc[s], st, lane, f);
+            // (kTag 3, EXL3_SET_VAR=3 / 8: K = 2's words by permlane, no stage - the window kernels' levels 11-13)
+            slice_frags<K2, cb, kTag == 2 ? 2 : 0, kTag == 3>(wc[s], st, lane, f);
             // f: outputs g (f[0], f[1]) and g + 8 (f[2], f[3]), inputs 2t, 2t + 1 (f[0], f[2]) / 2t + 8, 2t + 9
             wt[g * kWtP11 + t] = f[0];
             wt[g * kWtP11 + 4 + t] = f[1];
@@ -2533,9 +2534,9 @@ __device__ __forceinline__ void set_rows_w(const SetArgs& a, Gemm&& gemm, const 
     }
 }
 
-template <int K2, int cb, bool gate_up, int NR, int kTag = 0>
-__global__ void __launch_bounds__(kThreads) wmma_set_kernel(SetArgs a, const float* x, int ldx, const int* idx,
-                                                         uint16_t* h, int ldh, float* y, int ldy) {
+template <int K2, int cb, bool gate_up, int NR, int kTag>
+__device__ __forceinline__ void wmma_set_body(const SetArgs& a, const float* x, int ldx, const int* idx, uint16_t* h,
+                                              int ldh, float* y, int ldy) {
 #if defined(EXL3_WMMA_RDNA4)
     __shared__ __align__(16) Rdna4Smem<NR> sm;
 #else
@@ -2558,13 +2559,26 @@ __global__ void __launch_bounds__(kThreads) wmma_set_kernel(SetArgs a, const flo
             return sm.out;
         }
 #endif
-        block_gemm_w<K2, cb, K2, NR>((const uint32_t*) (blob + a.lay.trellis[r]), ld, g * 8, 0, k1, in,
-                                     (const uint16_t*) (blob + a.lay.suh[r]), nc, sm);
+        block_gemm_w<K2, cb, K2, NR, kTag == 2 ? 0 : kTag>((const uint32_t*) (blob + a.lay.trellis[r]), ld, g * 8, 0,
+                                                            k1, in, (const uint16_t*) (blob + a.lay.suh[r]), nc, sm);
         return sm.out;
     };
     set_rows_w<NR, gate_up>(a, gemm, (const uint16_t*) (blob + a.lay.svh[0]), (const uint16_t*) (blob + a.lay.svh[1]),
                             (const uint16_t*) (blob + a.lay.svh[2]), x, ldx, idx, h, ldh, y, ldy, row, nc, g, gate);
 }
+template <int K2, int cb, bool gate_up, int NR, int kTag = 0>
+__global__ void __launch_bounds__(kThreads) wmma_set_kernel(SetArgs a, const float* x, int ldx, const int* idx,
+                                                         uint16_t* h, int ldh, float* y, int ldy) {
+    wmma_set_body<K2, cb, gate_up, NR, kTag>(a, x, ldx, idx, h, ldh, y, ldy);
+}
+#if defined(STRATA_USE_HIP)
+// (EXL3_SET_VAR 5 / 8) the same with the compiler fitting its registers to 8 waves a SIMD (192 VGPRs)
+template <int K2, int cb, bool gate_up, int NR, int kTag = 0>
+__global__ void __launch_bounds__(kThreads) __attribute__((amdgpu_waves_per_eu(8)))
+wmma_set_occ_kernel(SetArgs a, const float* x, int ldx, const int* idx, uint16_t* h, int ldh, float* y, int ldy) {
+    wmma_set_body<K2, cb, gate_up, NR, kTag>(a, x, ldx, idx, h, ldh, y, ldy);
+}
+#endif
 
 template <int cb, bool gate_up, int NR>
 __global__ void __launch_bounds__(kThreads) wmma_set_mix_kernel(SetArgs a, KMix mx, const float* x, int ldx,
@@ -3409,13 +3423,32 @@ static bool wmma_v2() {
     return false;
 #endif
 }
+// EXL3_SET_VAR (HIP gfx11, opt-in, for the kernel benches): 3 K = 2's words by permlane (no LDS stage), 5 the
+// kernels fitted to 8 waves a SIMD, 8 both; unset or 0 the default (EXL3_WMMA_V2 as before).  The same bits.
+static int set_var() {
+#if defined(STRATA_USE_HIP)
+    static const int v = [] {
+        const char* e = std::getenv("EXL3_SET_VAR");
+        return e != nullptr ? std::atoi(e) : 0;
+    }();
+    return v;
+#else
+    return 0;
+#endif
+}
 template <int K2, int cb> struct RunWmmaGateUp {
     static void run(const SetArgs& a, const float* x, int ldx, const int* idx, uint16_t* h, int ldh, cudaStream_t s) {
         with_rows([&](auto nr) {
             constexpr int NR = decltype(nr)::value;
             const dim3 grid((a.max_rows + NR - 1) / NR, a.n_ff / kCols, a.n_exp);
 #if defined(STRATA_USE_HIP)
-            if (wmma_v2())
+            if (set_var() == 3)
+                wmma_set_kernel<K2, cb, true, NR, 3><<<grid, kThreads, 0, s>>>(a, x, ldx, idx, h, ldh, nullptr, 0);
+            else if (set_var() == 5)
+                wmma_set_occ_kernel<K2, cb, true, NR, 0><<<grid, kThreads, 0, s>>>(a, x, ldx, idx, h, ldh, nullptr, 0);
+            else if (set_var() == 8)
+                wmma_set_occ_kernel<K2, cb, true, NR, 3><<<grid, kThreads, 0, s>>>(a, x, ldx, idx, h, ldh, nullptr, 0);
+            else if (wmma_v2())
                 wmma_set_kernel<K2, cb, true, NR, 2><<<grid, kThreads, 0, s>>>(a, x, ldx, idx, h, ldh, nullptr, 0);
             else
 #endif
@@ -3430,7 +3463,15 @@ template <int K2, int cb> struct RunWmmaDown {
             const dim3 grid((a.max_rows + NR - 1) / NR, a.n_embd / kCols, a.n_exp);
             uint16_t* hh = const_cast<uint16_t*>(h);
 #if defined(STRATA_USE_HIP)
-            if (wmma_v2())
+            if (set_var() == 3)
+                wmma_set_kernel<K2, cb, false, NR, 3><<<grid, kThreads, 0, s>>>(a, nullptr, 0, nullptr, hh, ldh, y, ldy);
+            else if (set_var() == 5)
+                wmma_set_occ_kernel<K2, cb, false, NR, 0><<<grid, kThreads, 0, s>>>(a, nullptr, 0, nullptr, hh, ldh, y,
+                                                                                ldy);
+            else if (set_var() == 8)
+                wmma_set_occ_kernel<K2, cb, false, NR, 3><<<grid, kThreads, 0, s>>>(a, nullptr, 0, nullptr, hh, ldh, y,
+                                                                                ldy);
+            else if (wmma_v2())
                 wmma_set_kernel<K2, cb, false, NR, 2><<<grid, kThreads, 0, s>>>(a, nullptr, 0, nullptr, hh, ldh, y, ldy);
             else
 #endif
