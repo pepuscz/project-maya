@@ -5576,6 +5576,16 @@ struct Model::Impl {
         }();
         return on;
     }
+    // DS4_FAT_X3_MIN_TOKENS (16384): the busy experts' path only for chunks of at least this many tokens - a long
+    // prompt's; a short prompt's few busy experts are as fast on the tiles (188: 256 rows, 24K chunks: 130K prefill
+    // +6.9 %, a 2K prompt -1.8 %)
+    static int fat_x3_min_tokens() {
+        static const int n = [] {
+            const char* v = ds4_env("DS4_FAT_X3_MIN_TOKENS");
+            return v != nullptr ? std::max(0, std::atoi(v)) : 16384;
+        }();
+        return n;
+    }
     // matrix r of an EXL3 expert blob laid out as lay (gate / up: D -> FF, down: FF -> D)
     static x3::Mat x3_part(const x3::ExpertLayout& lay, const uint8_t* blob, int r, int D, int FF) {
         x3::Mat m;
@@ -6614,7 +6624,7 @@ struct Model::Impl {
                     // (DS4_FAT_X3: the busy experts through FP16 GEMMs, the others through the tiles in runs of
                     //  neighbours - each run its own bounds and blobs, the set's row0: the same local rows)
                     std::vector<char> big;
-                    if (fat_x3() && sa.mix.n == 0 && fat_ready(d, c, D, FF, true)) {
+                    if (fat_x3() && T >= fat_x3_min_tokens() && sa.mix.n == 0 && fat_ready(d, c, D, FF, true)) {
                         big.assign((size_t) (j - i0), 0);
                         bool any = false;
                         for (int i = i0; i < j; ++i) any |= (big[(size_t) (i - i0)] = b[i + 1] - b[i] >= fat_rows()) != 0;
