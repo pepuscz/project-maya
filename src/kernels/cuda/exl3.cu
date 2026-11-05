@@ -764,6 +764,16 @@ __device__ __forceinline__ void block_out(const float* red, const uint16_t* svh,
 #pragma unroll
     for (int i = 0; i < 4; ++i) dst[lane * 4 + i] = __fmul_rn(v[i], h2f(svh[lane * 4 + i]));
 }
+// ... the same into the lane's own 4 (T22's gate in registers: the lane that makes them is the one that uses them)
+__device__ __forceinline__ void block_out_r(const float* red, const uint16_t* svh, float (&dst)[4]) {
+    const int lane = threadIdx.x & 31;
+    float v[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) v[i] = red[lane * 4 + i];
+    had128(v, lane);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) dst[i] = __fmul_rn(v[i], h2f(svh[lane * 4 + i]));
+}
 // ... the clamped swiglu ...
 __device__ __forceinline__ float swiglu(float gv, float uv, float limit) {
     if (limit > 0.0f) {
@@ -2002,9 +2012,22 @@ constexpr int kWtP = 12;
 constexpr int kWtP11 = 12;
 template <int K2, int NR>
 struct WmmaSmem {   // (out, xb and wt at the same offsets for every K2: the mixed kernel keeps one for all classes)
+    static constexpr bool kUnion = false;
     float out[NR * kCols];
     __half xb[2 * NR * kXS];
     uint32_t wt[kWarps * 16 * (kWtP > kWtP11 ? kWtP : kWtP11)];   // a warp's decoded tile by output, 8 words a row
+    uint32_t stage[kWarps * 4 * K2];
+};
+// gfx11's shaped kernels (T22 test, EXL3_SET_VAR 12 / 13): out over xb - out is written only once every warp has read
+// xb's last chunk - so a block's LDS no longer caps the waves a SIMD below what its registers allow
+template <int K2, int NR>
+struct WmmaSmemU {
+    static constexpr bool kUnion = true;
+    union {
+        float out[NR * kCols];
+        __half xb[2 * NR * kXS];
+    };
+    uint32_t wt[kWarps * 16 * kWtP11];
     uint32_t stage[kWarps * 4 * K2];
 };
 #if defined(STRATA_USE_HIP) && defined(__GFX11__)
@@ -2180,6 +2203,7 @@ __device__ void block_gemm_w(const uint32_t* __restrict__ tr, int ld, int tc0, i
 #pragma unroll
             for (int r = 0; r < R; ++r) wc[s][r] = wn[s][r];
     }
+    if constexpr (Smem::kUnion) __syncthreads();   // (out over xb: every warp past its last chunk)
 #pragma unroll
     for (int b = 0; b < NB; ++b)
         if (b * 16 + m < nc)
@@ -2323,12 +2347,38 @@ __device__ void block_gemm_w(const uint32_t* __restrict__ tr, int ld, int tc0, i
 
 // a block's rows [row, row + nc) of one expert (gemm(r, in): part r's NR-row product, its out): gate / up into h
 // through the clamped swiglu, or down into y - hip_set_kernel's arithmetic around the product
-template <int NR, bool gate_up, class Gemm>
+template <int NR, bool gate_up, bool GateReg = false, class Gemm>
 __device__ __forceinline__ void set_rows_w(const SetArgs& a, Gemm&& gemm, const uint16_t* svh0, const uint16_t* svh1,
                                            const uint16_t* svh2, const float* x, int ldx, const int* idx, uint16_t* h,
                                            int ldh, float* y, int ldy, int row, int nc, int g, float* gate) {
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    if constexpr (gate_up) {
+    if constexpr (gate_up && GateReg) {   // (T22 var 13: the gate in the lane's registers, no LDS for it)
+        Xin in[NR / 8];
+#pragma unroll
+        for (int j = 0; j < NR / 8; ++j)
+            if (warp + 8 * j < nc) in[j].f = x + (size_t) idx[row + warp + 8 * j] * ldx;
+        float gr[NR / kWarps][4];
+        const float* o = gemm(0, in);
+#pragma unroll
+        for (int j = 0; j < NR / kWarps; ++j)
+            if (warp + kWarps * j < nc) block_out_r(o + (warp + kWarps * j) * kCols, svh0 + g * kCols, gr[j]);
+        __syncthreads();
+        o = gemm(1, in);
+#pragma unroll
+        for (int j = 0; j < NR / kWarps; ++j) {
+            const int rr = warp + kWarps * j;
+            if (rr >= nc) continue;
+            float v[4];
+            for (int i = 0; i < 4; ++i) v[i] = o[rr * kCols + lane * 4 + i];
+            had128(v, lane);
+            for (int i = 0; i < 4; ++i) {
+                const int cc = lane * 4 + i;
+                const float up = v[i] * h2f(svh1[g * kCols + cc]);
+                h[(size_t) (row + rr) * ldh + g * kCols + cc] =
+                    __half_as_ushort(__float2half_rn(swiglu(gr[j][i], up, a.limit)));
+            }
+        }
+    } else if constexpr (gate_up) {
         Xin in[NR / 8];
 #pragma unroll
         for (int j = 0; j < NR / 8; ++j)
@@ -2359,15 +2409,17 @@ __device__ __forceinline__ void set_rows_w(const SetArgs& a, Gemm&& gemm, const 
     }
 }
 
-template <int K2, int cb, bool gate_up, int NR, bool Perm>
+template <int K2, int cb, bool gate_up, int NR, bool Perm, int Var = 0>
 __device__ __forceinline__ void wmma_set_body(const SetArgs& a, const float* x, int ldx, const int* idx, uint16_t* h,
                                               int ldh, float* y, int ldy) {
 #if defined(EXL3_WMMA_RDNA4)
     __shared__ __align__(16) Rdna4Smem<NR> sm;
 #else
-    __shared__ __align__(32) WmmaSmem<K2, NR> sm;   // (wmma: 256-bit aligned operands)
+    // (wmma: 256-bit aligned operands; T22 var 12 / 13: out over xb)
+    __shared__ __align__(32) typename std::conditional<(Var >= 12), WmmaSmemU<K2, NR>, WmmaSmem<K2, NR>>::type sm;
 #endif
-    __shared__ float gate[NR * kCols];
+    constexpr bool kGateReg = Var == 13;
+    __shared__ float gate[(Var >= 12 && (kGateReg || !gate_up)) ? 1 : NR * kCols];   // (T22: none where unused)
     const int e = blockIdx.z, g = blockIdx.y;
     const int start = a.bounds[e], end = a.bounds[e + 1];
     const int row = start - a.row0 + (int) blockIdx.x * NR;
@@ -2380,8 +2432,9 @@ __device__ __forceinline__ void wmma_set_body(const SetArgs& a, const float* x, 
                                            (const uint16_t*) (blob + a.lay.suh[r]), nc, sm);
         return sm.out;
     };
-    set_rows_w<NR, gate_up>(a, gemm, (const uint16_t*) (blob + a.lay.svh[0]), (const uint16_t*) (blob + a.lay.svh[1]),
-                            (const uint16_t*) (blob + a.lay.svh[2]), x, ldx, idx, h, ldh, y, ldy, row, nc, g, gate);
+    set_rows_w<NR, gate_up, kGateReg>(a, gemm, (const uint16_t*) (blob + a.lay.svh[0]),
+                                      (const uint16_t*) (blob + a.lay.svh[1]), (const uint16_t*) (blob + a.lay.svh[2]),
+                                      x, ldx, idx, h, ldh, y, ldy, row, nc, g, gate);
 }
 template <int K2, int cb, bool gate_up, int NR, bool Perm = false>
 __global__ void __launch_bounds__(kThreads) wmma_set_kernel(SetArgs a, const float* x, int ldx, const int* idx,
@@ -2390,10 +2443,10 @@ __global__ void __launch_bounds__(kThreads) wmma_set_kernel(SetArgs a, const flo
 }
 #if defined(STRATA_USE_HIP)
 // gfx11's shaped prompt kernels (wmma_shape): the same, with the compiler fitting the registers to 8 waves a SIMD
-template <int K2, int cb, bool gate_up, int NR, bool Perm>
+template <int K2, int cb, bool gate_up, int NR, bool Perm, int Var = 0>
 __global__ void __launch_bounds__(kThreads) __attribute__((amdgpu_waves_per_eu(8)))
 wmma_set8_kernel(SetArgs a, const float* x, int ldx, const int* idx, uint16_t* h, int ldh, float* y, int ldy) {
-    wmma_set_body<K2, cb, gate_up, NR, Perm>(a, x, ldx, idx, h, ldh, y, ldy);
+    wmma_set_body<K2, cb, gate_up, NR, Perm, Var>(a, x, ldx, idx, h, ldh, y, ldy);
 }
 #endif
 
@@ -3222,6 +3275,16 @@ static bool wmma_shape() {
     return false;
 #endif
 }
+// T22 test: EXL3_SET_VAR=12 (out over xb) or 13 (and the gate in registers) for the shaped kernels; else the PR's
+static int set_var() {
+    static const int v = [] {
+        const char* e = std::getenv("EXL3_SET_VAR");
+        const int x = e != nullptr ? std::atoi(e) : 0, r = x == 12 || x == 13 ? x : 0;
+        std::fprintf(stderr, "exl3: shaped prompt kernels var %d (EXL3_SET_VAR, T22 test)\n", r);
+        return r;
+    }();
+    return v;
+}
 template <int K2, int cb> struct RunWmmaGateUp {
     static void run(const SetArgs& a, const float* x, int ldx, const int* idx, uint16_t* h, int ldh, cudaStream_t s) {
 #if defined(STRATA_USE_HIP)
@@ -3229,8 +3292,17 @@ template <int K2, int cb> struct RunWmmaGateUp {
             if (wmma_shape()) {
                 auto go = [&](auto nr) {
                     constexpr int NR = decltype(nr)::value;
-                    wmma_set8_kernel<K2, cb, true, NR, true><<<dim3((a.max_rows + NR - 1) / NR, a.n_ff / kCols, a.n_exp),
-                                                               kThreads, 0, s>>>(a, x, ldx, idx, h, ldh, nullptr, 0);
+                    auto launch = [&](auto var) {
+                        constexpr int V = decltype(var)::value;
+                        wmma_set8_kernel<K2, cb, true, NR, true, V>
+                            <<<dim3((a.max_rows + NR - 1) / NR, a.n_ff / kCols, a.n_exp), kThreads, 0, s>>>(
+                                a, x, ldx, idx, h, ldh, nullptr, 0);
+                    };
+                    switch (set_var()) {
+                    case 12: launch(std::integral_constant<int, 12>{}); break;
+                    case 13: launch(std::integral_constant<int, 13>{}); break;
+                    default: launch(std::integral_constant<int, 0>{}); break;
+                    }
                 };
                 if (a.max_rows >= 64) go(std::integral_constant<int, 32>{});
                 else go(std::integral_constant<int, 16>{});
@@ -3251,10 +3323,14 @@ template <int K2, int cb> struct RunWmmaDown {
             if (wmma_shape()) {
                 auto go = [&](auto nr) {
                     constexpr int NR = decltype(nr)::value;
-                    wmma_set8_kernel<K2, cb, false, NR, true><<<dim3((a.max_rows + NR - 1) / NR, a.n_embd / kCols,
-                                                                     a.n_exp),
-                                                                kThreads, 0, s>>>(a, nullptr, 0, nullptr,
-                                                                                  const_cast<uint16_t*>(h), ldh, y, ldy);
+                    auto launch = [&](auto var) {   // (13 = 12 here: the down has no gate)
+                        constexpr int V = decltype(var)::value;
+                        wmma_set8_kernel<K2, cb, false, NR, true, V>
+                            <<<dim3((a.max_rows + NR - 1) / NR, a.n_embd / kCols, a.n_exp), kThreads, 0, s>>>(
+                                a, nullptr, 0, nullptr, const_cast<uint16_t*>(h), ldh, y, ldy);
+                    };
+                    if (set_var() >= 12) launch(std::integral_constant<int, 12>{});
+                    else launch(std::integral_constant<int, 0>{});
                 };
                 if (a.max_rows >= 64) go(std::integral_constant<int, 32>{});
                 else go(std::integral_constant<int, 16>{});
