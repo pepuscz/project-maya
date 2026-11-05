@@ -3424,7 +3424,9 @@ static bool wmma_v2() {
 #endif
 }
 // EXL3_SET_VAR (HIP gfx11, opt-in, for the kernel benches): 3 K = 2's words by permlane (no LDS stage), 5 the
-// kernels fitted to 8 waves a SIMD, 8 both; unset or 0 the default (EXL3_WMMA_V2 as before).  The same bits.
+// kernels fitted to 8 waves a SIMD, 8 both; 9 each bitrate its best (186b, an RX 7900 XTX): K2 4 at 32 rows a block
+// with 8 (-18 % kernel time), other K2 at 16 rows with 5 (-4 %); unset or 0 the default (EXL3_WMMA_V2 as before).
+// The same bits.
 static int set_var() {
 #if defined(STRATA_USE_HIP)
     static const int v = [] {
@@ -3438,6 +3440,15 @@ static int set_var() {
 }
 template <int K2, int cb> struct RunWmmaGateUp {
     static void run(const SetArgs& a, const float* x, int ldx, const int* idx, uint16_t* h, int ldh, cudaStream_t s) {
+#if defined(STRATA_USE_HIP)
+        if (set_var() == 9) {
+            constexpr int NR = K2 == 4 ? 32 : 16;
+            const dim3 grid((a.max_rows + NR - 1) / NR, a.n_ff / kCols, a.n_exp);
+            wmma_set_occ_kernel<K2, cb, true, NR, K2 == 4 ? 3 : 0><<<grid, kThreads, 0, s>>>(a, x, ldx, idx, h, ldh,
+                                                                                        nullptr, 0);
+            return;
+        }
+#endif
         with_rows([&](auto nr) {
             constexpr int NR = decltype(nr)::value;
             const dim3 grid((a.max_rows + NR - 1) / NR, a.n_ff / kCols, a.n_exp);
@@ -3458,6 +3469,15 @@ template <int K2, int cb> struct RunWmmaGateUp {
 };
 template <int K2, int cb> struct RunWmmaDown {
     static void run(const SetArgs& a, const uint16_t* h, int ldh, float* y, int ldy, cudaStream_t s) {
+#if defined(STRATA_USE_HIP)
+        if (set_var() == 9) {
+            constexpr int NR = K2 == 4 ? 32 : 16;
+            const dim3 grid((a.max_rows + NR - 1) / NR, a.n_embd / kCols, a.n_exp);
+            wmma_set_occ_kernel<K2, cb, false, NR, K2 == 4 ? 3 : 0><<<grid, kThreads, 0, s>>>(
+                a, nullptr, 0, nullptr, const_cast<uint16_t*>(h), ldh, y, ldy);
+            return;
+        }
+#endif
         with_rows([&](auto nr) {
             constexpr int NR = decltype(nr)::value;
             const dim3 grid((a.max_rows + NR - 1) / NR, a.n_embd / kCols, a.n_exp);
