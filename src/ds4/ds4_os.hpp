@@ -586,6 +586,21 @@ inline void pin_self(int cpu) {
     sched_setaffinity(0, sizeof set, &set);
 #endif
 }
+/// The calling thread on the logical CPUs `cpus` (Windows: those of the first 64), and every thread it starts later
+inline void pin_self_to(const std::vector<int>& cpus) {
+#if defined(_WIN32)
+    DWORD_PTR m = 0;
+    for (int c : cpus)
+        if (c >= 0 && c < 64) m |= (DWORD_PTR) 1 << c;
+    if (m != 0) SetThreadAffinityMask(GetCurrentThread(), m);
+#else
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    for (int c : cpus)
+        if (c >= 0 && c < CPU_SETSIZE) CPU_SET(c, &set);
+    sched_setaffinity(0, sizeof set, &set);
+#endif
+}
 inline void pin_thread(std::thread& t, int cpu) {
 #if defined(_WIN32)
     if (cpu >= 0 && cpu < 64) SetThreadAffinityMask((HANDLE) t.native_handle(), (DWORD_PTR) 1 << cpu);

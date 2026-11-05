@@ -1359,6 +1359,7 @@ struct Model::Impl {
     std::vector<std::unique_ptr<Pool>> pools;   // one per NUMA node, its workers on that node's cores
     std::vector<std::vector<int>> cores;        // each node's physical cores
     std::vector<std::vector<os::Core>> core_threads;   // ... each with its logical CPUs and efficiency class
+    std::vector<int> main_cpus;                 // (DS4_MAIN_CORES) the loading thread's CPUs, none of the lane's
     std::string lane_name = "cores";            // the CPU lane's pools: which of lane_cfgs() (tune_lane picks one)
     std::string lane_report;                    // what tune_lane measured
     int NH = 1;                                 // the CPU lane's parts of an expert (the NUMA nodes)
@@ -9325,6 +9326,12 @@ struct Model::Impl {
         for (size_t X = 0; X < c.cpus.size(); ++X) {
             std::vector<int> v = c.cpus[X];
             if (X == 0) v.erase(std::remove(v.begin(), v.end(), svc), v.end());   // (the service thread's)
+            if (X == 0 && !main_cpus.empty())   // (DS4_MAIN_CORES: the loading thread's)
+                v.erase(std::remove_if(v.begin(), v.end(),
+                                       [&](int cpu) {
+                                           return std::find(main_cpus.begin(), main_cpus.end(), cpu) != main_cpus.end();
+                                       }),
+                        v.end());
             if (X == 0 && o.cpu_threads <= 0 && leaves_none && (int) v.size() > spare_cores + 1)
                 v.resize(v.size() - (size_t) spare_cores);
             int nw = (int) v.size();
@@ -9336,6 +9343,25 @@ struct Model::Impl {
     // the CPU lane's workers: lane_cfgs' first (cores), or the one STRATA_DS4_CPU_LANE=<name> asks for; tune_lane may
     // change them once the experts are placed
     void make_pools() {
+        // DS4_MAIN_CORES=<n> (opt-in until measured; 0: off): the first part's last n cores kept from the lane for the
+        // thread that loads the model and then drives the devices (it launches a decode's kernels and waits on them),
+        // and for every thread it starts from here on (the helper's, the lookahead's, the expert cache's).  Unpinned,
+        // with a spinner on every core - the service thread spins all through a decode, each worker 200 us after a job
+        // - it ran on a spinner's SMT sibling or on the spinner's own CPU, and the decode's windows waited for it
+        if (const char* v = ds4_env("DS4_MAIN_CORES");
+            v != nullptr && std::atoi(v) > 0 && main_cpus.empty() && !core_threads.empty()) {
+            const std::vector<os::Core>& p0 = core_threads[0];
+            const int n = std::min(std::atoi(v), (int) p0.size() - 2);   // (the service thread's core and one worker's)
+            for (int i = 0; i < n; ++i)
+                for (int cpu : p0[p0.size() - 1 - (size_t) i].cpus) main_cpus.push_back(cpu);
+            if (!main_cpus.empty()) {
+                os::pin_self_to(main_cpus);
+                std::string s;
+                for (int cpu : main_cpus) s += (s.empty() ? "" : ",") + std::to_string(cpu);
+                std::fprintf(stderr, "ds4: DS4_MAIN_CORES=%d: CPUs %s for this thread and the ones it starts, none of "
+                                     "the CPU lane's\n", n, s.c_str());
+            }
+        }
         const std::vector<LaneCfg> cfgs = lane_cfgs();
         size_t pick = 0;
         if (const char* v = std::getenv("STRATA_DS4_CPU_LANE"))
