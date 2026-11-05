@@ -2140,7 +2140,7 @@ __device__ void rdna4_block_wmma(const uint32_t* tr, int ld, int tc0, int k0, in
 
 // block_gemv for nc <= NR activations (warp w loads activations w, w + 8, ..: in[j] the one at w + 8 j):
 // sm.out[n * kCols + o]
-template <int K2, int cb, int KS, int NR, bool Perm = false, class Input, class Smem>
+template <int K2, int cb, int KS, int NR, bool Perm = false, bool OneXs = false, class Input, class Smem>
 __device__ void block_gemm_w(const uint32_t* __restrict__ tr, int ld, int tc0, int k0, int k1, const Input (&in)[NR / 8],
                              const uint16_t* __restrict__ suh, int nc, Smem& sm) {
 #if defined(EXL3_WMMA_RDNA4)
@@ -2155,11 +2155,11 @@ __device__ void block_gemm_w(const uint32_t* __restrict__ tr, int ld, int tc0, i
     uint32_t* wt = sm.wt + warp * 16 * kWtP11;
     const int nq = (k1 - k0) / kCols;
     uint32_t wc[8][R], wn[8][R];
-    float xv[NJ][4], xs[NJ][4];
+    float xv[NJ][4], xs[OneXs ? 1 : NJ][4];   // (OneXs, T23: suh is the same for every row - one copy)
     load_tiles<K2>(tile, sstride, lane, wc);
 #pragma unroll
     for (int j = 0; j < NJ; ++j)
-        if (warp + 8 * j < nc) chunk_load(in[j], suh, k0, lane, xv[j], xs[j]);
+        if (warp + 8 * j < nc) chunk_load(in[j], suh, k0, lane, xv[j], xs[OneXs ? 0 : j]);
     exl3_f8 c[NB];
 #pragma unroll
     for (int b = 0; b < NB; ++b) c[b] = exl3_f8{};
@@ -2167,13 +2167,13 @@ __device__ void block_gemm_w(const uint32_t* __restrict__ tr, int ld, int tc0, i
         __half* xq = sm.xb + (q & 1) * (NR * kXS);
 #pragma unroll
         for (int j = 0; j < NJ; ++j)
-            if (warp + 8 * j < nc) chunk_store(xv[j], xs[j], lane, xq + (warp + 8 * j) * kXS);
+            if (warp + 8 * j < nc) chunk_store(xv[j], xs[OneXs ? 0 : j], lane, xq + (warp + 8 * j) * kXS);
         __syncthreads();
         if (q + 1 < nq) {
             load_tiles<K2>(tile + (size_t) (q + 1) * 8 * sstride, sstride, lane, wn);
 #pragma unroll
             for (int j = 0; j < NJ; ++j)
-                if (warp + 8 * j < nc) chunk_load(in[j], suh, k0 + (q + 1) * kCols, lane, xv[j], xs[j]);
+                if (warp + 8 * j < nc) chunk_load(in[j], suh, k0 + (q + 1) * kCols, lane, xv[j], xs[OneXs ? 0 : j]);
         }
 #pragma unroll
         for (int s = 0; s < 8; ++s) {
@@ -2410,7 +2410,7 @@ __device__ __forceinline__ void set_rows_w(const SetArgs& a, Gemm&& gemm, const 
     }
 }
 
-template <int K2, int cb, bool gate_up, int NR, bool Perm, bool Shaped = false>
+template <int K2, int cb, bool gate_up, int NR, bool Perm, bool Shaped = false, int Var = 0>
 __device__ __forceinline__ void wmma_set_body(const SetArgs& a, const float* x, int ldx, const int* idx, uint16_t* h,
                                               int ldh, float* y, int ldy) {
 #if defined(EXL3_WMMA_RDNA4)
@@ -2431,7 +2431,7 @@ __device__ __forceinline__ void wmma_set_body(const SetArgs& a, const float* x, 
     const uint8_t* blob = a.wbase + (size_t) e * a.stride;
     auto gemm = [&](int r, const auto& in) -> const float* {
         const int ld = r < 2 ? a.n_ff / 16 : a.n_embd / 16, k1 = r < 2 ? a.n_embd : a.n_ff;
-        block_gemm_w<K2, cb, K2, NR, Perm>((const uint32_t*) (blob + a.lay.trellis[r]), ld, g * 8, 0, k1, in,
+        block_gemm_w<K2, cb, K2, NR, Perm, (Var >= 14)>((const uint32_t*) (blob + a.lay.trellis[r]), ld, g * 8, 0, k1, in,
                                            (const uint16_t*) (blob + a.lay.suh[r]), nc, sm);
         return sm.out;
     };
@@ -2446,10 +2446,16 @@ __global__ void __launch_bounds__(kThreads) wmma_set_kernel(SetArgs a, const flo
 }
 #if defined(STRATA_USE_HIP)
 // gfx11's shaped prompt kernels (wmma_shape): the same, with the compiler fitting the registers to 8 waves a SIMD
-template <int K2, int cb, bool gate_up, int NR, bool Perm>
+template <int K2, int cb, bool gate_up, int NR, bool Perm, int Var = 0>
 __global__ void __launch_bounds__(kThreads) __attribute__((amdgpu_waves_per_eu(8)))
 wmma_set8_kernel(SetArgs a, const float* x, int ldx, const int* idx, uint16_t* h, int ldh, float* y, int ldy) {
-    wmma_set_body<K2, cb, gate_up, NR, Perm, true>(a, x, ldx, idx, h, ldh, y, ldy);
+    wmma_set_body<K2, cb, gate_up, NR, Perm, true, Var>(a, x, ldx, idx, h, ldh, y, ldy);
+}
+// T23 test: 64-row blocks fitted to 6 waves a SIMD (their LDS, ~41 KB, lets 3 blocks a WGP run: 6 waves)
+template <int K2, int cb, bool gate_up, int NR, bool Perm, int Var>
+__global__ void __launch_bounds__(kThreads) __attribute__((amdgpu_waves_per_eu(6)))
+wmma_set6_kernel(SetArgs a, const float* x, int ldx, const int* idx, uint16_t* h, int ldh, float* y, int ldy) {
+    wmma_set_body<K2, cb, gate_up, NR, Perm, true, Var>(a, x, ldx, idx, h, ldh, y, ldy);
 }
 #endif
 
@@ -3279,18 +3285,41 @@ static bool wmma_shape() {
     return false;
 #endif
 }
+// T23 test (EXL3_SET_VAR): 14 = sets of 128 rows and more in 64-row blocks at 6 waves, 15 = the same at 8 waves,
+// 16 = the PR's blocks; all three keep one copy of suh's scales (OneXs). Else the PR's kernels
+static int set_var() {
+    static const int v = [] {
+        const char* e = std::getenv("EXL3_SET_VAR");
+        const int x = e != nullptr ? std::atoi(e) : 0, r = x >= 14 && x <= 16 ? x : 0;
+        std::fprintf(stderr, "exl3: shaped prompt kernels var %d (EXL3_SET_VAR, T23 test)\n", r);
+        return r;
+    }();
+    return v;
+}
 template <int K2, int cb> struct RunWmmaGateUp {
     static void run(const SetArgs& a, const float* x, int ldx, const int* idx, uint16_t* h, int ldh, cudaStream_t s) {
 #if defined(STRATA_USE_HIP)
         if constexpr (K2 == 4 || K2 == 5)
             if (wmma_shape()) {
-                auto go = [&](auto nr) {
-                    constexpr int NR = decltype(nr)::value;
-                    wmma_set8_kernel<K2, cb, true, NR, true><<<dim3((a.max_rows + NR - 1) / NR, a.n_ff / kCols, a.n_exp),
-                                                               kThreads, 0, s>>>(a, x, ldx, idx, h, ldh, nullptr, 0);
+                auto go = [&](auto nr, auto var, auto w6) {
+                    constexpr int NR = decltype(nr)::value, V = decltype(var)::value;
+                    const dim3 grid((a.max_rows + NR - 1) / NR, a.n_ff / kCols, a.n_exp);
+                    if constexpr (decltype(w6)::value)
+                        wmma_set6_kernel<K2, cb, true, NR, true, V><<<grid, kThreads, 0, s>>>(a, x, ldx, idx, h, ldh,
+                                                                                            nullptr, 0);
+                    else
+                        wmma_set8_kernel<K2, cb, true, NR, true, V><<<grid, kThreads, 0, s>>>(a, x, ldx, idx, h, ldh,
+                                                                                            nullptr, 0);
                 };
-                if (a.max_rows >= 64) go(std::integral_constant<int, 32>{});
-                else go(std::integral_constant<int, 16>{});
+                using I = std::integral_constant<int, 0>;
+                using F = std::false_type;
+                const int v = set_var();
+                if (v == 14 && a.max_rows >= 128) go(std::integral_constant<int, 64>{}, std::integral_constant<int, 14>{}, std::true_type{});
+                else if (v == 15 && a.max_rows >= 128) go(std::integral_constant<int, 64>{}, std::integral_constant<int, 15>{}, F{});
+                else if (v != 0 && a.max_rows >= 64) go(std::integral_constant<int, 32>{}, std::integral_constant<int, 16>{}, F{});
+                else if (v != 0) go(std::integral_constant<int, 16>{}, std::integral_constant<int, 16>{}, F{});
+                else if (a.max_rows >= 64) go(std::integral_constant<int, 32>{}, I{}, F{});
+                else go(std::integral_constant<int, 16>{}, I{}, F{});
                 return;
             }
 #endif
@@ -3306,15 +3335,25 @@ template <int K2, int cb> struct RunWmmaDown {
 #if defined(STRATA_USE_HIP)
         if constexpr (K2 == 4 || K2 == 5)
             if (wmma_shape()) {
-                auto go = [&](auto nr) {
-                    constexpr int NR = decltype(nr)::value;
-                    wmma_set8_kernel<K2, cb, false, NR, true><<<dim3((a.max_rows + NR - 1) / NR, a.n_embd / kCols,
-                                                                     a.n_exp),
-                                                                kThreads, 0, s>>>(a, nullptr, 0, nullptr,
-                                                                                  const_cast<uint16_t*>(h), ldh, y, ldy);
+                auto go = [&](auto nr, auto var, auto w6) {
+                    constexpr int NR = decltype(nr)::value, V = decltype(var)::value;
+                    const dim3 grid((a.max_rows + NR - 1) / NR, a.n_embd / kCols, a.n_exp);
+                    if constexpr (decltype(w6)::value)
+                        wmma_set6_kernel<K2, cb, false, NR, true, V><<<grid, kThreads, 0, s>>>(
+                            a, nullptr, 0, nullptr, const_cast<uint16_t*>(h), ldh, y, ldy);
+                    else
+                        wmma_set8_kernel<K2, cb, false, NR, true, V><<<grid, kThreads, 0, s>>>(
+                            a, nullptr, 0, nullptr, const_cast<uint16_t*>(h), ldh, y, ldy);
                 };
-                if (a.max_rows >= 64) go(std::integral_constant<int, 32>{});
-                else go(std::integral_constant<int, 16>{});
+                using I = std::integral_constant<int, 0>;
+                using F = std::false_type;
+                const int v = set_var();
+                if (v == 14 && a.max_rows >= 128) go(std::integral_constant<int, 64>{}, std::integral_constant<int, 14>{}, std::true_type{});
+                else if (v == 15 && a.max_rows >= 128) go(std::integral_constant<int, 64>{}, std::integral_constant<int, 15>{}, F{});
+                else if (v != 0 && a.max_rows >= 64) go(std::integral_constant<int, 32>{}, std::integral_constant<int, 16>{}, F{});
+                else if (v != 0) go(std::integral_constant<int, 16>{}, std::integral_constant<int, 16>{}, F{});
+                else if (a.max_rows >= 64) go(std::integral_constant<int, 32>{}, I{}, F{});
+                else go(std::integral_constant<int, 16>{}, I{}, F{});
                 return;
             }
 #endif
