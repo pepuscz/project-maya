@@ -2523,12 +2523,24 @@ struct Model::Impl {
     bool read_blob_file(const Layer& l, int e, uint8_t* blob, std::vector<uint8_t>& region, bool cached = false) const {
         if (l.lay.fmt == gg::kFmtMXFP4) return read_mx_file(l, e, blob, cached);
         region.resize(l.region_bytes[(size_t) e]);
+        // DS4_LEND_DIRECT=1 (opt-in until measured): an uncached read past the page cache (O_DIRECT through an aligned
+        // staging, copy_direct; buffered where that fails).  The lend's hand-back read its ~6 GB a buffered read-ahead
+        // window at a time from a cold drive - 1.1-1.6 GB/s on a USB4 NVMe, 3-6 s before the first token - and dropped
+        // the pages again after; large unbuffered reads run near the drive's speed and leave the page cache alone
+        static const bool direct = [] {
+            const char* v = ds4_env("DS4_LEND_DIRECT");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
+        thread_local std::vector<uint8_t> dstage;
+        const int f = l.region_file[(size_t) e];
         const bool read = e < (int) l.esplit.size() && l.esplit[(size_t) e]
                               ? read_split(l, e, region.data())
-                              : cached ? os::pread_full(pk.fds[(size_t) l.region_file[(size_t) e]], region.data(),
-                                                        region.size(), l.region_off[(size_t) e])
-                                       : pk.read_at(l.region_file[(size_t) e], l.region_off[(size_t) e], region.size(),
-                                                    region.data());
+                              : cached ? os::pread_full(pk.fds[(size_t) f], region.data(), region.size(),
+                                                        l.region_off[(size_t) e])
+                                       : (direct && (size_t) f < pk.dfds.size() &&
+                                          os::copy_direct(pk.dfds[(size_t) f], l.region_off[(size_t) e], region.size(),
+                                                          region.data(), dstage)) ||
+                                             pk.read_at(f, l.region_off[(size_t) e], region.size(), region.data());
         if (read) repack(l, e, region.data(), blob);
         return read;
     }
@@ -19733,7 +19745,7 @@ struct Model::Impl {
                     const int e = jobs[i].e;
                     if (l.nm > 1) {   // (DS4_TP_BORROW) each member its part
                         uint8_t* half = rf_half[(size_t) t];
-                        bool ok = l.blob <= rf_bytes && read_blob_file(l, e, stage, region), same = true;
+                        bool ok = l.blob <= rf_bytes && read_blob_file(l, e, stage, region, cached), same = true;
                         const bool read = ok;   // (a read that fails: the CPU lane takes it - the file has it)
                         for (int m = 0; m < l.nm && ok; ++m) {
                             const Layer& x = member(l, m);
