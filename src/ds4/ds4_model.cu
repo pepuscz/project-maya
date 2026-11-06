@@ -5823,6 +5823,7 @@ struct Model::Impl {
                         continue;
                     }
                     if (x3_pool(l0, e) != nullptr) continue;   // (DS4_FLOW_HELPER: out of the pool, nothing to read)
+                    if (!l0.wcopy.empty() && l0.wcopy[(size_t) e] != nullptr) continue;   // (DS4_WARM_COPY: in RAM)
                     os::advise(pk.fds[(size_t) l0.region_file[(size_t) e]], l0.region_off[(size_t) e], l0.region_bytes[(size_t) e], true);
                     nb += (double) l0.region_bytes[(size_t) e];
                 }
@@ -5869,6 +5870,10 @@ struct Model::Impl {
             return true;
         }
         if (l.lay.fmt == gg::kFmtMXFP4) return l.nm > 1 ? read_mx_part(l, e, mi, si) : read_mx(l, e, si);
+        if (!l.wcopy.empty() && l.wcopy[(size_t) e] != nullptr) {   // (DS4_WARM_COPY: its region out of its copy)
+            std::memcpy(si, l.wcopy[(size_t) e], l.region_bytes[(size_t) e]);
+            return true;
+        }
         return pk.read_at(l.region_file[(size_t) e], l.region_off[(size_t) e], l.region_bytes[(size_t) e], si);
     }
     // (DS4_FLOW_HELPER_CHECK) an EXL3 item staged out of the pool against its file region repacked the same way
