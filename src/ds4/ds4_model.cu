@@ -14189,9 +14189,18 @@ struct Model::Impl {
             double share;
         };
         std::vector<Cand> c;
+        // DS4_HELPER_DRAFT=1 (opt-in until measured; EXL3): the DSpark blocks' experts without a VRAM slot are
+        // candidates too, ranked with the trunk's by their share of their layer - a block is one device's, so the
+        // service thread answers its picks as a trunk layer's of one GPU.  Without it they stay on the CPU lane, which
+        // the drafter's every round waits on
+        static const bool helper_draft = [] {
+            const char* v = ds4_env("DS4_HELPER_DRAFT");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
         for (const Layer& l : L) {
             const bool supported = pk.gguf ? helper_layer(l)
-                                            : !l.mtp && l.n_cls == 1 && l.lay.fmt == 0;
+                                            : (!l.mtp || (helper_draft && l.nm == 1)) && l.n_cls == 1 &&
+                                                  l.lay.fmt == 0;
             if (!supported) continue;
             const uint32_t* p = prof.data() + (size_t) l.il * g.n_exp;
             double sum = 0;
