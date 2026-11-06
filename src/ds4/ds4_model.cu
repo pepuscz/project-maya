@@ -14279,7 +14279,15 @@ struct Model::Impl {
             for (int e = 0; e < l.n_exp; ++e)
                 if (l.slot[(size_t) e] < 0) c.push_back({l.il, e, sum > 0 ? p[e] / sum : 0.0});
         }
-        std::stable_sort(c.begin(), c.end(), [](const Cand& a, const Cand& b) { return a.share > b.share; });
+        // (DS4_HELPER_DRAFT: a block's experts first - the drafter runs every round, and its hottest are in VRAM
+        //  already, so by their share the rest lost the pool's last places to the trunk's and stayed on the CPU lane:
+        //  61 of a request's 495 drafter picks with a 109 GB pool.  The shares themselves stay as they are: the load
+        //  says how much of the routing the pool covers from them)
+        std::stable_sort(c.begin(), c.end(), [&](const Cand& a, const Cand& b) {
+            const bool da = helper_draft && L[(size_t) a.layer].mtp, db = helper_draft && L[(size_t) b.layer].mtp;
+            if (da != db) return da;
+            return a.share > b.share;
+        });
         // DS4_HELPER_RECENT: hr_want slots of each layer it takes experts of, carved first (the profile's coldest of
         // its pool give way) - all of them inside DS4_HELPER_GB, refused before any upload if they do not fit
         size_t hr_bytes = 0;
