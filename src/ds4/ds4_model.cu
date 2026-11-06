@@ -916,6 +916,7 @@ struct Layer {
         int k[3], n[3];
     } hl;
     std::vector<std::array<uint8_t*, 4>> hh;     // expert -> its parts on the nodes
+    std::vector<uint8_t*> wcopy;                 // (DS4_WARM_COPY) expert -> its file region copied into RAM, or null
     // the expert cache: one VRAM slot and one set of host parts kept free, so an expert can move in while the one it
     // replaces moves out; heat is how much each expert was used lately (the profile's share to start with)
     int n_slots = 0, spare_vram = -1;
@@ -1480,6 +1481,10 @@ struct Model::Impl {
     uint8_t* file_part(const Layer& l, int e) const {
         return pk.maps[(size_t) l.region_file[(size_t) e]].first + l.region_off[(size_t) e];
     }
+    // where the CPU lane reads expert e in place: its RAM copy (DS4_WARM_COPY), else its file's mapping
+    uint8_t* host_part(const Layer& l, int e) const {
+        return !l.wcopy.empty() && l.wcopy[(size_t) e] != nullptr ? l.wcopy[(size_t) e] : file_part(l, e);
+    }
     // host side of the CPU lane, a window's rows
     float *h_x = nullptr, *h_w = nullptr, *h_part = nullptr;
     int* h_idx = nullptr;
@@ -1839,6 +1844,7 @@ struct Model::Impl {
                 if (!os::in_ram(mx_mat(l, e, r), mx_part_bytes(l, r))) return false;
             return true;
         }
+        if (!l.wcopy.empty() && l.wcopy[(size_t) e] != nullptr) return true;
         return !file_experts || os::in_ram(file_part(l, e), l.blob);
     }
     // STRATA_DS4_DISK_SKIP_AUTO=1 (with DISK_SKIP_W; experimental, off by default): DISK_SKIP_W only while the model is
@@ -9003,16 +9009,47 @@ struct Model::Impl {
             std::stable_sort(cand.begin(), cand.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
             int drafts = 0;
             uint64_t draft_bytes = 0;
+            std::vector<Job> warmed;   // (the read-ahead's experts, in its order)
             for (const auto& c : cand) {
                 const uint64_t b = L[(size_t) c.second.layer].region_bytes[(size_t) c.second.e];
                 if (warm + b > warm_bytes) break;
                 warm += b;
                 jobs.push_back(c.second);
+                warmed.push_back(c.second);
                 if (L[(size_t) c.second.layer].mtp) ++drafts, draft_bytes += b;
             }
             if (warm_draft)
                 std::fprintf(stderr, "ds4: the read-ahead takes the DSpark blocks' %d CPU-lane experts first (%.2f GB of "
                                      "%.1f; DS4_WARM_DRAFT)\n", drafts, draft_bytes / 1e9, warm / 1e9);
+            // DS4_WARM_COPY=1 (opt-in until measured): the read-ahead's experts copied into RAM of the engine's own
+            // (their file pages dropped again) and the CPU lane reading them there, instead of the page cache - which
+            // a load's ~150 GB of reads and a long prompt's lend left holding them or not from one load to the next
+            // (a decode then read them back from the drive: 6 -> 16 MB a token, 68 -> 44 tok/s at 16K).  The same
+            // bytes in the same layout; an expert the cache moves to VRAM and back returns to its copy (host_part)
+            static const bool warm_copy = [] {
+                const char* v = ds4_env("DS4_WARM_COPY");
+                return v != nullptr && std::atoi(v) != 0;
+            }();
+            if (warm_copy && warm > 0) {
+                uint8_t* arena = (uint8_t*) node_map((size_t) warm, -1, 1);
+                if (arena == nullptr) {
+                    std::fprintf(stderr, "ds4: DS4_WARM_COPY: %.1f GB of RAM not given - the page cache, as before\n",
+                                 warm / 1e9);
+                } else {
+                    uint64_t off = 0;
+                    for (const Job& j : warmed) {   // (exactly the experts the load reads for the read-ahead)
+                        Layer& l = L[(size_t) j.layer];
+                        const int e = j.e;
+                        const uint64_t b = l.region_bytes[(size_t) e];
+                        if (e < (int) l.esplit.size() && l.esplit[(size_t) e]) continue;   // (across two files: in place)
+                        if (l.wcopy.empty()) l.wcopy.assign((size_t) l.n_exp, nullptr);
+                        l.wcopy[(size_t) e] = arena + off;
+                        off += b;
+                    }
+                    std::fprintf(stderr, "ds4: the CPU lane's read-ahead in RAM of its own, not the page cache: %.1f GB "
+                                         "(DS4_WARM_COPY)\n", off / 1e9);
+                }
+            }
         }
         std::sort(jobs.begin(), jobs.end(), [&](const Job& a, const Job& b) {
             const Layer &la = L[(size_t) a.layer], &lb = L[(size_t) b.layer];
@@ -9140,6 +9177,11 @@ struct Model::Impl {
                         }
                         if (drop_cache)
                             os::advise(pk.fds[(size_t) l.region_file[(size_t) e]], l.region_off[(size_t) e], l.region_bytes[(size_t) e], false);
+                    } else if (file_experts && !l.wcopy.empty() && l.wcopy[(size_t) e] != nullptr) {
+                        // (DS4_WARM_COPY: the region as the file holds it, into its copy; the pages are dead then)
+                        std::memcpy(l.wcopy[(size_t) e], region.data(), l.region_bytes[(size_t) e]);
+                        os::advise(pk.fds[(size_t) l.region_file[(size_t) e]], l.region_off[(size_t) e],
+                                   l.region_bytes[(size_t) e], false);
                     } else if (!file_experts) {
                         for (int X = 0; X < NH; ++X) repack_part(l, region.data(), X, l.hh[(size_t) e][(size_t) X]);
                         // copied into RAM: the pages are dead.  In place (file_experts) the CPU lane's experts *are*
@@ -9162,6 +9204,9 @@ struct Model::Impl {
             err = ferr;
             return false;
         }
+        for (Layer& l : L)   // (DS4_WARM_COPY: the CPU lane reads the copies, filled above)
+            for (size_t e = 0; e < l.wcopy.size(); ++e)
+                if (l.wcopy[e] != nullptr && l.slot[e] < 0) l.host[e] = l.hh[e][0] = l.wcopy[e];
         if (file_experts)
             std::fprintf(stderr, "ds4: experts loaded in %.1f s (%.1f GB of the CPU lane's read ahead)\n",
                          (now_ms() - t0) / 1000.0, warm / 1e9);
@@ -12151,7 +12196,7 @@ struct Model::Impl {
             if (l.lay.fmt == gg::kFmtMXFP4) {   // (the file has it)
                 l.host[(size_t) sw.out] = (uint8_t*) mx_mat(l, sw.out, 0);
             } else if (file_experts) {   // (back to its pages in the file)
-                l.hh[(size_t) sw.out] = {file_part(l, sw.out), nullptr, nullptr, nullptr};
+                l.hh[(size_t) sw.out] = {host_part(l, sw.out), nullptr, nullptr, nullptr};
                 l.host[(size_t) sw.out] = l.hh[(size_t) sw.out][0];
             } else {
                 l.hh[(size_t) sw.out] = l.spare_host;
@@ -12398,8 +12443,9 @@ struct Model::Impl {
                     }
                     if (n.lay.fmt == gg::kFmtMXFP4)
                         for (int q = 0; q < 3; ++q) pf_want.push_back({mx_mat(n, e, q), mx_part_bytes(n, q)});
-                    else if (!(e < (int) n.esplit.size() && n.esplit[(size_t) e]))   // (EXL3: its file region; one
-                        pf_want.push_back({file_part(n, e), n.region_bytes[(size_t) e]});   //  across two files: none)
+                    else if (!(e < (int) n.esplit.size() && n.esplit[(size_t) e]) &&   // (EXL3: its file region; one
+                             (n.wcopy.empty() || n.wcopy[(size_t) e] == nullptr))   //  across two files or in RAM: none)
+                        pf_want.push_back({file_part(n, e), n.region_bytes[(size_t) e]});
                     ip_note_expert(n, e);   // (the Windows trimmer: prefetched pages enter this process's working set)
                 }
         }
@@ -19742,7 +19788,7 @@ struct Model::Impl {
             ++n_bad;   // (to the CPU lane: the file has it)
             l.slot[(size_t) e] = -1;
             if (l.lay.fmt == gg::kFmtMXFP4) l.host[(size_t) e] = (uint8_t*) mx_mat(l, e, 0);
-            else l.host[(size_t) e] = l.hh[(size_t) e][0] = file_part(l, e);   // (an EXL3 expert in place: as the load)
+            else l.host[(size_t) e] = l.hh[(size_t) e][0] = host_part(l, e);   // (an EXL3 expert in place: as the load)
             --l.n_vram;
             const unsigned long long zero = 0;
             for (int m = 0; m < l.nm; ++m) {   // (a group's: every member's table - DS4_TP_BORROW)
