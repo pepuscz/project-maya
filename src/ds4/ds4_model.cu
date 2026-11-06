@@ -14668,12 +14668,14 @@ struct Model::Impl {
         }
     }
 
-    // (the window's plan) its layers' requests to the helper's thread, in seq order
-    void helper_window(int T, const WinPlan& wp) {
+    // (the window's plan) its layers' requests to the helper's thread, in seq order - the trunk's, or (DS4_HELPER_DRAFT)
+    // a draft's DSpark blocks [il0, il1)
+    void helper_window(int T, const WinPlan& wp, int il0 = 0, int il1 = -1) {
         if (helper_dead.load(std::memory_order_relaxed)) return;
+        if (il1 < 0) il1 = g.nl;
         {
             std::lock_guard<std::mutex> lk(hq_mu);
-            for (int il = 0; il < g.nl; ++il)
+            for (int il = il0; il < il1; ++il)
                 if (L[(size_t) il].helper_tab != nullptr) hq.push_back({il, wp.seq[il], T});
         }
         hq_cv.notify_one();
@@ -16692,6 +16694,9 @@ struct Model::Impl {
             dp.seq[il] = ++seq_issued;
             layer_of[dp.seq[il] % kRing].store(il, std::memory_order_release);
         }
+        // (DS4_HELPER_DRAFT: a block with experts in the helper's pool - its requests to the helper's thread, as a
+        //  trunk window's; without them the service thread waited for a helper that was never asked)
+        if (helper_n > 0 && dp.async) helper_window(T, dp, g.nl, g.nl + g.n_mtp);
         const size_t hs = (size_t) T * H * D, rs = (size_t) g.win * g.hd;
         if (dump_d != nullptr && h_dump == nullptr &&
             (!halloc(h_dump, (size_t) g.n_mtp * kWin * H * D, err) || !halloc(h_dump_ring, (size_t) g.n_mtp * rs, err)))
