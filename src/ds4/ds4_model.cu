@@ -9072,21 +9072,36 @@ struct Model::Impl {
                 if (!file_experts || l.slot[(size_t) e] >= 0 || helper_owned(l, e)) jobs.push_back({l.il, e});
         uint64_t warm = 0;
         if (file_experts) {
+            // DS4_WARM_DRAFT=1 (opt-in until measured): the DSpark blocks' CPU-lane experts first, whatever their
+            // share - the drafter runs every decode round and a prompt never reads them (nor the helper: helper_layer),
+            // so ranked by share with the trunk's they came in from the drive at a decode's first rounds
+            static const bool warm_draft = [] {
+                const char* v = ds4_env("DS4_WARM_DRAFT");
+                return v != nullptr && std::atoi(v) != 0;
+            }();
             std::vector<std::pair<double, Job>> cand;
             for (const Layer& l : L) {
                 const uint32_t* p = prof.data() + (size_t) l.il * g.n_exp;
                 double sum = 0;
                 for (int e = 0; e < l.n_exp; ++e) sum += p[e];
+                const double first = warm_draft && l.mtp ? 2.0 : 0.0;   // (a share is at most 1: above every trunk one, ties too)
                 for (int e = 0; e < l.n_exp; ++e)
-                    if (l.slot[(size_t) e] < 0 && !helper_owned(l, e)) cand.push_back({sum > 0 ? p[e] / sum : 0.0, Job{l.il, e}});
+                    if (l.slot[(size_t) e] < 0 && !helper_owned(l, e))
+                        cand.push_back({first + (sum > 0 ? p[e] / sum : 0.0), Job{l.il, e}});
             }
             std::stable_sort(cand.begin(), cand.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+            int drafts = 0;
+            uint64_t draft_bytes = 0;
             for (const auto& c : cand) {
                 const uint64_t b = L[(size_t) c.second.layer].region_bytes[(size_t) c.second.e];
                 if (warm + b > warm_bytes) break;
                 warm += b;
                 jobs.push_back(c.second);
+                if (L[(size_t) c.second.layer].mtp) ++drafts, draft_bytes += b;
             }
+            if (warm_draft)
+                std::fprintf(stderr, "ds4: the read-ahead takes the DSpark blocks' %d CPU-lane experts first (%.2f GB of "
+                                     "%.1f; DS4_WARM_DRAFT)\n", drafts, draft_bytes / 1e9, warm / 1e9);
         }
         std::sort(jobs.begin(), jobs.end(), [&](const Job& a, const Job& b) {
             const Layer &la = L[(size_t) a.layer], &lb = L[(size_t) b.layer];

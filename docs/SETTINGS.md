@@ -1539,6 +1539,7 @@ lead's requests take them and each pick's sum joins the lead's CPU part once, be
 | `MAYA_DS4_HELPER` | off | the helper's visible GPU index (outside `--gpus` unless shared mode is enabled); with `MAYA_DS4_HELPER_GB`. Linux only (tested); Windows + AMD untested |
 | `MAYA_DS4_HELPER_GB` | - | its experts' pool, GB |
 | `MAYA_DS4_WARM_CAP_GB` | - | required with the helper: the load's experts in host RAM, GB, beside the pool (an integrated GPU's pool is host RAM too); ignored under `DS4_REQUIRE_ALL_RAM=1` (every expert in RAM) |
+| `MAYA_DS4_WARM_DRAFT` | off | `1` (in place, `--mmap-experts on`): the load's read-ahead takes the DSpark blocks' CPU-lane experts first, whatever their share - the drafter runs every decode round, and neither a prompt nor the helper's pool reads them, so ranked with the trunk's they came in from the drive at a decode's first rounds. Page cache only; the same outputs |
 | `MAYA_DS4_HELPER_CHECK` | off | `1`: at load, two tokens per expert format through the helper against the CPU lane, and its grouped window path against its per-token one, bit for bit |
 
 Uniform EXL3 layers can also use the helper, including layers sharded across a target TP group. Enable
