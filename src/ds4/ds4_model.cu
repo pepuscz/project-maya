@@ -1366,6 +1366,13 @@ struct Model::Impl {
     // what fits) instead of copied into RAM, and how much of them the load reads ahead (the most-routed first)
     bool file_experts = false;
     uint64_t warm_bytes = 0;
+    // DS4_EXL3_PF=1: the in-place EXL3 entries' file regions a CPU-lane call is about to read, handed to a thread of
+    // their own (x3pf_loop) - the cold ones asked for there (os::prefetch), the lane's threads computing meanwhile
+    std::vector<std::pair<const void*, size_t>> x3pf_q;
+    std::mutex x3pf_mu;
+    std::condition_variable x3pf_cv;
+    std::thread x3pf_th;
+    bool x3pf_quit = false;
     // DS4_TP_GGUF_UNEVEN=1: a GGUF group's members take its experts' FFN in whole blocks of tp_blk values, as even as
     // they go (splitb, the odd blocks going round the members layer by layer) instead of only even shares
     bool tp_uneven = false;
@@ -2354,6 +2361,12 @@ struct Model::Impl {
 
     ~Impl() {
         if (rf_pre.joinable()) rf_pre.join();
+        {   // (DS4_EXL3_PF) before the mappings it reads the residency of go
+            std::lock_guard<std::mutex> lk(x3pf_mu);
+            x3pf_quit = true;
+        }
+        x3pf_cv.notify_all();
+        if (x3pf_th.joinable()) x3pf_th.join();
         blas_skip.store(true);
         if (blas_th.joinable()) blas_th.join();   // (it uses the cuBLAS handles destroyed below)
         {
@@ -11328,6 +11341,25 @@ struct Model::Impl {
         phase(3);
     }
 
+    // (DS4_EXL3_PF) the queued regions: the ones not in the page cache (os::resident_sampled) asked for at once
+    // (os::prefetch: madvise WILLNEED / PrefetchVirtualMemory); one the lane has read by then costs only its check
+    void x3pf_loop() {
+        std::vector<std::pair<const void*, size_t>> got, cold;
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> lk(x3pf_mu);
+                x3pf_cv.wait(lk, [&] { return x3pf_quit || !x3pf_q.empty(); });
+                if (x3pf_quit) return;
+                got.swap(x3pf_q);
+            }
+            cold.clear();
+            for (const auto& x : got)
+                if (!os::resident_sampled(x.first, x.second)) cold.push_back(x);
+            os::prefetch(cold);
+            got.clear();
+        }
+    }
+
     void cpu_experts(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx = 0,
                      const int* ord = nullptr) {
         if (ldx == 0) ldx = (size_t) g.dim;
@@ -11361,6 +11393,24 @@ struct Model::Impl {
         c.accd = c_accd.data();
         c.yd = c_yd.data();
         if (!c.cnt) c.alloc_counters(2);
+        // DS4_EXL3_PF=1 (opt-in): an expert read in place has its whole region asked for at once, as the GGUF paths'
+        // os::prefetch_cold, so a cold one comes in as large reads side by side instead of a read-ahead window at a
+        // time under the trellis walk.  On x3pf_loop's thread, and only the regions not in the page cache: asked for
+        // here, in the call, the hint cost 3.5 % of the decode with every expert cached (a 2x RX 7900 XTX box, no
+        // helper).  I/O hints only; the same outputs.  Off: none, as before
+        static const bool x3_pf = [] {
+            const char* v = ds4_env("DS4_EXL3_PF");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
+        if (x3_pf && file_experts) {
+            std::lock_guard<std::mutex> lk(x3pf_mu);
+            for (const Ent& en : ents)
+                if (!(en.e < (int) l.esplit.size() && l.esplit[(size_t) en.e]) &&
+                    l.hh[(size_t) en.e][0] == file_part(l, en.e))   // (in place: not a VRAM, RAM or split one)
+                    x3pf_q.push_back({file_part(l, en.e), (size_t) l.region_bytes[(size_t) en.e]});
+            if (!x3pf_th.joinable()) x3pf_th = std::thread([this] { x3pf_loop(); });
+            x3pf_cv.notify_one();
+        }
         // DS4_CPU_SPLIT_COLS=1 (MAYA_DS4_CPU_SPLIT_COLS): a call of few entries (a decoded token's one or two experts a
         // layer) has its gate / up and down pieces cut by columns too, so more of the lane's threads share it
         // (ds4_cpu_exl3.hpp, exl3_split_runs: the threads of the smallest node's batch) - every sum the same, bit for
