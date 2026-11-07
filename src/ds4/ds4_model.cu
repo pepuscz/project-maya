@@ -379,12 +379,14 @@ struct Pack {
     std::vector<std::pair<uint8_t*, size_t>> maps;   // file -> its read-only mapping (map(): the experts in place)
     std::vector<os::fd_t> dfds;   // (gguf) file -> unbuffered (os::open_direct; kBadFd: buffered reads only)
     std::vector<os::fd_t> pfds;   // (gguf) file -> for reads from many threads at once (os::open_par)
+    std::vector<os::fd_t> xdfds;  // (an EXL3 pack, DS4_LEND_DIRECT) file -> unbuffered, for the hand-back's reads only
 
     ~Pack() {
         for (auto& m : maps) os::unmap(m.first, m.second);
         for (os::fd_t fd : fds) os::close_fd(fd);
         for (os::fd_t fd : dfds) os::close_fd(fd);
         for (os::fd_t fd : pfds) os::close_fd(fd);
+        for (os::fd_t fd : xdfds) os::close_fd(fd);
     }
     // file i mapped whole, read-only (once; not thread-safe: called while loading)
     const uint8_t* map(int file) {
@@ -469,6 +471,12 @@ struct Pack {
                 dfds.push_back(os::open_direct(model_dir + "/" + files[i]));
                 pfds.push_back(os::open_par(model_dir + "/" + files[i]));
             }
+        else {   // (DS4_LEND_DIRECT: read_blob_file's own unbuffered descriptors; kBadFd where the filesystem refuses)
+            const char* v = std::getenv("STRATA_DS4_LEND_DIRECT");
+            if (v == nullptr) v = std::getenv("DS4_LEND_DIRECT");
+            if (v != nullptr && std::atoi(v) != 0)
+                for (const std::string& fn : files) xdfds.push_back(os::open_direct(model_dir + "/" + fn));
+        }
         // the Engram tables
         std::FILE* e = std::fopen((d + "/engram.bin").c_str(), "rb");
         if (e == nullptr) {
@@ -2136,6 +2144,7 @@ struct Model::Impl {
     }
     std::vector<uint8_t*> rf_stage, rf_half;   // (rf_half: DS4_TP_BORROW's member parts, one a thread)
     std::thread rf_pre;   // (borrow_begin: the lent experts' file ranges asked for while the prompt runs; borrow_end joins it)
+    mutable std::atomic<int64_t> lend_direct_n{0}, lend_buffered_n{0};   // (DS4_LEND_DIRECT: a hand-back's reads, each way)
     bool rf_pre_cached = false;   // (the lent experts' ranges were asked for: borrow_end reads them through the page cache)
     // DS4_LENT_RAM_GB (off: 0): pinned RAM copies of the experts a prompt's buffers lie over.  Taken from their slots
     // just before the buffers overwrite them (borrow_begin), once an expert; while lent they are DMA'd from the copy
@@ -2536,12 +2545,29 @@ struct Model::Impl {
     bool read_blob_file(const Layer& l, int e, uint8_t* blob, std::vector<uint8_t>& region, bool cached = false) const {
         if (l.lay.fmt == gg::kFmtMXFP4) return read_mx_file(l, e, blob, cached);
         region.resize(l.region_bytes[(size_t) e]);
-        const bool read = e < (int) l.esplit.size() && l.esplit[(size_t) e]
-                              ? read_split(l, e, region.data())
-                              : cached ? os::pread_full(pk.fds[(size_t) l.region_file[(size_t) e]], region.data(),
-                                                        region.size(), l.region_off[(size_t) e])
-                                       : pk.read_at(l.region_file[(size_t) e], l.region_off[(size_t) e], region.size(),
-                                                    region.data());
+        // DS4_LEND_DIRECT=1 (opt-in until measured; an EXL3 pack - its own unbuffered descriptors, Pack::xdfds): an
+        // uncached read of an expert's region past the page cache (O_DIRECT through an aligned staging, copy_direct;
+        // buffered where that fails).  Its one caller is the lend's hand-back, which read its ~6 GB a buffered read-
+        // ahead window at a time from a cold drive - 1.1-1.6 GB/s on a USB4 NVMe, 3-6 s before the first token - and
+        // dropped the pages again after; large unbuffered reads run near the drive's speed and leave the page cache be.
+        // Only a region not in the page cache (os::resident_sampled over its mapping) goes past it: one the load or the
+        // prompt left cached is copied from there - read from the drive instead, a 6.3 GB hand-back took 1.76 s
+        // against 1.10 s (2x RX 7900 XTX + Radeon 8060S, a 109 GB helper pool)
+        thread_local std::vector<uint8_t> dstage;
+        const int f = l.region_file[(size_t) e];
+        const bool split = e < (int) l.esplit.size() && l.esplit[(size_t) e];
+        const bool cold = !split && !cached && (size_t) f < pk.xdfds.size() &&
+                          !((size_t) f < pk.maps.size() && pk.maps[(size_t) f].first != nullptr &&
+                            os::resident_sampled(pk.maps[(size_t) f].first + l.region_off[(size_t) e], region.size()));
+        bool went_direct = false;
+        const bool read = split ? read_split(l, e, region.data())
+                              : cached ? os::pread_full(pk.fds[(size_t) f], region.data(), region.size(),
+                                                        l.region_off[(size_t) e])
+                                       : (went_direct = cold &&
+                                                        os::copy_direct(pk.xdfds[(size_t) f], l.region_off[(size_t) e],
+                                                                        region.size(), region.data(), dstage)) ||
+                                             pk.read_at(f, l.region_off[(size_t) e], region.size(), region.data());
+        if (!pk.xdfds.empty() && !cached) (went_direct ? lend_direct_n : lend_buffered_n).fetch_add(1);
         if (read) repack(l, e, region.data(), blob);
         return read;
     }
@@ -19798,7 +19824,7 @@ struct Model::Impl {
                     const int e = jobs[i].e;
                     if (l.nm > 1) {   // (DS4_TP_BORROW) each member its part
                         uint8_t* half = rf_half[(size_t) t];
-                        bool ok = l.blob <= rf_bytes && read_blob_file(l, e, stage, region), same = true;
+                        bool ok = l.blob <= rf_bytes && read_blob_file(l, e, stage, region, cached), same = true;
                         const bool read = ok;   // (a read that fails: the CPU lane takes it - the file has it)
                         for (int m = 0; m < l.nm && ok; ++m) {
                             const Layer& x = member(l, m);
@@ -19903,6 +19929,12 @@ struct Model::Impl {
                                                      : ("; MISMATCH: " + std::to_string(differ.load()) +
                                                         " differ - to the CPU lane").c_str())
                                : "");
+        }
+        if (!pk.xdfds.empty()) {   // (DS4_LEND_DIRECT: how this hand-back's uncached reads went)
+            const int64_t nd = lend_direct_n.exchange(0), nb = lend_buffered_n.exchange(0);
+            if (nd + nb > 0)
+                std::fprintf(stderr, "ds4: DS4_LEND_DIRECT: %lld of %lld hand-back reads past the page cache\n",
+                             (long long) nd, (long long) (nd + nb));
         }
         if (broken) {
             lend_broken = true;
