@@ -2035,6 +2035,20 @@ struct Model::Impl {
     // protocol at 3.5 bits, 8 / 16 / 24 / 32 of them: 59.0 / 61.5 / 62.2 / 62.9 tok/s, a routing trace's VRAM-neutral
     // optimum ~32), at most DS4_RECENT_FILLS (2) new ones a layer a tick
     int recent_n = 0;
+    // DS4_RECENT_FILE=1 (opt-in, MAYA_DS4_RECENT_FILE): the recent slots for an EXL3 pack read in place (--mmap-experts
+    // on) too - a fill reads the expert's file region into pinned staging (read_blob_file, the lent slots' way back) and
+    // copies each member its part.  With a helper GPU (DS4_HELPER) its picks count for the recent rule as the CPU
+    // lane's do, and an expert mapped into a recent slot leaves the helper's table until the slot lets it go (hr_mirror
+    // and the 'tables' job, as DS4_HELPER_RECENT's) - the helper's pool keeps its copy.  DS4_RECENT sets the slots a
+    // layer (0 without it here); DS4_RECENT_TICK the fills a tick may start over all layers (unset: no cap)
+    bool rc_file = false;
+    int recent_tick = 1 << 30;
+    bool rc_helper_ok = true;                   // (false: no event for the helper's 'tables' job - its experts stay its)
+    uint8_t* rc_stage = nullptr;                // (the fill thread's: an expert's blob read from its file)
+    std::vector<uint8_t*> rc_half;              // (a member's part of it each, while its copy runs)
+    bool rc_src_ok(const Layer& l) const {      // a recent slot's source: RAM copies, a GGUF's landings, the files
+        return !file_experts || (pk.gguf && ln_land) || (rc_file && l.lay.fmt != gg::kFmtMXFP4);
+    }
     // DS4_RECENT_FIT (MAYA_DS4_RECENT_FIT, ds4_place.hpp; unset or 0: off, the split below as before): 1 - a layer whose
     // slots cannot hold the whole recent set beside a static and the spare keeps as many recent slots as leave one,
     // not none; 2 - also the queue: each layer its recent set, a static and the spare first, the slots past them priced
@@ -3938,6 +3952,11 @@ struct Model::Impl {
         one_gpu_path();   // (the devices, their groups and the helper GPU known: before the recent slots' count)
         // (a GGUF: 32 too while streamed experts land in them, DS4_LAND - the link's bytes stay in VRAM)
         recent_n = std::max(0, (int) env_f("DS4_RECENT", chunk > 0 && (!file_experts || (pk.gguf && ln_land)) ? 32.0f : 0.0f));
+        {   // (DS4_RECENT_FILE: an EXL3 pack in place - see rc_file)
+            const char* v = ds4_env("DS4_RECENT_FILE");
+            rc_file = v != nullptr && std::atoi(v) != 0 && file_experts && !pk.gguf;
+            if (const char* t = ds4_env("DS4_RECENT_TICK")) recent_tick = std::max(1, std::atoi(t));
+        }
         if (chunk > 0) {
             chunk = std::min(kMaxChunk, std::max(dc != nullptr ? 16 : 256, chunk / 16 * 16));
             eg_cap = (size_t) chunk;
@@ -7909,14 +7928,14 @@ struct Model::Impl {
             // a layer with experts on both sides keeps one VRAM slot free for the cache's swaps
             l.n_slots = std::min(l.n_vram, l.n_exp);
             if (o.expert_cache && l.n_slots >= 2 && l.n_slots < l.n_exp) {   // (every expert fits: nothing to swap)
-                int r = recent_n > 0 && !l.mtp && (!file_experts || (pk.gguf && ln_land)) &&
+                int r = recent_n > 0 && !l.mtp && rc_src_ok(l) &&
                                 l.n_slots - 1 - recent_n >= 1 ? recent_n : 0;
                 // (DS4_RECENT_FIT: a layer too small for the whole set keeps as many as leave a static and the spare -
                 //  not an EXL3 lender's)
                 bool x3l = false;
                 for (int m = 0; m < l.nm && recent_fit > 0; ++m) x3l = x3l || x3_lends(member(l, m).dev);
                 if (recent_fit > 0 && r == 0 && !x3l)
-                    r = place::recent_slots(l.n_slots, recent_n, !l.mtp && (!file_experts || (pk.gguf && ln_land)),
+                    r = place::recent_slots(l.n_slots, recent_n, !l.mtp && rc_src_ok(l),
                                             recent_fit);
                 l.n_vram = l.n_slots - 1 - r;   // (the recent slots: [n_vram, n_vram + r), from the profile's coldest)
                 l.spare_vram = l.n_slots - 1;
@@ -7938,7 +7957,7 @@ struct Model::Impl {
                 const size_t li = (size_t) (&l - &L[0]);
                 const int s0 = li < fit0.size() && fit0[li] >= 0 ? fit0[li] : l.n_slots;
                 const place::Split d = place::split(s0, l.n_exp, o.expert_cache, recent_n,
-                                                    !l.mtp && (!file_experts || (pk.gguf && ln_land)), 0);
+                                                    !l.mtp && rc_src_ok(l), 0);
                 if (d.recent == 0 && l.rc_n > 0) {
                     ++fit_note.layers;
                     fit_note.rmin = std::min(fit_note.rmin, l.rc_n);
@@ -11701,6 +11720,7 @@ struct Model::Impl {
         std::vector<RcJob> fly;     // issued, not yet done
         std::deque<RcJob> held;     // waiting for their group's turn to end (copy_open)
         std::string err;
+        std::vector<uint8_t> rc_region;   // (DS4_RECENT_FILE: read_blob_file's scratch)
         for (;;) {
             {
                 std::unique_lock<std::mutex> lk(rc_mu);
@@ -11730,6 +11750,16 @@ struct Model::Impl {
                     injected = seq.fetch_add(1, std::memory_order_relaxed) % fault_rate == fault_rate - 1;
                 }
                 bool ok = true;
+                // (DS4_RECENT_FILE: an EXL3 expert in place - its file region read and repacked into pinned staging, each
+                //  member its part from there; the copies are waited for below, before the staging takes the next fill's)
+                const bool from_file = rc_file && l.lay.fmt != gg::kFmtMXFP4;
+                if (from_file && !injected &&
+                    !(rc_stage != nullptr && (int) rc_half.size() >= l.nm &&
+                      read_blob_file(l, j.expert, rc_stage, rc_region))) {
+                    err = "reading layer " + std::to_string(l.il) + " expert " + std::to_string(j.expert) +
+                          " from its file failed";
+                    ok = false;
+                }
                 for (int m = 0; m < l.nm; ++m) {
                     Layer& x = member(l, m);
                     const int di = x.dev;
@@ -11739,9 +11769,30 @@ struct Model::Impl {
                     if (injected) {
                         err = "DS4_FAULT_RC_FILL: injected recent-slot fill failure (nothing was copied)";
                         ok = false;
+                    } else if (from_file) {
+                        if (ok) {
+                            const uint8_t* part = rc_stage;
+                            if (l.nm > 1) {
+                                blob_to_half(l, rc_stage, m, rc_half[(size_t) m]);
+                                part = rc_half[(size_t) m];
+                            }
+                            if (cudaMemcpyAsync(sat(l, x, l.rc_base + j.slot, unit(x)), part, unit(x),
+                                                cudaMemcpyHostToDevice, rc_cs[(size_t) di]) != cudaSuccess) {
+                                err = "copying layer " + std::to_string(l.il) + " expert " + std::to_string(j.expert) +
+                                      " into its recent slot failed";
+                                ok = false;
+                            }
+                        }
                     } else if (!stream_expert(l, m, j.expert, sat(l, x, l.rc_base + j.slot, unit(x)), rc_cs[(size_t) di], err))
                         ok = false;
                     cudaEventRecord(l.rc_ev[(size_t) j.slot * l.nm + m], rc_cs[(size_t) di]);
+                }
+                if (from_file) {   // (the staging is the next fill's once these copies are done)
+                    for (int m = 0; m < l.nm; ++m) {
+                        cudaSetDevice(devs[(size_t) member(l, m).dev].id);
+                        cudaEventSynchronize(l.rc_ev[(size_t) j.slot * l.nm + m]);
+                    }
+                    if (ok) drop_file_pages(l, j.expert);   // (one more copy of it: in VRAM - its file pages need not stay)
                 }
                 if (ok)
                     fly.push_back(j);
@@ -11810,6 +11861,13 @@ struct Model::Impl {
             }
             std::this_thread::sleep_for(std::chrono::microseconds(100));
         }
+        if (rc_file && helper_id >= 0 && !helper_dead.load(std::memory_order_relaxed)) {
+            // (DS4_RECENT_FILE: the helper's last 'tables' job first - this tick is to map every fill that is done; one
+            //  it cannot map is dropped there, its slot left empty)
+            const double tw = now_ms();
+            while (!hr_tab_rec.load(std::memory_order_acquire) && now_ms() - tw < 1000.0)
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
         tick_begin();
         rc_tick(false);
         tick_flush();
@@ -11839,11 +11897,46 @@ struct Model::Impl {
             }
             rc_done.reset(new std::atomic<unsigned>[(size_t) std::max(1, off)]);
             for (int i = 0; i < off; ++i) rc_done[(size_t) i].store(0u);
+            if (rc_file) {   // (DS4_RECENT_FILE) the fill thread's pinned staging: a blob, and a part a member
+                size_t maxb = 0;
+                int maxm = 1;
+                for (const Layer& l : L)
+                    if (l.rc_n > 0) maxb = std::max(maxb, l.blob), maxm = std::max(maxm, l.nm);
+                bool got = maxb > 0 && cudaHostAlloc((void**) &rc_stage, maxb, cudaHostAllocPortable) == cudaSuccess;
+                if (got) host_allocs.push_back(rc_stage);
+                for (int m = 0; got && m < maxm; ++m) {
+                    uint8_t* h = nullptr;
+                    got = cudaHostAlloc((void**) &h, maxb, cudaHostAllocPortable) == cudaSuccess;
+                    if (got) {
+                        host_allocs.push_back(h);
+                        rc_half.push_back(h);
+                    }
+                }
+                if (!got) {
+                    std::fprintf(stderr, "ds4: DS4_RECENT_FILE: no pinned staging for the fills - the recent slots stay empty\n");
+                    rc_stage = nullptr;
+                }
+                if (helper_id >= 0 && hr_tab_ev == nullptr) {   // (the 'tables' job's event, where DS4_HELPER_RECENT made none)
+                    int cur = 0;
+                    cudaGetDevice(&cur);
+                    rc_helper_ok = cudaSetDevice(helper_id) == cudaSuccess &&
+                                   cudaEventCreateWithFlags(&hr_tab_ev, cudaEventDisableTiming) == cudaSuccess;
+                    if (!rc_helper_ok) hr_tab_ev = nullptr;
+                    cudaSetDevice(cur);
+                }
+            }
             rc_th = std::thread([this] { rc_loop(); });
         }
         const unsigned now = rc_clock.fetch_add(1, std::memory_order_relaxed) + 1;
         std::vector<std::vector<unsigned long long>>& upd = tick_upd;
         std::vector<RcJob>& jobs = tick_jobs;
+        // (DS4_RECENT_FILE with a helper GPU: its table follows the recent slots through hr_mirror, which may change only
+        //  once the last 'tables' job has run - else this tick maps and lets go none of the helper's experts; a helper
+        //  that failed reads no table, so nothing waits for it)
+        const bool rc_hdead = helper_dead.load(std::memory_order_relaxed);
+        const bool tab_free = rc_helper_ok && (rc_hdead || hr_tab_rec.load(std::memory_order_acquire));
+        std::vector<int> tab_changed;
+        int tick_started = 0;
         for (Layer& l : L) {
             if (l.rc_n == 0) continue;
             const int nm = l.nm;
@@ -11890,6 +11983,13 @@ struct Model::Impl {
             for (int i = 0; i < l.rc_n; ++i) {   // the fills done: mapped (unless a swap took the expert in meanwhile)
                 const int e = l.rc_fill[(size_t) i];
                 if (e < 0 || rc_done[(size_t) (l.rc_off + i)].load(std::memory_order_acquire) != l.rc_gen[(size_t) i]) continue;
+                const bool hown = rc_file && helper_owned(l, e);   // (DS4_RECENT_FILE: the helper's - its table follows)
+                if (hown && (l.hr_mirror == nullptr || !tab_free)) {
+                    // (its table cannot follow now: mapped at a later tick - or, a drain before a lend, not at all: the
+                    //  slot goes under the buffers empty)
+                    if (!start_fills) l.rc_fill[(size_t) i] = -1;
+                    continue;
+                }
                 l.rc_fill[(size_t) i] = -1;
                 if (l.slot[(size_t) e] >= 0) continue;
                 l.slot[(size_t) e] = l.rc_base + i;
@@ -11897,6 +11997,10 @@ struct Model::Impl {
                 l.rc_stamp[(size_t) i] = now;
                 if (nm == 1) set_vm(l, e, l.rc_base + i);
                 set_tab(e, i);
+                if (hown) {   // (the helper lets it go: its entry 0 from the next window's takes on)
+                    l.hr_mirror[(size_t) e] = 0ull;
+                    tab_changed.push_back(l.il);
+                }
                 ++rc_fills_done;
                 if (check_swaps && l.lay.fmt == gg::kFmtMXFP4 && nm == 1) {   // (a GGUF's: its blob, as a landing's)
                     std::vector<uint8_t> want(l.blob), dev(l.blob);
@@ -11941,10 +12045,12 @@ struct Model::Impl {
             }
             int started = 0;
             // (latest first; none while a prompt's room is kept between its parts - recent slots may lie under it)
-            const bool fills = start_fills && !lend_held.load(std::memory_order_relaxed);
-            for (size_t h = l.cpu_hits.size(); fills && h-- > 0 && started < recent_fills;) {
+            const bool fills = start_fills && !lend_held.load(std::memory_order_relaxed) &&
+                               (!rc_file || (rc_stage != nullptr && (l.hr_mirror == nullptr || tab_free)));
+            for (size_t h = l.cpu_hits.size(); fills && h-- > 0 && started < recent_fills && tick_started < recent_tick;) {
                 const int e = l.cpu_hits[h];
                 if (e < 0 || e >= l.n_exp || l.slot[(size_t) e] >= 0 || e == l.sw_in) continue;
+                if (rc_file && l.hr_mirror == nullptr && helper_owned(l, e)) continue;   // (its table could not follow)
                 int uses = 0;
                 for (const std::vector<int>& hv : l.rc_hist) uses += std::binary_search(hv.begin(), hv.end(), e) ? 1 : 0;
                 if (uses < recent_need) continue;
@@ -11965,14 +12071,32 @@ struct Model::Impl {
                     l.slot[(size_t) old] = -1;
                     set_tab(old, -1);
                     l.rc_exp[(size_t) v] = -1;
+                    if (rc_file && l.hr_mirror != nullptr && helper_owned(l, old)) {   // (the helper's again)
+                        l.hr_mirror[(size_t) old] = (unsigned long long) l.helper[(size_t) old];
+                        tab_changed.push_back(l.il);
+                    }
                 }
                 l.rc_fill[(size_t) v] = e;
                 l.rc_gen[(size_t) v] = now;
                 jobs.push_back({l.il, v, e, now, win_now.load(std::memory_order_relaxed)});
                 ++started;
+                ++tick_started;
                 ++rc_fills_started;
             }
         }
+        if (!tab_changed.empty() && !rc_hdead) rc_helper_tables(tab_changed);
+    }
+    // (DS4_RECENT_FILE) the layers whose hr_mirror a tick changed: the helper's tables from them, before its next takes
+    void rc_helper_tables(std::vector<int>& changed) {
+        std::sort(changed.begin(), changed.end());
+        changed.erase(std::unique(changed.begin(), changed.end()), changed.end());
+        hr_tab_rec.store(false, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lk(hq_mu);
+            hr_tables.insert(hr_tables.end(), changed.begin(), changed.end());
+            hq.push_back({-1, 0u, 0, true});
+        }
+        hq_cv.notify_one();
     }
 
     // a tick's table entries (the recent slots', the swaps'): one launch a device, before the next window; then rc_go
@@ -14392,7 +14516,7 @@ struct Model::Impl {
             helper_allocs.push_back(p);
             ok = cudaMemcpy(p, t.data(), t.size() * 8, cudaMemcpyHostToDevice) == cudaSuccess;
             l.helper_tab = (unsigned long long*) p;
-            if (ok && l.hr_n > 0) {   // (its pinned mirror: the table the next 'tables' job copies, recent slots too)
+            if (ok && (l.hr_n > 0 || (rc_file && l.rc_n > 0))) {   // (its pinned mirror: the table the next 'tables' job copies, recent slots too)
                 void* m = nullptr;
                 ok = cudaHostAlloc(&m, t.size() * 8, cudaHostAllocPortable) == cudaSuccess;
                 if (!ok) break;
@@ -15226,6 +15350,7 @@ struct Model::Impl {
                             if (held_out(l, e)) ++st.lend_picks;   // (its slot under a prompt's kept room)
                             if (hon && l.helper[(size_t) e] != nullptr) {
                                 hpicks.push_back({e, t * kPicks + i});
+                                if (rc_file && l.rc_n > 0) l.cpu_hits.push_back(e);   // (DS4_RECENT_FILE: its rule's too)
                                 if (l.hr_n > 0 && l.hr_slot[(size_t) e] >= 0) {   // (a recent slot's: its stamp)
                                     ++st.hr_hits;
                                     std::lock_guard<std::mutex> lk(hr_mu);
@@ -19866,6 +19991,7 @@ struct Model::Impl {
             });
         for (auto& t : th) t.join();
         size_t n_bad = 0, bytes = 0;
+        std::vector<std::pair<int, int>> bad_helper;   // (DS4_RECENT_FILE: layer, expert - back in the helper's table)
         for (size_t i = 0; i < jobs.size(); ++i) {
             Layer& l = L[(size_t) jobs[i].layer];
             const int e = jobs[i].e;
@@ -19878,10 +20004,16 @@ struct Model::Impl {
                 continue;
             }
             ++n_bad;   // (to the CPU lane: the file has it)
+            // (DS4_RECENT_FILE: a recent slot's expert - the slot free again, not one static fewer; the helper's again
+            //  where it was its)
+            const int bs = l.slot[(size_t) e];
+            const bool rcs = l.rc_n > 0 && bs >= l.rc_base && bs < l.rc_base + l.rc_n;
+            if (rcs) l.rc_exp[(size_t) (bs - l.rc_base)] = -1;
+            if (rc_file && l.hr_mirror != nullptr && helper_owned(l, e)) bad_helper.push_back({l.il, e});
             l.slot[(size_t) e] = -1;
             if (l.lay.fmt == gg::kFmtMXFP4) l.host[(size_t) e] = (uint8_t*) mx_mat(l, e, 0);
             else l.host[(size_t) e] = l.hh[(size_t) e][0] = file_part(l, e);   // (an EXL3 expert in place: as the load)
-            --l.n_vram;
+            if (!rcs) --l.n_vram;
             const unsigned long long zero = 0;
             for (int m = 0; m < l.nm; ++m) {   // (a group's: every member's table - DS4_TP_BORROW)
                 const Layer& x = member(l, m);
@@ -19896,6 +20028,20 @@ struct Model::Impl {
                     l.lend_mark[e] = 0;
                     if (!tab_entry(l, (int) e)) broken = true;
                 }
+        if (!bad_helper.empty() && !helper_dead.load(std::memory_order_relaxed)) {
+            // (DS4_RECENT_FILE: a recent slot's expert that did not come back is the helper's again - its mirror once
+            //  the last 'tables' job is done, then the tables before the next window's takes)
+            const double tw = now_ms();
+            while (!hr_tab_rec.load(std::memory_order_acquire) && now_ms() - tw < 1000.0)
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
+            std::vector<int> ch;
+            for (const auto& be : bad_helper) {
+                Layer& l = L[(size_t) be.first];
+                l.hr_mirror[(size_t) be.second] = (unsigned long long) l.helper[(size_t) be.second];
+                ch.push_back(be.first);
+            }
+            rc_helper_tables(ch);
+        }
         lent_experts += (int64_t) jobs.size();
         lent_ms += now_ms() - t0;
         st.lent_back += (int64_t) jobs.size();
