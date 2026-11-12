@@ -6699,7 +6699,7 @@ struct Model::Impl {
     static int prompt_light() {
         static const int r = [] {
             const char* v = ds4_env("DS4_PROMPT_LIGHT");
-            return v != nullptr ? std::max(0, std::min(64, std::atoi(v))) : 0;
+            return v != nullptr ? std::max(0, std::min(512, std::atoi(v))) : 0;
         }();
         return r;
     }
