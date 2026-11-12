@@ -1551,6 +1551,7 @@ for fallback, and CPU versus GPU floating-point arithmetic can change model outp
 | --- | --- | --- |
 | `MAYA_DS4_HELPER_EXL3` | off | `1`: allow uniform EXL3 experts in the helper pool |
 | `MAYA_DS4_HELPER_DRAFT` | off | `1` (EXL3, with the helper): the DSpark blocks' experts without a VRAM slot go into the helper's pool too, ahead of the trunk's (the drafter runs every round; its hottest experts are in VRAM already, `MAYA_DS4_DRAFT_VRAM`); the draft pass posts its blocks' requests to the helper as a trunk window does. Placement only: the helper's sums differ from the CPU lane's in the last bits |
+| `MAYA_DS4_PROMPT_LIGHT` | off | `<R>` (1-64; EXL3 read in place, with the helper and `MAYA_DS4_FLOW_HELPER`): a prompt chunk's streamed experts that at most R of its rows pick are computed on the helper from its pool instead of copied to the cards - their rows go out, the sums come back and join the lead's before the all-reduce. For short prompts, whose copies over the cards' links are the bottleneck. Not bit for bit (the helper's sums). `MAYA_DS4_PROMPT_LIGHT_CAP`: rows a layer may send (4096) |
 | `MAYA_DS4_HELPER_SHARED` | off | `1`: let the helper also host DSpark blocks; currently requires EXL3, `--tp 2`, loaded DSpark blocks and zero target layers on that GPU |
 
 With shared mode, select the helper in `--gpus`, place DSpark there with `MAYA_DS4_DRAFT_GPU`, and use
