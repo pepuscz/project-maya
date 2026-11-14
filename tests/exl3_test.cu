@@ -2537,6 +2537,99 @@ void bench_set() {
     }
 }
 
+// --bench-read: the memory floor for the helper's window kernels (#128). Reads whole expert blobs, the size the
+// window kernels read (the bench-win layout), in sets of G scattered copies as a decode window's groups are, cycling
+// through enough copies to miss the GPU's caches. mode 0 only reads (16-byte loads, xor), mode 1 also does a little
+// ALU per word (two u16 halves to float and summed), the cheapest stand-in for "read and use". The result sets the
+// floor in us an expert that a window kernel could reach if it were bound by memory alone.
+__global__ void bench_read_kernel(const unsigned long long* __restrict__ ptrs, size_t n16, unsigned* sink, int mode) {
+    const uint4* p = reinterpret_cast<const uint4*>(ptrs[blockIdx.y]);
+    uint32_t a = 0;
+    float f = 0.0f;
+    for (size_t i = blockIdx.x * (size_t) blockDim.x + threadIdx.x; i < n16; i += (size_t) gridDim.x * blockDim.x) {
+        const uint4 v = p[i];
+        if (mode == 0) {
+            a ^= v.x ^ v.y ^ v.z ^ v.w;
+        } else {
+            f += (float) (v.x & 0xffffu) + (float) (v.x >> 16) + (float) (v.y & 0xffffu) + (float) (v.y >> 16) +
+                 (float) (v.z & 0xffffu) + (float) (v.z >> 16) + (float) (v.w & 0xffffu) + (float) (v.w >> 16);
+        }
+    }
+    if (a == 0x9e3779b9u || f == -1.0f) atomicAdd(sink, 1u);   // (never true: keeps the loads)
+}
+
+void bench_read() {
+    const int E = 5120, F = 2304;
+    auto env_int = [](const char* n, int d) {
+        const char* v = std::getenv(n);
+        return v != nullptr && *v ? std::atoi(v) : d;
+    };
+    const int iters = std::max(1, env_int("BENCH_READ_ITERS", 50)), NB = std::max(24, env_int("BENCH_READ_BLOBS", 96));
+    const int threads = 256;
+    cudaDeviceProp prop{};
+    int dev = 0;
+    CK(cudaGetDevice(&dev));
+    CK(cudaGetDeviceProperties(&prop, dev));
+    const int CUs = prop.multiProcessorCount, per_cu = std::max(1, env_int("BENCH_READ_BLOCKS_CU", 8));
+    unsigned* d_sink = nullptr;
+    CK(cudaMalloc(&d_sink, 4));
+    CK(cudaMemset(d_sink, 0, 4));
+    cudaEvent_t ev0, ev1;
+    CK(cudaEventCreate(&ev0));
+    CK(cudaEventCreate(&ev1));
+    std::vector<int> k2s = {4, 5};
+    if (env_int("BENCH_READ_K2", 0) > 0) k2s = {env_int("BENCH_READ_K2", 0)};
+    for (const int k2 : k2s) {
+        size_t at = 0;   // one expert blob as the window kernels see it (bench_win's layout)
+        for (int r = 0; r < 3; ++r) {
+            const int kk = r < 2 ? E : F, n = r < 2 ? F : E;
+            at += (ex::trellis_bytes_k2(kk, n, k2) + 255) / 256 * 256;
+            at += (2 * (size_t) kk + 255) / 256 * 256;
+            at += (2 * (size_t) n + 255) / 256 * 256;
+        }
+        uint8_t* d_all = nullptr;
+        CK(cudaMalloc(&d_all, (size_t) NB * at));
+        CK(cudaMemset(d_all, 0x5a, (size_t) NB * at));
+        std::printf("  bench read: %s, %d CUs, K%d expert blob %.2f MB, %d copies (%.0f MB), %d blocks a CU, %d calls a case\n",
+                    prop.name, CUs, k2, at / 1e6, NB, NB * at / 1e6, per_cu, iters);
+        for (const int mode : {0, 1})
+            for (const int G : {1, 4, 8, 12, 24}) {
+                const int NS = NB / G;
+                std::vector<unsigned long long*> sets;
+                for (int s = 0; s <= NS; ++s) {   // (set NS: G times copy 0, the hot case)
+                    std::vector<unsigned long long> pp((size_t) G);
+                    for (int g = 0; g < G; ++g)
+                        pp[(size_t) g] = (unsigned long long) (d_all + (s == NS ? 0 : (size_t) (s * G + g) * at));
+                    sets.push_back(dev_copy(pp));
+                }
+                const dim3 grid((unsigned) std::max(1, CUs * per_cu / G), (unsigned) G);
+                const size_t n16 = at / 16;
+                for (const bool hot : {false, true}) {
+                    for (int w = 0; w < 3; ++w)
+                        bench_read_kernel<<<grid, threads>>>(sets[(size_t) (hot ? NS : w % NS)], n16, d_sink, mode);
+                    CK(cudaDeviceSynchronize());
+                    CK(cudaEventRecord(ev0));
+                    for (int it = 0; it < iters; ++it)
+                        bench_read_kernel<<<grid, threads>>>(sets[(size_t) (hot ? NS : it % NS)], n16, d_sink, mode);
+                    CK(cudaEventRecord(ev1));
+                    CK(cudaEventSynchronize(ev1));
+                    CK(cudaGetLastError());
+                    float ms = 0.0f;
+                    CK(cudaEventElapsedTime(&ms, ev0, ev1));
+                    const double us = 1000.0 * ms / iters;
+                    std::printf("  bench read %-9s G=%2d %-4s: %8.1f us a call  %6.1f us an expert  %6.1f GB/s\n",
+                                mode == 0 ? "read" : "read+sum", G, hot ? "hot" : "cold", us, us / G,
+                                (double) G * at / (us * 1e3));
+                }
+                for (auto* d : sets) cudaFree(d);
+            }
+        cudaFree(d_all);
+    }
+    cudaEventDestroy(ev0);
+    cudaEventDestroy(ev1);
+    cudaFree(d_sink);
+}
+
 int main(int argc, char** argv) {
     if (argc > 1 && std::string(argv[1]) == "--bench-set") {
         bench_set();
@@ -2549,6 +2642,10 @@ int main(int argc, char** argv) {
     if (argc > 1 && std::string(argv[1]) == "--bench-win") {
         bench_win();
         return g_fail != 0;
+    }
+    if (argc > 1 && std::string(argv[1]) == "--bench-read") {
+        bench_read();
+        return 0;
     }
     if (argc > 1 && std::string(argv[1]) == "--bench") {
         bench_moe();
