@@ -2211,6 +2211,21 @@ __global__ void read_roof_kernel(const uint4* p, size_t n, unsigned* sink) {
     if (acc == 0x9e3779b9u) atomicAdd(sink, 1u);
 }
 
+// (EXL3_PHASE_PROF builds) block_gemv's phase shares since the last reset, one line; nothing in other builds
+static void pp_reset() {
+    unsigned long long v[9];
+    (void) ex::phase_prof(v, true);
+}
+static void pp_line(const std::string& tag) {
+    unsigned long long v[9];
+    if (!ex::phase_prof(v, true) || v[8] == 0 || v[7] == 0) return;
+    static const char* nm[7] = {"prologue", "store+sync", "loads issued", "slice0 frag (tile wait)", "slices1-7 frag",
+                                "products", "epilogue"};
+    std::printf("    phases %s: %llu wave calls, %.0f cycles a wave call:", tag.c_str(), v[8], (double) v[7] / v[8]);
+    for (int i = 0; i < 7; ++i) std::printf("  %s %.1f %%", nm[i], 100.0 * (double) v[i] / (double) v[7]);
+    std::printf("\n");
+}
+
 // --bench-win: a verify window's routed experts on one device at DeepSeek-V4.1's geometry (5120 -> 2304 -> 5120,
 // mul1) - win_experts, the kernels the DS4 helper runs for a decode round.  Per case: T tokens, h of a token's 6
 // experts on this device, G distinct experts among them (token t's entry i on expert (t h + i) mod G).  Each call
@@ -2330,8 +2345,11 @@ void bench_win() {
                 CK(cudaEventElapsedTime(&ms, ev0, ev1));
                 return ms / iters;
             };
+            pp_reset();
             const float cold = timed([&](int i) { call(gps[(size_t) (i % NS)]); });
+            pp_line("win rows K" + kname(k2) + " " + std::to_string(rr) + " rows cold");
             const float hot = timed([&](int) { call(gps[(size_t) NS]); });
+            pp_line("win rows K" + kname(k2) + " " + std::to_string(rr) + " rows hot");
             call(gps[0]);
             CK(cudaDeviceSynchronize());
             const std::vector<float> o = host_copy(d_part, (size_t) n * E);
@@ -2419,8 +2437,13 @@ void bench_win() {
                 CK(cudaEventElapsedTime(&ms, ev0, ev1));
                 return ms / iters;
             };
+            const std::string ptag = "win K" + kname(k2) + " T" + std::to_string(c.T) + " h" + std::to_string(c.h) +
+                                     " G" + std::to_string(c.G);
+            pp_reset();
             const float cold = timed([&](int i) { call(sets[(size_t) (i % NS)]); });
+            pp_line(ptag + " cold");
             const float hot = timed([&](int) { call(sets[(size_t) NS]); });
+            pp_line(ptag + " hot");
             const int roof_blocks = prop.multiProcessorCount * 8;
             const float roof = timed([&](int i) {
                 read_roof_kernel<<<roof_blocks, 256>>>((const uint4*) (d_all + (size_t) (i % NS) * c.G * at),
@@ -2461,7 +2484,8 @@ void bench_mv() {
                             {"wo_a", 4096, 1024, 8},   {"wo_b", 8192, 5120, 1},  {"sh_w1", 5120, 2304, 2},
                             {"sh_w2", 2304, 5120, 1}};
     const char* only = std::getenv("BENCH_MV_ONLY");
-    const int k2 = 12, cb = 2, iters = std::getenv("BENCH_MV_ITERS") ? std::atoi(std::getenv("BENCH_MV_ITERS")) : 100;
+    const int k2 = std::getenv("BENCH_MV_K2") ? std::atoi(std::getenv("BENCH_MV_K2")) : 12, cb = 2,   // (BENCH_MV_K2: another K2)
+              iters = std::getenv("BENCH_MV_ITERS") ? std::atoi(std::getenv("BENCH_MV_ITERS")) : 100;
     double tot_us = 0;
     for (const Shape& s : shapes) {
         if (only != nullptr && std::string(only) != s.name) continue;
@@ -2487,6 +2511,7 @@ void bench_mv() {
         j.y = d_y;
         j.alpha = 1.0f;
         for (int i = 0; i < 5; ++i) ex::mv(&j, 1, 0);
+        pp_reset();
         cudaEvent_t a, b;
         cudaEventCreate(&a);
         cudaEventCreate(&b);
@@ -2507,6 +2532,7 @@ void bench_mv() {
         const double bytes = (double) h.tr.size() * 4;
         std::printf("  bench mv %-6s k%5d n%6d: %7.1f us  %6.0f GB/s  x%d a token  bits %016llx\n", s.name, s.k, s.n,
                     us, bytes / us / 1e3, s.per_tok, (unsigned long long) hsh);
+        pp_line(std::string("mv ") + s.name);
         tot_us += us * s.per_tok;
         cudaFree(d_tr);
         cudaFree(d_suh);
