@@ -697,12 +697,25 @@ struct KBatch {
 #if defined(STRATA_USE_HIP) && (defined(__gfx942__) || defined(__gfx950__))
 #define EXL3_SEP_DEV 1
 #endif
+// EXL3_MV_SEP (a build option, #127): the dense GEMV's split sums by mv_reduce_kernel on RDNA3 / RDNA3.5 too, instead of
+// mv_kernel's last-block hand-off (a fence and an atomic a block); the same sums in split order, the same bits.  Only
+// mv: the routed experts keep the hand-off (on gfx1151 their separate kernels measured ~4% slower)
+#if defined(EXL3_SEP_DEV) || (defined(STRATA_USE_HIP) && defined(EXL3_MV_SEP) && (defined(__GFX11__) || defined(__gfx1100__) || defined(__gfx1151__)))
+#define EXL3_MV_SEP_DEV 1
+#endif
+// EXL3_MV_WAVES=<n> (a build option, #127): an occupancy hint for mv_kernel on AMD (amdgpu_waves_per_eu min n): the
+// register allocation only, the same arithmetic and bits
+#if defined(STRATA_USE_HIP) && defined(EXL3_MV_WAVES)
+#define EXL3_MV_ATTR __attribute__((amdgpu_waves_per_eu(EXL3_MV_WAVES)))
+#else
+#define EXL3_MV_ATTR
+#endif
 
 // a launch's blocks: its jobs' (output block, input split) pairs, each for all of the job's nc activations at once
 // (block_gemv).  S > 1: the partial sums go to the scratch and the last block of an output block adds them up in split
 // order (deterministic) and runs the epilogue
 template <int K2, int cb, bool Single = false>
-__global__ void EXL3_BOUNDS(kMinBlocksMv<K2>) mv_kernel(const KBatch b) {
+__global__ void EXL3_BOUNDS(kMinBlocksMv<K2>) EXL3_MV_ATTR mv_kernel(const KBatch b) {
     __shared__ __align__(16) BlockSmem<K2, Single ? 1 : kTok> sm;
     __shared__ int last;
     int ji = 0;
@@ -731,7 +744,7 @@ __global__ void EXL3_BOUNDS(kMinBlocksMv<K2>) mv_kernel(const KBatch b) {
     if (threadIdx.x < kCols)
         for (int c = 0; c < nc; ++c)
             J.part[((size_t) c * J.S + sp) * J.n + g * kCols + threadIdx.x] = sm.out[c * kCols + threadIdx.x];
-#if defined(EXL3_SEP_DEV)
+#if defined(EXL3_MV_SEP_DEV)
     return;   // (mv_reduce_kernel adds them up)
 #endif
     __threadfence();
@@ -1148,6 +1161,24 @@ static bool sep_sums() {
                          ? 2 : 1;
     }
     return known[dev] == 2;
+}
+
+// whether mv_kernel's split sums are mv_reduce_kernel's on this GPU: sep_sums() GPUs, and with EXL3_MV_SEP gfx11
+// (the device code above returns early there: the two go together)
+static bool mv_sep() {
+    if (sep_sums()) return true;
+#if defined(EXL3_MV_SEP)
+    thread_local int known[64] = {};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
+    if (known[dev] == 0) {
+        cudaDeviceProp p{};
+        known[dev] = cudaGetDeviceProperties(&p, dev) == cudaSuccess && std::strncmp(p.gcnArchName, "gfx11", 5) == 0 ? 2 : 1;
+    }
+    return known[dev] == 2;
+#else
+    return false;
+#endif
 }
 #define EXL3_MOE_SWIGLU(a, s) \
     do { if (sep_sums()) moe_swiglu_kernel<<<dim3((unsigned) ((a).n_ff / kCols), (unsigned) (a).k), kCols, 0, s>>>(a); } while (0)
@@ -3124,7 +3155,7 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
         int rblocks = 0, rnc = 0;
         for (int j = 0; j < nb; ++j)
             if (b.j[j].S > 1) rblocks += b.j[j].n / kCols, rnc = std::max(rnc, b.j[j].nc);
-        if (rblocks > 0 && sep_sums()) mv_reduce_kernel<<<dim3(rblocks, rnc), kCols, 0, s>>>(b);
+        if (rblocks > 0 && mv_sep()) mv_reduce_kernel<<<dim3(rblocks, rnc), kCols, 0, s>>>(b);
 #endif
     }
     launch_check("mv");
