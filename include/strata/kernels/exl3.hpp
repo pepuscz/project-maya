@@ -175,6 +175,10 @@ struct WinArgs {
     int max_rows = 0;   // (rows) the most rows a group has: blocks sized for 2 / 4 when that few (0: 8)
 };
 bool win_experts(const WinArgs& a, cudaStream_t s);
+/// (WinArgs::rows) whether win_experts takes such a launch: the shapes, the gate's and the up's K, the counters for
+/// max_groups groups, the input split's scratch for T rows - checked without a launch or a message, so a caller can
+/// route a layer's experts elsewhere up front
+bool win_rows_covered(const WinArgs& a);
 /// Whether the current device runs the several-activation kernels (win_experts; mv's ncol > 1): every device does
 /// (they take ~10 KB of shared memory a block).
 bool several_ok();
