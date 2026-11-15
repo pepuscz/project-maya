@@ -189,7 +189,9 @@ bool prompt_tc();
 bool prompt_wmma();
 /// A set of n_exp routed experts in VRAM, expert e's blob at wbase + e * stride (the layout in lay), owning the sorted
 /// rows [bounds[e], bounds[e + 1]) (device, n_exp + 1 entries); a sorted row's LOCAL row is bounds[e] - row0 + r.
+constexpr unsigned kSetHead = 0x5e7a0142u, kSetTail = 0x142a5e7au;   // (#142) SetArgs' guard words
 struct SetArgs {
+    unsigned head = kSetHead;   // (#142 diagnostics: the set kernels compare both guard words, set_guard)
     const uint8_t* wbase = nullptr;
     size_t stride = 0;
     ExpertLayout lay;
@@ -202,7 +204,16 @@ struct SetArgs {
     int n_embd = 4096, n_ff = 2048;
     float limit = 0.0f;
     int skip_ge = 0;    // (ds4's low-bit GGUF experts) > 0: experts of at least this many rows are the caller's (FP16 GEMMs)
+    unsigned tail = kSetTail;
 };
+/// (#142 diagnostics, opt-in) the current device's set kernels check their arguments before reading through them: the
+/// guard words at both ends of SetArgs and the pointers the kernel reads (null).  A block that finds one wrong does no
+/// work: it counts itself in diag[0], and the first such block writes what it saw into diag[1 .. kSetDiagWords) (block,
+/// guard words, pointers, sizes - set_guard_words names them).  diag: the device's address of a host-mapped buffer of
+/// kSetDiagWords words; null: no checks (the default)
+constexpr int kSetDiagWords = 40;
+bool set_guard(unsigned* diag);
+extern const char* const set_guard_words[kSetDiagWords];
 /// h[local row] = FP16 clamped swiglu of gate and up over x[row_idx[local row]] (F32 rows, ldx floats apart).
 void set_gate_up(const SetArgs& a, const float* x, int ldx, const int* row_idx, uint16_t* h16, int ldh, cudaStream_t s);
 /// y[local row] = down(h[local row]) (F32 rows, ldy floats apart).

@@ -757,6 +757,7 @@ struct Chunk {
     cudaEvent_t lt_g = nullptr, lt_h = nullptr;
     uint16_t* lt_hh = nullptr;
     int* lt_ident = nullptr;
+    unsigned* lt_diag = nullptr;   // (DS4_SET_GUARD, #142) the helper's set kernels' bad-arguments record (host-mapped)
     // (DS4_LIGHT_WIN) the window launch's groups (pinned, mapped: blob addresses, bounds, rows, the count) and on the
     // helper its F32 gate / up values, a row each
     unsigned long long* lt_wgp = nullptr;
@@ -6757,6 +6758,43 @@ struct Model::Impl {
         }();
         return w;
     }
+    // DS4_SET_GUARD=1 (#142 diagnostics, opt-in): the helper's set kernels check their arguments (SetArgs' guard
+    // words, the pointers they read through) before using them; a launch that finds them wrong does no work and says
+    // what it saw - the layer's light sums are then wrong (a diagnostic run's, not a server's).  One record for the
+    // helper, host-mapped (both leads read it)
+    unsigned* set_guard_buf() const {
+        static unsigned* const buf = [this]() -> unsigned* {
+            const char* v = ds4_env("DS4_SET_GUARD");
+            if (v == nullptr || std::atoi(v) <= 0) return nullptr;
+            unsigned *p = nullptr, *dp = nullptr;
+            int prev = 0;
+            bool ok = cudaGetDevice(&prev) == cudaSuccess &&
+                      cudaHostAlloc((void**) &p, (size_t) x3::kSetDiagWords * 4,
+                                    cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess;
+            if (ok) std::memset(p, 0, (size_t) x3::kSetDiagWords * 4);
+            ok = ok && cudaSetDevice(helper_id) == cudaSuccess &&
+                 cudaHostGetDevicePointer((void**) &dp, p, 0) == cudaSuccess && x3::set_guard(dp);
+            ok = cudaSetDevice(prev) == cudaSuccess && ok;
+            std::fprintf(stderr, ok ? "ds4: DS4_SET_GUARD=1 (#142): the helper's set kernels check their arguments first\n"
+                                    : "ds4: DS4_SET_GUARD: its record failed - no checks\n");
+            return ok ? p : nullptr;
+        }();
+        return buf;
+    }
+    // (DS4_SET_GUARD) the set kernels' record after the layer's light experts: every bad launch said so
+    static void set_guard_report(unsigned* d, int il) {
+        const unsigned n = __atomic_exchange_n(&d[0], 0u, __ATOMIC_SEQ_CST);
+        if (n == 0) return;
+        std::string m = "ds4: DS4_SET_GUARD (#142): layer " + std::to_string(il) + ": " + std::to_string(n) +
+                        " set-kernel blocks found bad arguments; the first saw:";
+        for (int i = 1; i < x3::kSetDiagWords; ++i) {
+            char w[64];
+            std::snprintf(w, sizeof w, " %s=0x%x", x3::set_guard_words[i], d[i]);
+            m += w;
+        }
+        std::fprintf(stderr, "%s\n", m.c_str());
+        std::fflush(stderr);
+    }
     bool light_ok(const Layer& L0) const {
         return prompt_light() > 0 && helper_id >= 0 && flow_helper && file_experts && !helper_dead.load() &&
                L0.lay.fmt != gg::kFmtMXFP4 && L0.n_cls == 1 && !L0.helper.empty();
@@ -6792,6 +6830,7 @@ struct Model::Impl {
                 err = "DS4_PROMPT_LIGHT: its buffers (" + std::to_string((size_t) cap * D * 8 >> 20) + " MB pinned) failed";
                 return false;
             }
+            c.lt_diag = set_guard_buf();
             std::fprintf(stderr, "ds4: DS4_PROMPT_LIGHT=%d: a prompt chunk's experts of at most %d rows from the helper's "
                                  "pool computed on CUDA%d, not copied (up to %d rows a layer)\n",
                          R, R, helper_id, cap);
@@ -18733,6 +18772,7 @@ struct Model::Impl {
                 err = "the helper's light experts of layer " + std::to_string(L0.il) + " failed (DS4_PROMPT_LIGHT)";
                 return false;
             }
+            if (c.lt_diag != nullptr) set_guard_report(c.lt_diag, L0.il);
             light_add(c.acc, c.lt_hy, c.lt_dlidx, c.pos, c.rw, T, l.k_exp, D, s);
         }
         if (xsum) moe_x_finish(c.acc, c.acc64, (size_t) T * D, s);

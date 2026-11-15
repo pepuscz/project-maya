@@ -2532,6 +2532,61 @@ __device__ __forceinline__ void set_rows_w(const SetArgs& a, Gemm&& gemm, const 
     }
 }
 
+// (#142 diagnostics, set_guard) the device's buffer for set kernels' bad arguments (null: no checks)
+__device__ unsigned* g_set_diag = nullptr;
+__device__ __forceinline__ void set_diag_ptr(unsigned* d, int i, const void* p) {
+    const unsigned long long v = (unsigned long long) p;
+    d[i] = (unsigned) v;
+    d[i + 1] = (unsigned) (v >> 32);
+}
+// whether a set kernel's arguments are wrong (the guard words, a pointer it reads through null): the block then does
+// no work - the first such block on the device writes what it saw (set_guard_words)
+template <bool gate_up>
+__device__ __forceinline__ bool set_args_bad(const SetArgs& a, const float* x, int ldx, const int* idx,
+                                             const uint16_t* h, int ldh, const float* y, int ldy) {
+    unsigned* d = g_set_diag;
+    if (d == nullptr) return false;
+    const unsigned bad = (unsigned) (a.head != kSetHead) | (unsigned) (a.tail != kSetTail) << 1 |
+                         (unsigned) (a.bounds == nullptr) << 2 | (unsigned) (a.mix.n == 0 && a.wbase == nullptr) << 3 |
+                         (unsigned) (h == nullptr) << 4 |
+                         (gate_up ? (unsigned) (x == nullptr) << 5 | (unsigned) (idx == nullptr) << 6
+                                  : (unsigned) (y == nullptr) << 7);
+    if (bad == 0) return false;
+    if (threadIdx.x == 0 && atomicAdd(d, 1u) == 0) {
+        d[1] = blockIdx.x;
+        d[2] = blockIdx.y;
+        d[3] = blockIdx.z;
+        d[4] = gate_up ? 1u : 0u;
+        d[5] = a.head;
+        d[6] = a.tail;
+        set_diag_ptr(d, 7, a.wbase);
+        set_diag_ptr(d, 9, (const void*) (unsigned long long) a.stride);
+        set_diag_ptr(d, 11, a.bounds);
+        set_diag_ptr(d, 13, a.eptr);
+        d[15] = (unsigned) a.n_exp;
+        d[16] = (unsigned) a.row0;
+        d[17] = (unsigned) a.max_rows;
+        d[18] = (unsigned) a.n_embd;
+        d[19] = (unsigned) a.n_ff;
+        d[20] = (unsigned) a.mix.n;
+        d[21] = (unsigned) a.skip_ge;
+        set_diag_ptr(d, 22, x);
+        set_diag_ptr(d, 24, idx);
+        set_diag_ptr(d, 26, h);
+        set_diag_ptr(d, 28, y);
+        d[30] = (unsigned) ldx;
+        d[31] = (unsigned) ldh;
+        d[32] = (unsigned) ldy;
+        set_diag_ptr(d, 33, (const void*) (unsigned long long) a.lay.trellis[0]);
+        set_diag_ptr(d, 35, (const void*) (unsigned long long) a.lay.svh[0]);
+        d[37] = (unsigned) a.lay.k2[0];
+        d[38] = (unsigned) a.lay.cb;
+        d[39] = bad;
+        __threadfence_system();
+    }
+    return true;
+}
+
 template <int K2, int cb, bool gate_up, int NR, bool Perm, bool Shaped = false>
 __device__ __forceinline__ void wmma_set_body(const SetArgs& a, const float* x, int ldx, const int* idx, uint16_t* h,
                                               int ldh, float* y, int ldy) {
@@ -2545,6 +2600,7 @@ __device__ __forceinline__ void wmma_set_body(const SetArgs& a, const float* x, 
     // 16-row blocks keep it in LDS (in registers 1-8 rows a set lost up to 2 %)
     constexpr bool kGateReg = Shaped && NR >= 32;
     __shared__ float gate[(Shaped && (kGateReg || !gate_up)) ? 1 : NR * kCols];
+    if (set_args_bad<gate_up>(a, x, ldx, idx, h, ldh, y, ldy)) return;   // (#142 diagnostics: off unless set_guard)
     const int e = blockIdx.z, g = blockIdx.y;
     const int start = a.bounds[e], end = a.bounds[e + 1];
     const int row = start - a.row0 + (int) blockIdx.x * NR;
@@ -3084,6 +3140,19 @@ int launch_errors() {
     return g_launch_errors.load(std::memory_order_relaxed);
 #endif
 }
+
+bool set_guard(unsigned* diag) {
+#if defined(STRATA_USE_HIP)
+    return hipMemcpyToSymbol(HIP_SYMBOL(g_set_diag), &diag, sizeof diag) == hipSuccess;
+#else
+    return cudaMemcpyToSymbol(g_set_diag, &diag, sizeof diag) == cudaSuccess;
+#endif
+}
+const char* const set_guard_words[kSetDiagWords] = {
+    "bad blocks", "block.x", "block.y", "block.z", "gate_up", "head", "tail", "wbase.lo", "wbase.hi", "stride.lo",
+    "stride.hi", "bounds.lo", "bounds.hi", "eptr.lo", "eptr.hi", "n_exp", "row0", "max_rows", "n_embd", "n_ff",
+    "mix.n", "skip_ge", "x.lo", "x.hi", "idx.lo", "idx.hi", "h.lo", "h.hi", "y.lo", "y.hi", "ldx", "ldh", "ldy",
+    "trellis0.lo", "trellis0.hi", "svh0.lo", "svh0.hi", "k2_0", "cb", "failed checks"};
 
 bool prepare(cudaStream_t s) {
     EXL3_LEGACY(prepare(s));
