@@ -769,6 +769,32 @@ __global__ void __launch_bounds__(kThreads) gemv_f32_pair_kernel(const TW* __res
 // prompt read DeepSeek-V4.1's 7.9 MB router 4096 times a layer)
 constexpr int kGemvT = 8, kGemvK = 128;
 static_assert(kGemvK % 32 == 0, "a lane's float4s in the one-token kernel's order");
+#if defined(STRATA_USE_HIP)
+// (AMD, the rows kernels) a whole chunk: the lane's kGemvK / 32 weight float4s loaded first - before the chunk's inputs
+// are staged, which they do not read, so the loads are in flight across the staging and its barriers instead of one
+// at a time in the sum (gate_row's kGateLd for a window's rows) - then summed in the same order as the loop below
+// (c = c0 + lane + 32 u, every token's onto its own acc): the same bits
+template <typename TW>
+__device__ __forceinline__ void gate_chunk_ld(const TW* __restrict__ w, int c0, int lane, float4 (&a)[kGemvK / 32]) {
+#pragma unroll
+    for (int u = 0; u < kGemvK / 32; ++u) a[u] = gate_ld(w, c0 + lane + 32 * u);
+}
+__device__ __forceinline__ void gate_chunk_sum(const float4 (&a)[kGemvK / 32], const float4 (&xs)[kGemvT][kGemvK],
+                                               int lane, float (&acc)[kGemvT]) {
+#pragma unroll
+    for (int u = 0; u < kGemvK / 32; ++u) {
+        const int c = lane + 32 * u;
+#pragma unroll
+        for (int t = 0; t < kGemvT; ++t) {
+            const float4 b = xs[t][c];
+            acc[t] = fmaf(a[u].x, b.x, acc[t]);
+            acc[t] = fmaf(a[u].y, b.y, acc[t]);
+            acc[t] = fmaf(a[u].z, b.z, acc[t]);
+            acc[t] = fmaf(a[u].w, b.w, acc[t]);
+        }
+    }
+}
+#endif
 template <typename TW>
 __global__ void __launch_bounds__(kThreads) gemv_f32_rows_kernel(const TW* __restrict__ W, const float* __restrict__ x,
                                                                  int n, int k, int T, float* __restrict__ y, int ldy) {
@@ -783,12 +809,22 @@ __global__ void __launch_bounds__(kThreads) gemv_f32_rows_kernel(const TW* __res
     for (int t = 0; t < kGemvT; ++t) acc[t] = 0.0f;
     for (int c0 = 0; c0 < k4; c0 += kGemvK) {
         const int nc = min(kGemvK, k4 - c0);
+#if defined(STRATA_USE_HIP)
+        float4 a4[kGemvK / 32];   // (a whole chunk: gate_chunk's loads)
+        if (nc == kGemvK) gate_chunk_ld(w, c0, lane, a4);
+#endif
         __syncthreads();
         for (int i = (int) threadIdx.x; i < kGemvT * kGemvK; i += kThreads) {
             const int t = i / kGemvK, c = i % kGemvK;
             if (t < nt && c < nc) xs[t][c] = ((const float4*) (x + (size_t) (t0 + t) * k))[c0 + c];
         }
         __syncthreads();
+#if defined(STRATA_USE_HIP)
+        if (nc == kGemvK) {
+            gate_chunk_sum(a4, xs, lane, acc);
+            continue;
+        }
+#endif
         for (int c = lane; c < nc; c += 32) {
             const float4 a = gate_ld(w, c0 + c);
 #pragma unroll
@@ -834,12 +870,22 @@ __global__ void __launch_bounds__(kThreads) gemv_f32_pair_rows_kernel(const TW* 
     for (int t = 0; t < kGemvT; ++t) acc[t] = 0.0f;
     for (int c0 = 0; c0 < k4; c0 += kGemvK) {
         const int nc = min(kGemvK, k4 - c0);
+#if defined(STRATA_USE_HIP)
+        float4 a4[kGemvK / 32];   // (a whole chunk: gate_chunk's loads)
+        if (nc == kGemvK) gate_chunk_ld(w, c0, lane, a4);
+#endif
         __syncthreads();
         for (int i = (int) threadIdx.x; i < kGemvT * kGemvK; i += kThreads) {
             const int t = i / kGemvK, c = i % kGemvK;
             if (t < nt && c < nc) xs[t][c] = ((const float4*) (x + (size_t) (t0 + t) * k))[c0 + c];
         }
         __syncthreads();
+#if defined(STRATA_USE_HIP)
+        if (nc == kGemvK) {
+            gate_chunk_sum(a4, xs, lane, acc);
+            continue;
+        }
+#endif
         for (int c = lane; c < nc; c += 32) {
             const float4 a = gate_ld(w, c0 + c);
 #pragma unroll
