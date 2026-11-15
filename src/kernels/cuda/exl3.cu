@@ -472,7 +472,7 @@ __device__ __forceinline__ void slice_frags(const uint32_t (&w)[Words<K2>::R], u
         uint32_t s[8];
 #pragma unroll
         for (int j = 0; j < 8; ++j) s[j] = b >> ((7 - j) * 2);
-        decode_states<cb>(s, f);
+        decode_states<cb, Pk>(s, f);
         return;
     }
     if constexpr (Perm && (K2 & 1) != 0 && Words<K2>::R == 1) {
@@ -494,7 +494,7 @@ __device__ __forceinline__ void slice_frags(const uint32_t (&w)[Words<K2>::R], u
             s[4 * g + 1] = x >> (2 * KA + 1);
             s[4 * g + 0] = x >> (3 * KA + 2);
         }
-        decode_states<cb>(s, f);
+        decode_states<cb, Pk>(s, f);
         return;
     }
 #endif
@@ -563,6 +563,11 @@ struct BlockSmem {
 #define EXL3_WARP() ((int) (threadIdx.x >> 5))
 #endif
 
+// block_gemv's slices without the warp's stage where slice_frags has a lane-exchange form (EXL3_DECODE_PERM, default
+// 1; 0: the stage, as before) - the same bits either way
+#if !defined(EXL3_DECODE_PERM)
+#define EXL3_DECODE_PERM 1
+#endif
 // (kTag 1: the mixed kernels' own copy - sharing one with them changes how AMD compiles the others' arithmetic)
 template <int K2, int cb, class Input = Xin, int kTag = 0, int Tokens = kTok>
 __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int k0, int k1, const Input& x,
@@ -596,7 +601,9 @@ __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int
 #pragma unroll
         for (int s = 0; s < 8; ++s) {
             uint32_t f[4];
-            slice_frags<K2, cb, false, true>(wc[s], st, lane, f);   // (Pk: the decode GEMV's multiply)
+            // (Perm: K 2 and the half-integer K fetch the slice's words across lanes - no stage write, no two warp
+            //  syncs a slice; Pk: the decode GEMV's multiply.  The same words and states: the same bits)
+            slice_frags<K2, cb, EXL3_DECODE_PERM, true>(wc[s], st, lane, f);
 #if defined(EXL3_TC)
             uint32_t b0 = 0u, b1 = 0u;
             if (g < nc) {
