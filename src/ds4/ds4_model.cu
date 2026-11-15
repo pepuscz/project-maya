@@ -469,6 +469,26 @@ struct Pack {
                 dfds.push_back(os::open_direct(model_dir + "/" + files[i]));
                 pfds.push_back(os::open_par(model_dir + "/" + files[i]));
             }
+        // DS4_FILE_RANDOM=1 (opt-in): the pack's reads (read_at, the prompt path's streamed experts) through
+        // descriptors of their own advised at random (os::advise_random) - no readahead.  An EXL3 pack reads every
+        // streamed expert through the page cache; on Linux with large folios (ext4, 6.x / 7.x) readahead asks for
+        // contiguous folios, and their allocation compacts memory: compaction migrates the pages the GPUs mirror (the
+        // CPU lane's parts, cudaHostRegister'd), and each such move evicts every queue of the process on every GPU
+        // (KFD) until the driver re-validates them - ~6 times an 8K prompt, ~50 ms of all three GPUs stopped, on 2x RX
+        // 7900 XTX + a Radeon 8060S.  Single pages need no compaction.  The mappings and fds keep their readahead
+        {
+            const char* v = std::getenv("STRATA_DS4_FILE_RANDOM");
+            if (v == nullptr) v = std::getenv("DS4_FILE_RANDOM");
+            if (v != nullptr && std::atoi(v) != 0) {
+                if (pfds.empty())
+                    for (const std::string& fn : files) pfds.push_back(os::open_par(model_dir + "/" + fn));
+                int n_adv = 0;
+                for (os::fd_t fd : pfds) n_adv += os::advise_random(fd) ? 1 : 0;
+                std::fprintf(stderr, "ds4: DS4_FILE_RANDOM=1: the pack's reads through %d of %zu descriptors advised "
+                                     "at random (no readahead)\n",
+                             n_adv, pfds.size());
+            }
+        }
         // the Engram tables
         std::FILE* e = std::fopen((d + "/engram.bin").c_str(), "rb");
         if (e == nullptr) {
