@@ -312,11 +312,11 @@ inline uint64_t unlock_range(const void* p, uint64_t n) {
 /// Reads through f are at random: no readahead (Linux: POSIX_FADV_RANDOM - the page cache takes the pages read, one by
 /// one, never the large folios readahead asks for; elsewhere nothing).  False if the OS refused the advice
 inline bool advise_random(fd_t f) {
-#if defined(_WIN32)
+#if !defined(_WIN32) && defined(POSIX_FADV_RANDOM)
+    return f != kBadFd && posix_fadvise((int) f, 0, 0, POSIX_FADV_RANDOM) == 0;
+#else
     (void) f;
     return true;
-#else
-    return f != kBadFd && posix_fadvise((int) f, 0, 0, POSIX_FADV_RANDOM) == 0;
 #endif
 }
 inline void advise(fd_t f, uint64_t off, uint64_t n, bool need) {
