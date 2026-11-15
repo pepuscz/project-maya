@@ -365,7 +365,8 @@ struct Xin {
 // the 128-input chunk of x from k0 on: the lane's 4 values and their suh ...
 __device__ __forceinline__ void chunk_load(const Xin& x, const uint16_t* __restrict__ suh, int k0, int lane,
                                            float (&v)[4], float (&s)[4]) {
-    const int base = k0 + lane * 4;
+    // (unsigned: a scalar base and a 32-bit vector offset for each load on AMD, as load_tiles' - the same addresses)
+    const unsigned base = (unsigned) k0 + (unsigned) lane * 4u;
     if (x.f != nullptr) {
 #pragma unroll
         for (int i = 0; i < 4; ++i) v[i] = x.f[base + i];
@@ -471,8 +472,11 @@ __device__ __forceinline__ void load_tiles(const uint32_t* __restrict__ tile0, s
             const int i = lane + 32 * r;
 #if defined(STRATA_USE_HIP)
             // (AMD: every lane loads - a lane past the tile's words its last word again, a value no path reads - so no
-            //  exec mask around each load and no select after it)
-            w[s][r] = __ldg(tile0 + (size_t) s * sstride + ((W % 32 == 0 || i < W) ? i : W - 1));
+            //  exec mask around each load and no select after it.  The slice's base is the wave's (scalar) and the
+            //  lane's word an unsigned 32-bit offset, so a load can take the scalar base and a 32-bit vector offset
+            //  instead of a 64-bit vector address of its own.  The same addresses, the same bits)
+            const uint32_t* row = tile0 + (size_t) s * sstride;
+            w[s][r] = __ldg(row + (unsigned) ((W % 32 == 0 || i < W) ? i : W - 1));
 #else
             w[s][r] = (W % 32 == 0 || i < W) ? __ldg(tile0 + (size_t) s * sstride + i) : 0u;
 #endif
