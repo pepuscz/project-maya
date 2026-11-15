@@ -2378,11 +2378,18 @@ void bench_win() {
 // after a kernel change that keeps the bits)
 void bench_mv() {
     struct Shape { const char* name; int k, n, per_tok; };
-    const Shape shapes[] = {{"wq_a", 5120, 1280, 1},   {"wq_b", 1280, 32768, 1}, {"wkv", 5120, 512, 1},
-                            {"wo_a", 4096, 1024, 8},   {"wo_b", 8192, 5120, 1},  {"sh_w1", 5120, 2304, 2},
+    // BENCH_MV_TP=2: one tensor-parallel member's share (wq_b's heads, wo_a's groups and wo_b's input halved), as each
+    // XTX runs it in production; BENCH_MV_NC: the activations a call (a decode window's rows, default 1);
+    // BENCH_MV_K2: the code (default 12 = K6, the attention's in turboderp's 2.25 bpw)
+    const int tp = std::getenv("BENCH_MV_TP") ? std::max(1, std::atoi(std::getenv("BENCH_MV_TP"))) : 1;
+    const int nc = std::getenv("BENCH_MV_NC") ? std::max(1, std::min(8, std::atoi(std::getenv("BENCH_MV_NC")))) : 1;
+    const Shape shapes[] = {{"wq_a", 5120, 1280, 1},      {"wq_b", 1280, 32768 / tp, 1}, {"wkv", 5120, 512, 1},
+                            {"wo_a", 4096, 1024, 8 / tp}, {"wo_b", 8192 / tp, 5120, 1},  {"sh_w1", 5120, 2304, 2},
                             {"sh_w2", 2304, 5120, 1}};
     const char* only = std::getenv("BENCH_MV_ONLY");
-    const int k2 = 12, cb = 2, iters = std::getenv("BENCH_MV_ITERS") ? std::atoi(std::getenv("BENCH_MV_ITERS")) : 100;
+    const int k2 = std::getenv("BENCH_MV_K2") ? std::atoi(std::getenv("BENCH_MV_K2")) : 12, cb = 2,
+              iters = std::getenv("BENCH_MV_ITERS") ? std::atoi(std::getenv("BENCH_MV_ITERS")) : 100;
+    std::printf("  bench mv: K%g, %d activation(s) a call, tensor-parallel share 1/%d\n", k2 / 2.0, nc, tp);
     double tot_us = 0;
     for (const Shape& s : shapes) {
         if (only != nullptr && std::string(only) != s.name) continue;
@@ -2398,15 +2405,18 @@ void bench_mv() {
         m.n = s.n;
         m.k2 = k2;
         m.cb = cb;
-        const std::vector<float> x = rand_x(s.k, 2.0f);
+        const std::vector<float> x = rand_x((size_t) s.k * nc, 2.0f);
         float* d_x = dev_copy(x);
         float* d_y = nullptr;
-        CK(cudaMalloc(&d_y, (size_t) s.n * sizeof(float)));
+        CK(cudaMalloc(&d_y, (size_t) s.n * nc * sizeof(float)));
         ex::MvJob j;
         j.m = &m;
         j.xf = d_x;
         j.y = d_y;
         j.alpha = 1.0f;
+        j.ncol = nc;
+        j.xf_cs = s.k;
+        j.y_cs = s.n;
         for (int i = 0; i < 5; ++i) ex::mv(&j, 1, 0);
         cudaEvent_t a, b;
         cudaEventCreate(&a);
@@ -2418,7 +2428,7 @@ void bench_mv() {
         float ms = 0;
         cudaEventElapsedTime(&ms, a, b);
         const double us = 1000.0 * ms / iters;
-        const std::vector<float> y = host_copy(d_y, (size_t) s.n);
+        const std::vector<float> y = host_copy(d_y, (size_t) s.n * nc);
         uint64_t hsh = 1469598103934665603ull;
         for (float v : y) {
             uint32_t u;
