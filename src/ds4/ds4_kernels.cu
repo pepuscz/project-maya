@@ -743,6 +743,23 @@ __global__ void __launch_bounds__(kThreads) gemv_f32_kernel(const TW* __restrict
     const float acc = gate_row(W + (size_t) row * k, (const float4*) (x + (size_t) t * k), k / 4, lane);
     if (lane == 0) y[(size_t) t * ldy + row] = acc;
 }
+// (DS4_ROUTE_FUSE, a group's lead) x's T rows into the helper's request (xo, rows xo_stride apart) by blocks of the
+// router's launch past its GEMV blocks (block bi of nb): the copy runs beside the GEMVs instead of after the routing in
+// route_pair (RoutePair::x_sent) - ~3.5 us a row over a card's x4 link in trace 286, on the path before the helper starts
+__device__ __forceinline__ void x_export_blocks(const float* __restrict__ x, int k, int T, float* __restrict__ xo,
+                                                size_t xo_stride, int bi, int nb) {
+    const int k4 = k / 4, n4 = T * k4;
+    for (int i = bi * kThreads + (int) threadIdx.x; i < n4; i += nb * kThreads) {
+        const int t = i / k4, c = i - t * k4;
+        ((float4*) (xo + (size_t) t * xo_stride))[c] = ((const float4*) (x + (size_t) t * k))[c];
+    }
+}
+__global__ void __launch_bounds__(kThreads) x_export_kernel(const float* __restrict__ x, int k, int T,
+                                                            float* __restrict__ xo, size_t xo_stride) {
+    x_export_blocks(x, k, T, xo, xo_stride, (int) blockIdx.x, (int) gridDim.x);
+}
+// the export's blocks: up to 16 (a window's 16 rows of 5120: 80 blocks' worth, 5 passes each)
+static int x_export_nb(int k, int T) { return std::max(1, std::min(16, (T * (k / 4) + kThreads - 1) / kThreads)); }
 // (DS4_ROUTE_FUSE, a decoded token: T 1) two gemv_f32_kernel launches in one grid - its first cdiv(n0, 8) blocks are
 // W0's rows into y0, the rest W1's into y1 - each row gemv_f32_kernel's code (a warp a row, a lane's float4s c = lane +
 // 32 j in order, fmaf, the warp's sum), so each row's bits.  The old kernel stays as it is: route_fuse_check
@@ -751,8 +768,13 @@ template <typename TW>
 __global__ void __launch_bounds__(kThreads) gemv_f32_pair_kernel(const TW* __restrict__ W0, int n0,
                                                                  float* __restrict__ y0, const TW* __restrict__ W1,
                                                                  int n1, float* __restrict__ y1,
-                                                                 const float* __restrict__ x, int k) {
-    const int b0 = (n0 + kThreads / 32 - 1) / (kThreads / 32);
+                                                                 const float* __restrict__ x, int k,
+                                                                 float* __restrict__ xo, size_t xo_stride) {
+    const int b0 = (n0 + kThreads / 32 - 1) / (kThreads / 32), b1 = (n1 + kThreads / 32 - 1) / (kThreads / 32);
+    if ((int) blockIdx.x >= b0 + b1) {   // (xo given: x's row into the request)
+        x_export_blocks(x, k, 1, xo, xo_stride, (int) blockIdx.x - b0 - b1, (int) gridDim.x - b0 - b1);
+        return;
+    }
     const bool second = (int) blockIdx.x >= b0;
     const TW* W = second ? W1 : W0;
     const int n = second ? n1 : n0;
@@ -855,9 +877,15 @@ __global__ void __launch_bounds__(kThreads) gemv_f32_pair_rows_kernel(const TW* 
                                                                       const TW* __restrict__ W1, int n1,
                                                                       float* __restrict__ y1,
                                                                       const float* __restrict__ x, int k, int T,
-                                                                      int ldy) {
+                                                                      int ldy, float* __restrict__ xo,
+                                                                      size_t xo_stride) {
     __shared__ float4 xs[kGemvT][kGemvK];
-    const int b0 = (n0 + kThreads / 32 - 1) / (kThreads / 32);
+    const int b0 = (n0 + kThreads / 32 - 1) / (kThreads / 32), b1 = (n1 + kThreads / 32 - 1) / (kThreads / 32);
+    if ((int) blockIdx.x >= b0 + b1) {   // (xo given: x's rows into the request, by the first row of blocks)
+        if (blockIdx.y == 0)
+            x_export_blocks(x, k, T, xo, xo_stride, (int) blockIdx.x - b0 - b1, (int) gridDim.x - b0 - b1);
+        return;
+    }
     const bool second = (int) blockIdx.x >= b0;
     const TW* W = second ? W1 : W0;
     const int n = second ? n1 : n0;
@@ -3085,7 +3113,7 @@ __global__ void __launch_bounds__(512) route_pair_kernel(const RoutePair a) {
             on_cpu = cpu;
         }
         __syncthreads();
-        if (a.req != nullptr && on_cpu)
+        if (a.req != nullptr && on_cpu && !a.x_sent)   // (x_sent: the router's launch put them there)
             for (int i = threadIdx.x; i < a.dim; i += blockDim.x) a.req->x[t][i] = a.x[(size_t) t * a.dim + i];
         return;
     }
@@ -4076,15 +4104,21 @@ void gemv_f16_rows(const uint16_t* W, const float* x, size_t ldx, int n, int k, 
 
 template <typename TW>
 static bool gemv_f32_pair_t(const TW* W0, int n0, float* y0, const TW* W1, int n1, float* y1, const float* x, int k,
-                            cudaStream_t s, int T, int ldy) {
-    if (n0 < 1 || n1 < 1 || k < 4 || k % 4 != 0 || T < 1 || T > kWin || (T > 1 && ldy < std::max(n0, n1)))
+                            cudaStream_t s, int T, int ldy, float* xo, size_t xo_stride) {
+    if (n0 < 1 || n1 < 1 || k < 4 || k % 4 != 0 || T < 1 || T > kWin || (T > 1 && ldy < std::max(n0, n1)) ||
+        (xo != nullptr && xo_stride < (size_t) k))
         return false;
     const int b0 = (int) cdiv(n0, kThreads / 32), b1 = (int) cdiv(n1, kThreads / 32);
-    if (T == 1) gemv_f32_pair_kernel<TW><<<b0 + b1, kThreads, 0, s>>>(W0, n0, y0, W1, n1, y1, x, k);
+    const int bx = xo != nullptr ? x_export_nb(k, T) : 0;   // (the export's blocks past the GEMVs')
+    if (T == 1) gemv_f32_pair_kernel<TW><<<b0 + b1 + bx, kThreads, 0, s>>>(W0, n0, y0, W1, n1, y1, x, k, xo, xo_stride);
     else   // (=2, a window's rows)
-        gemv_f32_pair_rows_kernel<TW><<<dim3(b0 + b1, cdiv(T, kGemvT)), kThreads, 0, s>>>(W0, n0, y0, W1, n1, y1, x, k,
-                                                                                          T, ldy);
+        gemv_f32_pair_rows_kernel<TW><<<dim3(b0 + b1 + bx, cdiv(T, kGemvT)), kThreads, 0, s>>>(W0, n0, y0, W1, n1, y1,
+                                                                                               x, k, T, ldy, xo,
+                                                                                               xo_stride);
     return cudaGetLastError() == cudaSuccess;
+}
+void x_export(const float* x, int k, int T, float* xo, size_t xo_stride, cudaStream_t s) {
+    if (T > 0 && k % 4 == 0) x_export_kernel<<<x_export_nb(k, T), kThreads, 0, s>>>(x, k, T, xo, xo_stride);
 }
 template <typename TW>
 static void gemv_f32_t(const TW* W, const float* x, int n, int k, int T, float* y, int ldy, cudaStream_t s) {
@@ -4095,8 +4129,8 @@ static void gemv_f32_t(const TW* W, const float* x, int n, int k, int T, float* 
                    T, y, ldy);
 }
 bool gemv_f32_pair(const float* W0, int n0, float* y0, const float* W1, int n1, float* y1, const float* x, int k,
-                   cudaStream_t s, int T, int ldy) {
-    return gemv_f32_pair_t(W0, n0, y0, W1, n1, y1, x, k, s, T, ldy);
+                   cudaStream_t s, int T, int ldy, float* xo, size_t xo_stride) {
+    return gemv_f32_pair_t(W0, n0, y0, W1, n1, y1, x, k, s, T, ldy, xo, xo_stride);
 }
 void gemv_f32(const float* W, const float* x, int n, int k, int T, float* y, int ldy, cudaStream_t s) {
     gemv_f32_t(W, x, n, k, T, y, ldy, s);
@@ -4106,15 +4140,17 @@ void gemv_f32(GateW W, const float* x, int n, int k, int T, float* y, int ldy, c
     else gemv_f32_t(W.f, x, n, k, T, y, ldy, s);
 }
 bool gemv_f32_pair(GateW W0, int n0, float* y0, GateW W1, int n1, float* y1, const float* x, int k, cudaStream_t s,
-                   int T, int ldy) {
+                   int T, int ldy, float* xo, size_t xo_stride) {
     if ((W0.h != nullptr) == (W1.h != nullptr))
-        return W0.h != nullptr ? gemv_f32_pair_t(W0.h, n0, y0, W1.h, n1, y1, x, k, s, T, ldy)
-                               : gemv_f32_pair_t(W0.f, n0, y0, W1.f, n1, y1, x, k, s, T, ldy);
+        return W0.h != nullptr ? gemv_f32_pair_t(W0.h, n0, y0, W1.h, n1, y1, x, k, s, T, ldy, xo, xo_stride)
+                               : gemv_f32_pair_t(W0.f, n0, y0, W1.f, n1, y1, x, k, s, T, ldy, xo, xo_stride);
     // (one router BF16, the other F32: each its own launch - a row's code and so its bits are the pair's)
-    if (n0 < 1 || n1 < 1 || k < 4 || k % 4 != 0 || T < 1 || T > kWin || (T > 1 && ldy < std::max(n0, n1)))
+    if (n0 < 1 || n1 < 1 || k < 4 || k % 4 != 0 || T < 1 || T > kWin || (T > 1 && ldy < std::max(n0, n1)) ||
+        (xo != nullptr && xo_stride < (size_t) k))
         return false;
     gemv_f32(W0, x, n0, k, T, y0, T > 1 ? ldy : n0, s);
     gemv_f32(W1, x, n1, k, T, y1, T > 1 ? ldy : n1, s);
+    if (xo != nullptr) x_export(x, k, T, xo, xo_stride, s);
     return cudaGetLastError() == cudaSuccess;
 }
 
