@@ -14033,54 +14033,68 @@ struct Model::Impl {
                 const unsigned long long* vt = c.vram == 0 ? l.vram_tab : vram;
                 if (c.vram == 0 && vt == nullptr) continue;   // (no VRAM table on this member: nothing to compare)
                 if (c.vram != 0 && n > 512) continue;
-                const unsigned seq = 0x51u + (unsigned) runs;
-                run("the routing", l.il,
-                    [&] {
-                        if (c.logits == 0) {   // (the logits: the first gates' on this x, the same in both sets)
-                            gemv_f32(l.gate_w, x, n, D, T, F(0, kLog), 1024, s);
-                            gemv_f32(nx.gate_w, x, an, D, T, F(0, kLogA), 1024, s);
-                            gemv_f32(l.gate_w, x, n, D, T, F(1, kLog), 1024, s);
-                            gemv_f32(nx.gate_w, x, an, D, T, F(1, kLogA), 1024, s);
-                        } else {
-                            for (int b = 0; b < 2; ++b)
-                                if (cudaMemcpyAsync(F(b, kLog), lg, (size_t) T * 1024 * 4, cudaMemcpyDeviceToDevice,
-                                                    s) != cudaSuccess ||
-                                    cudaMemcpyAsync(F(b, kLogA), lga, (size_t) T * 1024 * 4, cudaMemcpyDeviceToDevice,
-                                                    s) != cudaSuccess)
+                // (xs 1: x exported by the router's launch, as a lead runs it - gemv_f32_pair's xo, RoutePair::x_sent -
+                //  against the old launches plus x's rows in their request: the request holds x either way)
+                for (int xs = 0; xs < 2 && bad.empty(); ++xs) {
+                    const unsigned seq = 0x51u + (unsigned) runs;
+                    run(xs ? "the routing, x exported" : "the routing", l.il,
+                        [&] {
+                            if (c.logits == 0) {   // (the logits: the first gates' on this x, the same in both sets)
+                                gemv_f32(l.gate_w, x, n, D, T, F(0, kLog), 1024, s);
+                                gemv_f32(nx.gate_w, x, an, D, T, F(0, kLogA), 1024, s);
+                                gemv_f32(l.gate_w, x, n, D, T, F(1, kLog), 1024, s);
+                                gemv_f32(nx.gate_w, x, an, D, T, F(1, kLogA), 1024, s);
+                            } else {
+                                for (int b = 0; b < 2; ++b)
+                                    if (cudaMemcpyAsync(F(b, kLog), lg, (size_t) T * 1024 * 4, cudaMemcpyDeviceToDevice,
+                                                        s) != cudaSuccess ||
+                                        cudaMemcpyAsync(F(b, kLogA), lga, (size_t) T * 1024 * 4, cudaMemcpyDeviceToDevice,
+                                                        s) != cudaSuccess)
+                                        return false;
+                            }
+                            Req* rq = (Req*) (set[0] + at[kReq]);
+                            route_ahead(F(0, kLogA), rba, an, c.m, T, rq, 0, s);
+                            route_publish(F(0, kLog), rb0, n, l.k_exp, T, g.route_scale, vt, x, D, (int*) F(0, kIdx),
+                                          F(0, kW), (unsigned long long*) F(0, kPlan), rq, seq, s, bv, vl, c.m, 0);
+                            return !xs || cudaMemcpy2DAsync(&rq->x[0][0], (size_t) kMaxDim * 4, x, (size_t) D * 4,
+                                                            (size_t) D * 4, (size_t) T, cudaMemcpyDeviceToDevice,
+                                                            s) == cudaSuccess;
+                        },
+                        [&] {
+                            Req* rq1 = (Req*) (set[1] + at[kReq]);
+                            if (xs && c.logits == 0) {   // (the pair launch as a lead's: the same logits, x into rq1)
+                                if (!gemv_f32_pair(l.gate_w, n, F(1, kLog), nx.gate_w, an, F(1, kLogA), x, D, s, T, 1024,
+                                                   &rq1->x[0][0], (size_t) kMaxDim))
                                     return false;
-                        }
-                        Req* rq = (Req*) (set[0] + at[kReq]);
-                        route_ahead(F(0, kLogA), rba, an, c.m, T, rq, 0, s);
-                        route_publish(F(0, kLog), rb0, n, l.k_exp, T, g.route_scale, vt, x, D, (int*) F(0, kIdx),
-                                      F(0, kW), (unsigned long long*) F(0, kPlan), rq, seq, s, bv, vl, c.m, 0);
-                        return true;
-                    },
-                    [&] {
-                        RoutePair a;
-                        a.logits = F(1, kLog);
-                        a.bias = rb0;
-                        a.n = n;
-                        a.k = l.k_exp;
-                        a.route_scale = g.route_scale;
-                        a.vram = vt;
-                        a.x = x;
-                        a.dim = D;
-                        a.idx = (int*) F(1, kIdx);
-                        a.w = F(1, kW);
-                        a.plan_ptr = (unsigned long long*) F(1, kPlan);
-                        a.req = (Req*) (set[1] + at[kReq]);
-                        a.vl = vl;
-                        a.bias_vl = vl != 0 ? bv : nullptr;
-                        a.seq = seq;
-                        a.na0 = c.m;
-                        a.a_logits = F(1, kLogA);
-                        a.a_bias = rba;
-                        a.a_n = an;
-                        a.m = c.m;
-                        a.T = T;
-                        return route_pair(a, s);
-                    },
-                    c.logits == 0 ? (size_t) n : 1024, c.logits == 0 ? (size_t) an : 1024, l.k_exp);
+                            } else if (xs)
+                                x_export(x, D, T, &rq1->x[0][0], (size_t) kMaxDim, s);
+                            RoutePair a;
+                            a.logits = F(1, kLog);
+                            a.bias = rb0;
+                            a.n = n;
+                            a.k = l.k_exp;
+                            a.route_scale = g.route_scale;
+                            a.vram = vt;
+                            a.x = x;
+                            a.dim = D;
+                            a.idx = (int*) F(1, kIdx);
+                            a.w = F(1, kW);
+                            a.plan_ptr = (unsigned long long*) F(1, kPlan);
+                            a.req = (Req*) (set[1] + at[kReq]);
+                            a.vl = vl;
+                            a.bias_vl = vl != 0 ? bv : nullptr;
+                            a.seq = seq;
+                            a.na0 = c.m;
+                            a.a_logits = F(1, kLogA);
+                            a.a_bias = rba;
+                            a.a_n = an;
+                            a.m = c.m;
+                            a.T = T;
+                            a.x_sent = xs != 0;
+                            return route_pair(a, s);
+                        },
+                        c.logits == 0 ? (size_t) n : 1024, c.logits == 0 ? (size_t) an : 1024, l.k_exp);
+                }
             }
             cudaFree(in);   // (every run ended cleanly)
             cudaFree(out);
@@ -14091,9 +14105,10 @@ struct Model::Impl {
             for (const auto& p : pairs) ids += (ids.empty() ? "" : " ") + std::to_string(p.first->il);
             std::fprintf(stderr,
                          "ds4: CUDA%d route fuse check%s: %d runs (gates of layers %s and their next; the routing: "
-                         "real, tied, past 20 and negative logits, the request's x copied and not, the image bias off "
-                         "/ on / given and off, n 257, m 1 .. 16): both logits, the picks, weights, plan and the whole "
-                         "request the old launches' bit for bit, all finite, every guard intact (DS4_ROUTE_FUSE%s)\n",
+                         "real, tied, past 20 and negative logits, the request's x copied and not, or exported by the "
+                         "router's launch, the image bias off / on / given and off, n 257, m 1 .. 16): both logits, the "
+                         "picks, weights, plan and the whole request the old launches' bit for bit, all finite, every "
+                         "guard intact (DS4_ROUTE_FUSE%s)\n",
                          d.id, rows.c_str(), runs, ids.c_str(), T > 1 ? "=2" : "");
         }
         return true;
@@ -22322,8 +22337,12 @@ struct Model::Impl {
                 rp.T = T;
             }
             if (route_fusable(l, nx1, m1, D)) {   // (a GEMV not gone in reaches no routing; a routing, no publish)
+                // (x's rows into the request by the router's launch, beside its GEMVs - route_pair need not copy them
+                //  after the routing; checked at load with the rest, route_fuse_check)
+                float* xo = &rp.req->x[0][0];
+                rp.x_sent = true;
                 if (!gemv_f32_pair(l.gate_w, l.n_exp, d.glog, nx1->gate_w, nx1->n_exp, d.glog_a, d.x, D, s, T,
-                                   1024) ||
+                                   1024, xo, (size_t) kMaxDim) ||
                     !route_pair(rp, s)) {
                     err = "the fused router stage: a launch did not go in";
                     return false;
