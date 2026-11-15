@@ -179,6 +179,10 @@ bool win_experts(const WinArgs& a, cudaStream_t s);
 /// max_groups groups, the input split's scratch for T rows - checked without a launch or a message, so a caller can
 /// route a layer's experts elsewhere up front
 bool win_rows_covered(const WinArgs& a);
+/// (EXL3_PHASE_PROF builds, exl3_test): block_gemv's phase cycle sums since the last reset - prologue, chunk store +
+/// block sync, next loads issued, slice 0's fragment, slices 1-7's fragments, products, epilogue, whole, calls - then
+/// zeroed if reset.  false without EXL3_PHASE_PROF
+bool phase_prof(unsigned long long (&v)[9], bool reset);
 /// Whether the current device runs the several-activation kernels (win_experts; mv's ncol > 1): every device does
 /// (they take ~10 KB of shared memory a block).
 bool several_ok();

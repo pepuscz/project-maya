@@ -563,6 +563,20 @@ struct BlockSmem {
 #define EXL3_WARP() ((int) (threadIdx.x >> 5))
 #endif
 
+// EXL3_PHASE_PROF (a diagnostics build for exl3_test only, never production): each wave adds up the shader cycles of
+// block_gemv's phases (s_getreg SHADER_CYCLES, 20 bits: deltas within a wave only) and its lane 0 adds the sums to
+// exl3_pp at the end - 0 the prologue (first tile loads, first chunk), 1 the chunk store and the block sync, 2 the
+// next chunk's loads issued, 3 slice 0's fragment (the wait for the chunk's tiles in it), 4 slices 1-7's fragments
+// (the stage or lane exchange, the state decode), 5 the products, 6 the epilogue, 7 the whole call, 8 calls (waves).
+// The reads sit at slice boundaries, so the compiler may move a little work across them: shares, not exact splits
+#if defined(EXL3_PHASE_PROF) && defined(STRATA_USE_HIP)
+#define EXL3_PP 1
+constexpr int kPhases = 9;
+__device__ unsigned long long exl3_pp[kPhases];
+#define EXL3_PP_T() ((uint32_t) __builtin_readcyclecounter())
+#define EXL3_PP_ADD(i, a, b) (pp[i] += ((b) - (a)) & 0xFFFFFu)
+#endif
+
 // block_gemv's slices without the warp's stage where slice_frags has a lane-exchange form (EXL3_DECODE_PERM, default
 // 1; 0: the stage, as before) - the same bits either way
 #if !defined(EXL3_DECODE_PERM)
@@ -572,6 +586,9 @@ struct BlockSmem {
 template <int K2, int cb, class Input = Xin, int kTag = 0, int Tokens = kTok>
 __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int k0, int k1, const Input& x,
                            const uint16_t* __restrict__ suh, int nc, BlockSmem<K2, Tokens>& sm) {
+#if defined(EXL3_PP)
+    uint32_t pp[kPhases - 1] = {}, pt0 = EXL3_PP_T(), pa, pb, pc;
+#endif
     constexpr int W = Words<K2>::W, R = Words<K2>::R;
     const int lane = threadIdx.x & 31, warp = EXL3_WARP(), g = lane >> 2, t = lane & 3;
     const size_t sstride = (size_t) ld * W;
@@ -590,20 +607,42 @@ __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int
 #pragma unroll
     for (int cc = 0; cc < Tokens; ++cc) acc[cc][0] = acc[cc][1] = 0.0f;
 #endif
+#if defined(EXL3_PP)
+    pa = EXL3_PP_T();
+    EXL3_PP_ADD(0, pt0, pa);
+#endif
     for (int q = 0; q < nq; ++q) {
         __half* xq = sm.xb + (q & 1) * (Tokens * kCols);
+#if defined(EXL3_PP)
+        pa = EXL3_PP_T();
+#endif
         if (rot) chunk_store(xv, xs4, lane, xq + warp * kCols);
         __syncthreads();
+#if defined(EXL3_PP)
+        pb = EXL3_PP_T();
+        EXL3_PP_ADD(1, pa, pb);
+#endif
         if (q + 1 < nq) {
             load_tiles<K2>(tile + (size_t) (q + 1) * 8 * sstride, sstride, lane, wn);
             if (rot) chunk_load(x, suh, k0 + (q + 1) * kCols, lane, xv, xs4);
         }
+#if defined(EXL3_PP)
+        pc = EXL3_PP_T();
+        EXL3_PP_ADD(2, pb, pc);
+#endif
 #pragma unroll
         for (int s = 0; s < 8; ++s) {
             uint32_t f[4];
             // (Perm: K 2 and the half-integer K fetch the slice's words across lanes - no stage write, no two warp
             //  syncs a slice; Pk: the decode GEMV's multiply.  The same words and states: the same bits)
+#if defined(EXL3_PP)
+            pa = EXL3_PP_T();
+#endif
             slice_frags<K2, cb, EXL3_DECODE_PERM, true>(wc[s], st, lane, f);
+#if defined(EXL3_PP)
+            pb = EXL3_PP_T();
+            EXL3_PP_ADD(s == 0 ? 3 : 4, pa, pb);
+#endif
 #if defined(EXL3_TC)
             uint32_t b0 = 0u, b1 = 0u;
             if (g < nc) {
@@ -650,12 +689,19 @@ __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int
                     }
                 }
 #endif
+#if defined(EXL3_PP)
+            pc = EXL3_PP_T();
+            EXL3_PP_ADD(5, pb, pc);
+#endif
         }
 #pragma unroll
         for (int s = 0; s < 8; ++s)
 #pragma unroll
             for (int r = 0; r < R; ++r) wc[s][r] = wn[s][r];
     }
+#if defined(EXL3_PP)
+    pa = EXL3_PP_T();
+#endif
     const int o = warp * 16 + g;
 #if defined(EXL3_TC)
     // c: the tile's outputs g (c[0], c[1]) and g + 8 (c[2], c[3]) for activations 2t (c[0], c[2]) and 2t + 1
@@ -684,6 +730,16 @@ __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int
         }
 #endif
     __syncthreads();
+#if defined(EXL3_PP)
+    pb = EXL3_PP_T();
+    EXL3_PP_ADD(6, pa, pb);
+    EXL3_PP_ADD(7, pt0, pb);
+    if (lane == 0) {
+#pragma unroll
+        for (int i = 0; i < kPhases - 1; ++i) atomicAdd(&exl3_pp[i], (unsigned long long) pp[i]);
+        atomicAdd(&exl3_pp[kPhases - 1], 1ull);
+    }
+#endif
 }
 
 // one warp: y[c] = alpha * (H(red) * svh)[c] + bias[c] for the block's 128 outputs
@@ -3302,6 +3358,21 @@ void moe_down(const MoeArgs& a, const float* h, const float* sh_out, float* out,
     if (!dispatch<RunDown>(a.lay.k2[2], a.lay.cb, m, s))
         std::fprintf(stderr, "exl3 moe_down: K %g cb %d\n", a.lay.k2[2] / 2.0, a.lay.cb);
     launch_check("moe_down");
+}
+
+bool phase_prof(unsigned long long (&v)[9], bool reset) {
+#if defined(EXL3_PP)
+    if (cudaDeviceSynchronize() != cudaSuccess || cudaMemcpyFromSymbol(v, exl3_pp, sizeof v) != cudaSuccess) return false;
+    if (reset) {
+        const unsigned long long z[kPhases] = {};
+        if (cudaMemcpyToSymbol(exl3_pp, z, sizeof z) != cudaSuccess) return false;
+    }
+    return true;
+#else
+    (void) v;
+    (void) reset;
+    return false;
+#endif
 }
 
 bool win_rows_covered(const WinArgs& a) {
