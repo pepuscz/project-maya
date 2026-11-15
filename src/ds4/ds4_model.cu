@@ -6758,14 +6758,21 @@ struct Model::Impl {
         }();
         return w;
     }
-    // DS4_SET_GUARD=1 (#142 diagnostics, opt-in): the helper's set kernels check their arguments (SetArgs' guard
+    // DS4_SET_GUARD=<m> (#142 diagnostics, opt-in): the helper's set kernels check their arguments (SetArgs' guard
     // words, the pointers they read through) before using them; a launch that finds them wrong does no work and says
-    // what it saw - the layer's light sums are then wrong (a diagnostic run's, not a server's).  One record for the
-    // helper, host-mapped (both leads read it)
+    // what it saw.  m 1: the layer goes on (its light sums wrong - a diagnostic run's); 2: the request fails (the
+    // devices fine: no launch read through the wrong arguments).  One record for the helper, host-mapped (both leads
+    // read it)
+    static int set_guard_mode() {
+        static const int m = [] {
+            const char* v = ds4_env("DS4_SET_GUARD");
+            return v != nullptr ? std::max(0, std::min(2, std::atoi(v))) : 0;
+        }();
+        return m;
+    }
     unsigned* set_guard_buf() const {
         static unsigned* const buf = [this]() -> unsigned* {
-            const char* v = ds4_env("DS4_SET_GUARD");
-            if (v == nullptr || std::atoi(v) <= 0) return nullptr;
+            if (set_guard_mode() == 0) return nullptr;
             unsigned *p = nullptr, *dp = nullptr;
             int prev = 0;
             bool ok = cudaGetDevice(&prev) == cudaSuccess &&
@@ -6775,16 +6782,20 @@ struct Model::Impl {
             ok = ok && cudaSetDevice(helper_id) == cudaSuccess &&
                  cudaHostGetDevicePointer((void**) &dp, p, 0) == cudaSuccess && x3::set_guard(dp);
             ok = cudaSetDevice(prev) == cudaSuccess && ok;
-            std::fprintf(stderr, ok ? "ds4: DS4_SET_GUARD=1 (#142): the helper's set kernels check their arguments first\n"
-                                    : "ds4: DS4_SET_GUARD: its record failed - no checks\n");
+            if (ok)
+                std::fprintf(stderr, "ds4: DS4_SET_GUARD=%d (#142): the helper's set kernels check their arguments first "
+                                     "(a bad launch: %s)\n",
+                             set_guard_mode(), set_guard_mode() >= 2 ? "the request fails" : "the layer goes on");
+            else
+                std::fprintf(stderr, "ds4: DS4_SET_GUARD: its record failed - no checks\n");
             return ok ? p : nullptr;
         }();
         return buf;
     }
-    // (DS4_SET_GUARD) the set kernels' record after the layer's light experts: every bad launch said so
-    static void set_guard_report(unsigned* d, int il) {
+    // (DS4_SET_GUARD) the set kernels' record after the layer's light experts: every bad launch said so (true: one did)
+    static bool set_guard_report(unsigned* d, int il) {
         const unsigned n = __atomic_exchange_n(&d[0], 0u, __ATOMIC_SEQ_CST);
-        if (n == 0) return;
+        if (n == 0) return false;
         std::string m = "ds4: DS4_SET_GUARD (#142): layer " + std::to_string(il) + ": " + std::to_string(n) +
                         " set-kernel blocks found bad arguments; the first saw:";
         for (int i = 1; i < x3::kSetDiagWords; ++i) {
@@ -6794,6 +6805,7 @@ struct Model::Impl {
         }
         std::fprintf(stderr, "%s\n", m.c_str());
         std::fflush(stderr);
+        return true;
     }
     bool light_ok(const Layer& L0) const {
         return prompt_light() > 0 && helper_id >= 0 && flow_helper && file_experts && !helper_dead.load() &&
@@ -18772,7 +18784,11 @@ struct Model::Impl {
                 err = "the helper's light experts of layer " + std::to_string(L0.il) + " failed (DS4_PROMPT_LIGHT)";
                 return false;
             }
-            if (c.lt_diag != nullptr) set_guard_report(c.lt_diag, L0.il);
+            if (c.lt_diag != nullptr && set_guard_report(c.lt_diag, L0.il) && set_guard_mode() >= 2) {
+                err = "the helper's set kernels of layer " + std::to_string(L0.il) +
+                      " had bad arguments (DS4_SET_GUARD, #142)";
+                return false;
+            }
             light_add(c.acc, c.lt_hy, c.lt_dlidx, c.pos, c.rw, T, l.k_exp, D, s);
         }
         if (xsum) moe_x_finish(c.acc, c.acc64, (size_t) T * D, s);
