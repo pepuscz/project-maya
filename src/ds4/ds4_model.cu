@@ -1819,7 +1819,8 @@ struct Model::Impl {
         int ram = -1;   // (copy_mode, `in` held in RAM) the spare slot `out` is copied into from VRAM
         unsigned win = 0;   // (win_now at the tick that queued it)
         bool xch = false;   // (DS4_SETTLE_IDLE_MS) an idle exchange: `in` comes out of the helper's pool, `out` takes its place
-        const uint8_t* pool = nullptr;   // (xch) `in`'s blob in the helper's pool: the copy reads it there, not the file
+        bool dec = false;   // (DS4_SETTLE_DECODE) a decode one: `in` from the pool into VRAM, `out` to its file (dec_dups)
+        const uint8_t* pool = nullptr;   // (xch, dec) `in`'s blob in the helper's pool: the copy reads it there, not the file
     };
     static constexpr int kMaxSwaps = 8;
     // the swap rule: a CPU-lane expert in when its heat passes the coldest VRAM one's x margin + bonus; heat x decay
@@ -2149,6 +2150,7 @@ struct Model::Impl {
     struct SwapBufs {
         uint8_t *a = nullptr, *b = nullptr, *h = nullptr;
         std::vector<cudaStream_t> st;   // a copy stream a device
+        cudaStream_t hs = nullptr;      // (on the helper: reads out of its pool beside its work)
     };
     std::vector<SwapBufs> sw_bufs;
     std::vector<std::thread> cache_ths;
@@ -12165,11 +12167,13 @@ struct Model::Impl {
                                  l.il, sw.in, sw.out);
             } else {
                 bool from_pool = false;
-                if (sw.xch && sw.pool != nullptr) {   // (the exchange: `in`'s bytes already in memory, in the idle helper's
-                    int cur = 0;                       //  pool - into pinned memory, no page cache, no file read)
-                    cudaGetDevice(&cur);
+                if (sw.pool != nullptr) {   // (an exchange: `in`'s bytes already in memory, in the helper's pool - into
+                    int cur = 0;             //  pinned memory on a stream of its own, beside the helper's work during
+                    cudaGetDevice(&cur);     //  decode (DS4_SETTLE_DECODE): no page cache, no file read)
                     from_pool = cudaSetDevice(helper_id) == cudaSuccess &&
-                                cudaMemcpy(B.a, sw.pool, l.blob, cudaMemcpyDeviceToHost) == cudaSuccess;
+                                (B.hs != nullptr || cudaStreamCreateWithFlags(&B.hs, cudaStreamNonBlocking) == cudaSuccess) &&
+                                cudaMemcpyAsync(B.a, sw.pool, l.blob, cudaMemcpyDeviceToHost, B.hs) == cudaSuccess &&
+                                cudaStreamSynchronize(B.hs) == cudaSuccess;
                     if (!from_pool) (void) cudaGetLastError();
                     cudaSetDevice(cur);
                 }
@@ -12852,6 +12856,11 @@ struct Model::Impl {
             --sw_inflight;
             ++st.swaps;
             if (sw.xch) xch_finish(l, sw);
+            if (sw.dec) {   // (`in` in VRAM and still in the pool: its place there refilled at the next idle moment)
+                --dec_inflight;
+                ++dec_done;
+                dec_dups.push_back({l.il, sw.in});
+            }
         }
     }
     // the next moves: per layer the hottest CPU-lane expert the windows used, in place of the coldest VRAM one (and of
@@ -12945,6 +12954,7 @@ struct Model::Impl {
             ram_queue.push_back(rs);
             rqueued = true;
         }
+        if (settle_dec_on() && dec_queue()) queued = true;
         if (queued) sw_cv.notify_all();
         if (rqueued) ram_cv.notify_one();
     }
@@ -13050,20 +13060,9 @@ struct Model::Impl {
             return;
         }
         const int e = sw.out;
-        size_t need = l.blob;
-        for (int m = 0; m < l.nm; ++m) need = std::max(need, member(l, m).hblob);
-        if (xch_pin_n < need) {
-            if (xch_pin != nullptr) cudaFreeHost(xch_pin);
-            if (xch_half != nullptr) cudaFreeHost(xch_half);
-            xch_pin = xch_half = nullptr;
-            xch_pin_n = 0;
-            if (cudaHostAlloc((void**) &xch_pin, need, cudaHostAllocPortable) == cudaSuccess &&
-                cudaHostAlloc((void**) &xch_half, need, cudaHostAllocPortable) == cudaSuccess)
-                xch_pin_n = need;
-        }
         int cur = 0;
         cudaGetDevice(&cur);
-        bool ok = xch_pin_n >= need && vram_blob(l, l.spare_vram, xch_pin);
+        bool ok = xch_room(l) && vram_blob(l, l.spare_vram, xch_pin);
         const unsigned long long zero = 0ull, at = (unsigned long long) region;
         ok = ok && cudaSetDevice(helper_id) == cudaSuccess && cudaDeviceSynchronize() == cudaSuccess &&
              cudaMemcpy(l.helper_tab + sw.in, &zero, 8, cudaMemcpyHostToDevice) == cudaSuccess;
@@ -13114,6 +13113,127 @@ struct Model::Impl {
                          l.il, diff == 0 ? "matches" : "DIFFERS from", diff, both, held);
         }
     }
+    // DS4_SETTLE_DECODE=<n> (opt-in, with DS4_SETTLE_IDLE_MS; unset / 0: off): the idle exchange's move during decode
+    // too, at most n under way - each window's tick, the layers whose hottest pool expert passes their coldest VRAM
+    // one (the swap rule, DS4_CACHE_MARGIN / _BONUS; the CPU lane's own moves first, DS4_CACHE_INFLIGHT in all) bring
+    // it from the pool into VRAM on the expert cache's copy threads, which read the pool on a stream of the helper's
+    // own and copy into the cards off their turn (copy_open), and `out` goes back to its file.  The pool and its table
+    // are not touched while the helper works: `in` stays there too (VRAM has it, so the helper is never asked for it)
+    // and its place is refilled at the next idle moment (dec_refill: the layer's hottest expert neither tier holds,
+    // from its file).  Not bit for bit, as DS4_SETTLE_IDLE_MS
+    static int settle_dec_n() {
+        static const int v = [] {
+            const char* e = ds4_env("DS4_SETTLE_DECODE");
+            return e != nullptr ? std::max(0, std::atoi(e)) : 0;
+        }();
+        return v;
+    }
+    bool settle_dec_on() const { return settle_dec_n() > 0 && settle_idle_on(); }
+    std::vector<std::pair<int, int>> dec_dups;   // (layer, expert) moved into VRAM during decode, still in the pool
+    int dec_inflight = 0;
+    int64_t dec_done = 0, dec_said = 0, dec_refilled = 0;
+    double dec_t0 = 0;
+    // (cache_queue, a decode tick) the layers' best pool experts queued into VRAM, the biggest heat gain first
+    bool dec_queue() {
+        struct Cand {
+            float gain;
+            int layer, in, out;
+        };
+        std::vector<Cand> c;
+        for (const Layer& l : L) {
+            if (!xch_layer(l) || l.spare_vram < 0 || l.swap_pending) continue;
+            int hot = -1, cold = -1;
+            for (int e = 0; e < l.n_exp; ++e) {
+                const float h = l.heat[(size_t) e];
+                if (l.slot[(size_t) e] < 0) {
+                    if (l.helper[(size_t) e] != nullptr && (hot < 0 || h > l.heat[(size_t) hot])) hot = e;
+                } else if (cold < 0 || h < l.heat[(size_t) cold]) {
+                    cold = e;
+                }
+            }
+            if (hot >= 0 && cold >= 0 && l.heat[(size_t) hot] > l.heat[(size_t) cold] * c_margin + c_bonus)
+                c.push_back({l.heat[(size_t) hot] - l.heat[(size_t) cold], l.il, hot, cold});
+        }
+        std::sort(c.begin(), c.end(), [](const Cand& a, const Cand& b) { return a.gain > b.gain; });
+        bool queued = false;
+        for (const Cand& x : c) {
+            if (sw_inflight >= c_inflight || dec_inflight >= settle_dec_n()) break;
+            Layer& l = L[(size_t) x.layer];
+            l.swap_pending = true;
+            l.sw_in = x.in;
+            ++sw_inflight;
+            ++dec_inflight;
+            Swap sw{l.il, x.in, x.out};
+            sw.win = win_now.load(std::memory_order_relaxed);
+            sw.dec = true;
+            sw.pool = l.helper[(size_t) x.in];
+            std::lock_guard<std::mutex> lk(sw_mu);
+            sw_queue.push_back(sw);
+            queued = true;
+        }
+        return queued;
+    }
+    // (the engine thread, idle, no swap under way) the pool places decode's moves left doubled - their expert in VRAM
+    // and the pool - each given the layer's hottest expert neither holds, read from its file; a few ms a call.  The
+    // helper idle (synchronized first), nobody reads the pool or its table
+    void dec_refill() {
+        const double t0 = now_ms();
+        int cur = 0;
+        cudaGetDevice(&cur);
+        while (!dec_dups.empty() && now_ms() - t0 < 4.0 && !helper_dead.load(std::memory_order_relaxed)) {
+            const auto [il, in] = dec_dups.back();
+            dec_dups.pop_back();
+            Layer& l = L[(size_t) il];
+            uint8_t* const region = l.helper[(size_t) in];
+            if (region == nullptr || l.slot[(size_t) in] < 0) continue;   // (back to the pool's alone, or gone)
+            int f = -1;
+            for (int e = 0; e < l.n_exp; ++e)
+                if (l.slot[(size_t) e] < 0 && l.helper[(size_t) e] == nullptr &&
+                    (f < 0 || l.heat[(size_t) e] > l.heat[(size_t) f]))
+                    f = e;
+            if (f < 0 || !xch_room(l)) continue;
+            xch_reg.resize(l.region_bytes[(size_t) f]);
+            const bool filed = f < (int) l.esplit.size() && l.esplit[(size_t) f]
+                                   ? read_split(l, f, xch_reg.data())
+                                   : pk.read_at(l.region_file[(size_t) f], l.region_off[(size_t) f],
+                                                l.region_bytes[(size_t) f], xch_reg.data());
+            if (!filed) continue;   // (the place keeps `in`: nothing changed)
+            std::memset(xch_pin, 0, l.blob);
+            repack(l, f, xch_reg.data(), xch_pin);
+            const unsigned long long zero = 0ull, at = (unsigned long long) region;
+            bool ok = cudaSetDevice(helper_id) == cudaSuccess && cudaDeviceSynchronize() == cudaSuccess &&
+                      cudaMemcpy(l.helper_tab + in, &zero, 8, cudaMemcpyHostToDevice) == cudaSuccess;
+            l.helper[(size_t) in] = nullptr;
+            ok = ok && cudaMemcpy(region, xch_pin, l.blob, cudaMemcpyHostToDevice) == cudaSuccess &&
+                 cudaMemcpy(l.helper_tab + f, &at, 8, cudaMemcpyHostToDevice) == cudaSuccess;
+            if (!ok) {   // (the table and the pool may disagree: the CPU lane takes every pool pick from now on)
+                (void) cudaGetLastError();
+                st.helper_dead = 1;
+                if (!helper_dead.exchange(true))
+                    std::fprintf(stderr, "ds4: decode settle: refilling the helper's pool failed - the CPU lane takes "
+                                         "its picks from now on\n");
+                break;
+            }
+            l.helper[(size_t) f] = region;
+            ++dec_refilled;
+        }
+        cudaSetDevice(cur);
+    }
+    // the pinned buffers xch_finish and dec_refill write the pool from, l's size at least
+    bool xch_room(const Layer& l) {
+        size_t need = l.blob;
+        for (int m = 0; m < l.nm; ++m) need = std::max(need, member(l, m).hblob);
+        if (xch_pin_n < need) {
+            if (xch_pin != nullptr) cudaFreeHost(xch_pin);
+            if (xch_half != nullptr) cudaFreeHost(xch_half);
+            xch_pin = xch_half = nullptr;
+            xch_pin_n = 0;
+            if (cudaHostAlloc((void**) &xch_pin, need, cudaHostAllocPortable) == cudaSuccess &&
+                cudaHostAlloc((void**) &xch_half, need, cudaHostAllocPortable) == cudaSuccess)
+                xch_pin_n = need;
+        }
+        return xch_pin_n >= need;
+    }
     // (the engine thread, idle) the exchanges that landed switched in, the next ones queued: true while any is under way
     bool settle_idle_step() {
         if (!settle_idle_on()) return false;
@@ -13121,6 +13241,19 @@ struct Model::Impl {
         tick_begin();
         cache_switch();
         tick_flush();
+        if (!dec_dups.empty()) {   // (DS4_SETTLE_DECODE: decode's moves landed first, then their pool places refilled)
+            if (dec_t0 == 0) dec_t0 = now_ms();
+            if (sw_inflight > 0 || lend_held.load(std::memory_order_relaxed) || lent) return true;
+            dec_refill();
+            if (!dec_dups.empty() && !helper_dead.load(std::memory_order_relaxed)) return true;
+            dec_dups.clear();
+            std::fprintf(stderr, "ds4: decode settle: %lld experts moved from the helper's pool into VRAM during decode, "
+                                 "%lld pool places refilled in %.0f ms (DS4_SETTLE_DECODE)\n",
+                         (long long) (dec_done - dec_said), (long long) dec_refilled, now_ms() - dec_t0);
+            dec_said = dec_done;
+            dec_refilled = 0;
+            dec_t0 = 0;
+        }
         bool more = sw_inflight > 0;
         if (!lend_held.load(std::memory_order_relaxed) && !lent && !helper_dead.load(std::memory_order_relaxed)) {
             struct Cand {
