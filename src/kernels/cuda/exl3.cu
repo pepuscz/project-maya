@@ -590,6 +590,15 @@ struct BlockSmem {
 #define EXL3_WARP() ((int) (threadIdx.x >> 5))
 #endif
 
+// block_gemv's pipeline two chunks deep on AMD (EXL3_PIPE2, default 1; 0: one chunk, as before): the next chunk's input
+// rotated during this chunk and the one after's tiles and input issued, so the block's barrier stops waiting for the
+// rotating warps' memory.  The same loads, rotations and products in the same order: the same bits
+#if !defined(EXL3_PIPE2)
+#define EXL3_PIPE2 1
+#endif
+#if defined(STRATA_USE_HIP) && EXL3_PIPE2
+#define EXL3_PIPE2_ON 1
+#endif
 // (kTag 1: the mixed kernels' own copy - sharing one with them changes how AMD compiles the others' arithmetic)
 template <int K2, int cb, class Input = Xin, int kTag = 0, int Tokens = kTok>
 __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int k0, int k1, const Input& x,
@@ -604,7 +613,20 @@ __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int
     uint32_t wc[8][R], wn[8][R];
     float xv[4], xs4[4];
     load_tiles<K2>(tile, sstride, lane, wc);
+#if defined(EXL3_PIPE2_ON)
+    // (two chunks ahead: chunk q + 1's tiles in wn and its input rotated into its buffer during chunk q, chunk q + 2's
+    //  tiles and input issued then - so the barrier no longer waits on the rotating warps' memory)
+    uint32_t wn2[8][R];
+    float xv2[4], xs42[4];
+    if (nq > 1) load_tiles<K2>(tile + (size_t) 8 * sstride, sstride, lane, wn);
+    if (rot) {
+        chunk_load(x, suh, k0, lane, xv, xs4);
+        chunk_store(xv, xs4, lane, sm.xb + warp * kCols);   // (chunk 0 into buffer 0)
+        if (nq > 1) chunk_load(x, suh, k0 + kCols, lane, xv, xs4);
+    }
+#else
     if (rot) chunk_load(x, suh, k0, lane, xv, xs4);
+#endif
 #if defined(EXL3_TC)
     float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 #else
@@ -614,12 +636,31 @@ __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int
 #endif
     for (int q = 0; q < nq; ++q) {
         __half* xq = sm.xb + (q & 1) * (Tokens * kCols);
+#if defined(EXL3_PIPE2_ON)
+        // buffer q & 1 is complete (rotated during chunk q - 1, or before the loop) and every warp is past chunk q - 1,
+        // so buffer (q + 1) & 1 - chunk q - 1's - is free for chunk q + 1's input
+        __syncthreads();
+        if (q + 2 < nq) load_tiles<K2>(tile + (size_t) (q + 2) * 8 * sstride, sstride, lane, wn2);
+        if (rot && q + 1 < nq) {
+            const bool more = q + 2 < nq;
+            if (more) chunk_load(x, suh, k0 + (q + 2) * kCols, lane, xv2, xs42);
+            chunk_store(xv, xs4, lane, sm.xb + ((q + 1) & 1) * (Tokens * kCols) + warp * kCols);
+            if (more) {
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    xv[i] = xv2[i];
+                    xs4[i] = xs42[i];
+                }
+            }
+        }
+#else
         if (rot) chunk_store(xv, xs4, lane, xq + warp * kCols);
         __syncthreads();
         if (q + 1 < nq) {
             load_tiles<K2>(tile + (size_t) (q + 1) * 8 * sstride, sstride, lane, wn);
             if (rot) chunk_load(x, suh, k0 + (q + 1) * kCols, lane, xv, xs4);
         }
+#endif
 #pragma unroll
         for (int s = 0; s < 8; ++s) {
             uint32_t f[4];
@@ -674,7 +715,12 @@ __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int
 #pragma unroll
         for (int s = 0; s < 8; ++s)
 #pragma unroll
-            for (int r = 0; r < R; ++r) wc[s][r] = wn[s][r];
+            for (int r = 0; r < R; ++r) {
+                wc[s][r] = wn[s][r];
+#if defined(EXL3_PIPE2_ON)
+                wn[s][r] = wn2[s][r];
+#endif
+            }
     }
     const int o = warp * 16 + g;
 #if defined(EXL3_TC)
