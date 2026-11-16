@@ -403,6 +403,7 @@ public:
     double settle_idle_quiet_ms() const;
     bool settle_idle_step();
     void settle_idle_end();   ///< (before a request) the moves under way finished while still idle
+    void settle_prepare();    ///< (after load, before the first request) DS4_SETTLE_DECODE(_SSD)'s buffers
     const Stats& stats() const;
     std::string describe() const;
     /// INFO / VRAM lines for the server's Monitor.

@@ -1882,6 +1882,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         return true;
     };
     const bool multi = m.seq_count() > 1;
+    m.settle_prepare();   // (DS4_SETTLE_DECODE: its pinned buffers now, not in the first request's time)
     while (!multi) {   // one conversation: a request at a time
         end_if_broken();   // (the last request's DONE is out, on every path that ended it)
         g_busy.store(false);   // (waiting for a request: no watchdog)
