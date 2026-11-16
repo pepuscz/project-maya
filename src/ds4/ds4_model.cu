@@ -12221,7 +12221,14 @@ struct Model::Impl {
                 }
                 if (!file_experts)
                     for (int X = 0; X < NH; ++X) blob_to_part(l, B.b, X, l.spare_host[(size_t) X]);
-                if (sw.dec && sw.buf >= 0) {   // (DS4_SETTLE_DECODE: `out`'s blob out of the VRAM slot it still holds,
+                // (DS4_SETTLE_DECODE_OUT_FILE=1: `out`'s blob from its file - its pages, off the cards' links, which
+                //  the decode's all-reduces share)
+                static const bool out_file = env_f("DS4_SETTLE_DECODE_OUT_FILE", 0) != 0;
+                if (sw.dec && sw.buf >= 0 && out_file && file_experts) {
+                    const std::array<uint8_t*, 4> fp = {file_part(l, sw.out), nullptr, nullptr, nullptr};
+                    parts_to_blob(l, fp, dec_buf[sw.buf]);
+                    sw.ob_ok = true;
+                } else if (sw.dec && sw.buf >= 0) {   // (DS4_SETTLE_DECODE: `out`'s blob out of the VRAM slot it still holds,
                     uint8_t* const ob = dec_buf[sw.buf];   //  for the pool place `in` leaves - the members' parts joined)
                     bool ok = true;
                     for (int m = 0; m < l.nm && ok; ++m) {
@@ -12726,11 +12733,48 @@ struct Model::Impl {
         tick_jobs.clear();
     }
     void cache_tick(int T) {
+        const double t_in = now_ms();
         tick_begin();
         rc_tick();
         hr_tick(T);   // (DS4_HELPER_RECENT: before the swaps, whose queue takes this window's CPU-lane hits)
         swap_tick(T);
         tick_flush();
+        if (settle_dec_on() || settle_ssd_on()) win_time(T, t_in);
+    }
+    // (DS4_SETTLE_DECODE) the windows' time a token, by what was under way while they ran: nothing, the decode's moves,
+    // only the cache's own, only the pool's writes - the moves' cost on the critical path, said with the settle line
+    double wt_last = 0;
+    int wt_state = 0;
+    double wt_ms[4] = {}, wt_tick[4] = {};
+    int64_t wt_tok[4] = {}, wt_n[4] = {};
+    void win_time(int T, double t_in) {
+        const double t = now_ms();
+        if (wt_last > 0 && t - wt_last < 1000.0) {   // (a gap over a second: a request's start, not a window)
+            wt_ms[wt_state] += t - wt_last;
+            wt_tick[wt_state] += t - t_in;
+            wt_tok[wt_state] += T;
+            ++wt_n[wt_state];
+        }
+        wt_last = t;
+        bool pool = false;
+        for (int b = 0; b < kDecBufs && !pool; ++b) pool = dec_buf_state[b] >= 2;
+        wt_state = dec_inflight + ssd_inflight > 0 ? 1 : sw_inflight > 0 ? 2 : pool ? 3 : 0;
+    }
+    void win_time_say() {
+        static const char* nm[4] = {"nothing", "decode moves", "the cache's own moves", "pool writes only"};
+        std::string s;
+        for (int i = 0; i < 4; ++i) {
+            if (wt_n[i] == 0) continue;
+            char b[160];
+            std::snprintf(b, sizeof b, "%s%s: %lld windows, %lld tokens, %.2f ms a token (tick %.2f ms a window)",
+                          s.empty() ? "" : "; ", nm[i], (long long) wt_n[i], (long long) wt_tok[i],
+                          wt_ms[i] / (double) wt_tok[i], wt_tick[i] / (double) wt_n[i]);
+            s += b;
+            wt_ms[i] = wt_tick[i] = 0;
+            wt_tok[i] = wt_n[i] = 0;
+        }
+        wt_last = 0;
+        if (!s.empty()) std::fprintf(stderr, "ds4: decode settle: windows by what was under way - %s\n", s.c_str());
     }
     // (DS4_COPY_SWAP) the moves read in, switched while nothing reads the copies (between windows)
     void cs_switch() {
@@ -13386,6 +13430,7 @@ struct Model::Impl {
             bool pl;
         };
         static const float dm = env_f("DS4_SETTLE_DECODE_MARGIN", c_margin);
+        static const float sm = env_f("DS4_SETTLE_DECODE_SSD_MARGIN", dm);   // (the pool's leg: a CPU-lane pick costs ~20x)
         std::vector<Cand> c;
         const bool vram = settle_dec_on(), ssd = settle_ssd_on();
         for (const Layer& l : L) {
@@ -13403,7 +13448,7 @@ struct Model::Impl {
                     fhot = e;
                 }
             }
-            if (ssd && fhot >= 0 && pcold >= 0 && l.heat[(size_t) fhot] > l.heat[(size_t) pcold] * dm + c_bonus)
+            if (ssd && fhot >= 0 && pcold >= 0 && l.heat[(size_t) fhot] > l.heat[(size_t) pcold] * sm + c_bonus)
                 c.push_back({l.heat[(size_t) fhot] - l.heat[(size_t) pcold], l.il, fhot, pcold, true});
             else if (vram && l.spare_vram >= 0 && hot >= 0 && cold >= 0 && !mk[(size_t) cold] &&
                      l.heat[(size_t) hot] > l.heat[(size_t) cold] * dm + c_bonus)
@@ -13501,7 +13546,10 @@ struct Model::Impl {
     // (the engine thread, idle) the exchanges that landed switched in, the next ones queued: true while any is under way
     bool settle_idle_step() {
         if (!settle_idle_on()) return false;
-        if (xch_t0 == 0) xch_t0 = now_ms();
+        if (xch_t0 == 0) {
+            xch_t0 = now_ms();
+            if (settle_dec_on() || settle_ssd_on()) win_time_say();
+        }
         tick_begin();
         cache_switch();
         tick_flush();
