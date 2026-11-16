@@ -459,17 +459,34 @@ struct Words {
     static constexpr int W = 4 * K2, R = (W + 31) / 32;
 };
 
+// EXL3_BUFLOAD (default 1 on discrete RDNA 3 - gfx1100 / 1101 / 1102 - 32-lane waves; 0: global loads): load_tiles
+// through raw buffer loads.  Not on the APUs (gfx1150 / 1151): a Radeon 8060S's first cold window got slower there
+#if !defined(EXL3_BUFLOAD)
+#define EXL3_BUFLOAD 1
+#endif
+#if defined(STRATA_USE_HIP) && !defined(STRATA_HIP_WAVE64) && EXL3_BUFLOAD &&                                         \
+    (defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__))
+#define EXL3_BUFLOAD_ON 1
+#endif
 // the warp's tile of each of a chunk's 8 slices (slice s at tile0 + s sstride)
 template <int K2>
 __device__ __forceinline__ void load_tiles(const uint32_t* __restrict__ tile0, size_t sstride, int lane,
                                            uint32_t (&w)[8][Words<K2>::R]) {
     constexpr int W = Words<K2>::W, R = Words<K2>::R;
+#if defined(EXL3_BUFLOAD_ON)
+    // (AMD, EXL3_BUFLOAD: one buffer resource from the wave's tile base (scalar registers), the slice's offset a scalar
+    //  operand and the lane's word a 32-bit vector offset - no 64-bit vector address a load.  The same words)
+    const __amdgpu_buffer_rsrc_t rs = __builtin_amdgcn_make_buffer_rsrc((void*) tile0, (short) 0, 0x7fffffff, 0x31004000);
+#endif
 #pragma unroll
     for (int s = 0; s < 8; ++s)
 #pragma unroll
         for (int r = 0; r < R; ++r) {
             const int i = lane + 32 * r;
-#if defined(STRATA_USE_HIP)
+#if defined(EXL3_BUFLOAD_ON)
+            w[s][r] = __builtin_amdgcn_raw_buffer_load_b32(rs, 4 * ((W % 32 == 0 || i < W) ? i : W - 1),
+                                                          (int) (4 * (size_t) s * sstride), 0);
+#elif defined(STRATA_USE_HIP)
             // (AMD: every lane loads - a lane past the tile's words its last word again, a value no path reads - so no
             //  exec mask around each load and no select after it)
             w[s][r] = __ldg(tile0 + (size_t) s * sstride + ((W % 32 == 0 || i < W) ? i : W - 1));
