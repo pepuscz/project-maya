@@ -468,25 +468,36 @@ struct Words {
     (defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__))
 #define EXL3_BUFLOAD_ON 1
 #endif
-// the warp's tile of each of a chunk's 8 slices (slice s at tile0 + s sstride)
-template <int K2>
+// the warp's tile of each of a chunk's 8 slices (slice s at tile0 + s sstride); Buf false: the global loads even with
+// EXL3_BUFLOAD (mv_kernel's short inputs)
+template <int K2, bool Buf = true>
 __device__ __forceinline__ void load_tiles(const uint32_t* __restrict__ tile0, size_t sstride, int lane,
                                            uint32_t (&w)[8][Words<K2>::R]) {
     constexpr int W = Words<K2>::W, R = Words<K2>::R;
 #if defined(EXL3_BUFLOAD_ON)
-    // (AMD, EXL3_BUFLOAD: one buffer resource from the wave's tile base (scalar registers), the slice's offset a scalar
-    //  operand and the lane's word a 32-bit vector offset - no 64-bit vector address a load.  The same words)
-    const __amdgpu_buffer_rsrc_t rs = __builtin_amdgcn_make_buffer_rsrc((void*) tile0, (short) 0, 0x7fffffff, 0x31004000);
+    if constexpr (Buf) {
+        // (AMD, EXL3_BUFLOAD: one buffer resource from the wave's tile base (scalar registers), the slice's offset
+        //  a scalar operand and the lane's word a 32-bit vector offset - no 64-bit vector address a load.  The same
+        //  words)
+        const __amdgpu_buffer_rsrc_t rs =
+            __builtin_amdgcn_make_buffer_rsrc((void*) tile0, (short) 0, 0x7fffffff, 0x31004000);
+#pragma unroll
+        for (int s = 0; s < 8; ++s)
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                const int i = lane + 32 * r;
+                w[s][r] = __builtin_amdgcn_raw_buffer_load_b32(rs, 4 * ((W % 32 == 0 || i < W) ? i : W - 1),
+                                                              (int) (4 * (size_t) s * sstride), 0);
+            }
+        return;
+    }
 #endif
 #pragma unroll
     for (int s = 0; s < 8; ++s)
 #pragma unroll
         for (int r = 0; r < R; ++r) {
             const int i = lane + 32 * r;
-#if defined(EXL3_BUFLOAD_ON)
-            w[s][r] = __builtin_amdgcn_raw_buffer_load_b32(rs, 4 * ((W % 32 == 0 || i < W) ? i : W - 1),
-                                                          (int) (4 * (size_t) s * sstride), 0);
-#elif defined(STRATA_USE_HIP)
+#if defined(STRATA_USE_HIP)
             // (AMD: every lane loads - a lane past the tile's words its last word again, a value no path reads - so no
             //  exec mask around each load and no select after it)
             w[s][r] = __ldg(tile0 + (size_t) s * sstride + ((W % 32 == 0 || i < W) ? i : W - 1));
@@ -608,7 +619,7 @@ struct BlockSmem {
 #endif
 
 // (kTag 1: the mixed kernels' own copy - sharing one with them changes how AMD compiles the others' arithmetic)
-template <int K2, int cb, class Input = Xin, int kTag = 0, int Tokens = kTok>
+template <int K2, int cb, class Input = Xin, int kTag = 0, int Tokens = kTok, bool Buf = true>
 __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int k0, int k1, const Input& x,
                            const uint16_t* __restrict__ suh, int nc, BlockSmem<K2, Tokens>& sm) {
     constexpr int W = Words<K2>::W, R = Words<K2>::R;
@@ -620,7 +631,7 @@ __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int
     const int nq = (k1 - k0) / kCols;
     uint32_t wc[8][R], wn[8][R];
     float xv[4], xs4[4];
-    load_tiles<K2>(tile, sstride, lane, wc);
+    load_tiles<K2, Buf>(tile, sstride, lane, wc);
     if (rot) chunk_load(x, suh, k0, lane, xv, xs4);
 #if defined(EXL3_TC)
     float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -634,7 +645,7 @@ __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int
         if (rot) chunk_store(xv, xs4, lane, xq + warp * kCols);
         __syncthreads();
         if (q + 1 < nq) {
-            load_tiles<K2>(tile + (size_t) (q + 1) * 8 * sstride, sstride, lane, wn);
+            load_tiles<K2, Buf>(tile + (size_t) (q + 1) * 8 * sstride, sstride, lane, wn);
             if (rot) chunk_load(x, suh, k0 + (q + 1) * kCols, lane, xv, xs4);
         }
 #pragma unroll
@@ -792,7 +803,16 @@ __global__ void EXL3_BOUNDS(kMinBlocksMv<K2>) mv_kernel(const KBatch b) {
         if (J.xf != nullptr) x.f = J.xf + warp * J.xf_cs;
         else x.q = (const Q81*) ((const uint8_t*) J.xq + warp * J.xq_cs);
     }
-    EXL3_DECODE_INLINE block_gemv<K2, cb>(J.tr, J.ld, g * 8, k0, k1, x, J.suh, nc, sm);
+#if defined(EXL3_BUFLOAD_ON)
+    // (a short input - k below 2048 - keeps the global loads: DeepSeek-V4.1's wq_b, k 1280 n 32768, was 3 % slower
+    //  with the buffer loads in two runs of three on an RX 7900 XTX; its other GEMVs, k 2304 to 8192, 2 to 14 %
+    //  faster)
+    if (J.k < 2048)
+        EXL3_DECODE_INLINE block_gemv<K2, cb, Xin, 0, Single ? 1 : kTok, false>(J.tr, J.ld, g * 8, k0, k1, x, J.suh, nc,
+                                                                              sm);
+    else
+#endif
+        EXL3_DECODE_INLINE block_gemv<K2, cb>(J.tr, J.ld, g * 8, k0, k1, x, J.suh, nc, sm);
     const float* bias = J.bias != nullptr ? J.bias + g * kCols : nullptr;
     if (J.S == 1) {
         if (warp < nc)
