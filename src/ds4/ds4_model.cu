@@ -13090,15 +13090,24 @@ struct Model::Impl {
     }
     bool settle_on() const { return settle_ms() > 0.0 && o.expert_cache && !cache_ths.empty(); }
     std::vector<uint32_t> prof_run0;   // (the profile before the run)
+    // (DS4_SETTLE_PROMPT_HEAT=<n>: the run's picks scaled to n a layer in all - the profile's starting heat is ~512 -
+    //  so a long prompt points the way and the decode's own picks still decide; unset: its counts as they are)
+    static double settle_prompt_heat() {
+        static const double v = std::max(0.0, (double) env_f("DS4_SETTLE_PROMPT_HEAT", 0.0f));
+        return v;
+    }
     void settle_learn() {
         if (prof_run0.size() != prof.size()) return;
         for (Layer& l : L) {
             if (l.mtp || l.heat.size() < (size_t) l.n_exp || l.slot.size() < (size_t) l.n_exp) continue;
             const size_t o0 = (size_t) l.il * g.n_exp;
+            double sum = 0;
+            for (int e = 0; e < l.n_exp; ++e) sum += (double) (prof[o0 + (size_t) e] - prof_run0[o0 + (size_t) e]);
+            const double sc = settle_prompt_heat() > 0 && sum > 0 ? settle_prompt_heat() / sum : 1.0;
             for (int e = 0; e < l.n_exp; ++e) {
                 const uint32_t dn = prof[o0 + (size_t) e] - prof_run0[o0 + (size_t) e];
                 if (dn == 0) continue;
-                l.heat[(size_t) e] += (float) dn;
+                l.heat[(size_t) e] += (float) (dn * sc);
                 if (l.slot[(size_t) e] < 0 && !held_out(l, e)) l.cpu_hits.push_back(e);
             }
         }
@@ -23780,7 +23789,10 @@ struct Model::Impl {
             }
             if (mi == 0) st.experts += (int64_t) T * l.k_exp;
             if (mi == 0 && l.mtp) st.draft_experts += (int64_t) T * l.k_exp;
-            if (gated) gate_before_ar(l.dev, s);   // (the piece done before the links carry the all-reduce)
+            // (the piece done before the links carry the all-reduce; DS4_SETTLE_DECODE_GATE_NOWAIT=1: not waited for -
+            //  the wait itself costs ~0.1 ms a layer on ROCm, more than a 256 KB piece)
+            static const bool gate_nowait = env_f("DS4_SETTLE_DECODE_GATE_NOWAIT", 0) != 0;
+            if (gated && !gate_nowait) gate_before_ar(l.dev, s);
             if (nm > 1) allreduce(d.moe_out, T * D, ag, mi, ++d.ar_seq, d.xcnt, s);
             if (hs) CK(cudaStreamWaitEvent(s, d.hc_done, 0));
             ablate(d, d.moe_out, T, wp, s);
