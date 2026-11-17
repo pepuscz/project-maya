@@ -12985,6 +12985,7 @@ struct Model::Impl {
             if (l.cpu_hits.empty()) continue;
             std::vector<int> hits;
             hits.swap(l.cpu_hits);
+            if (ssd_hits_on() && l.il < (int) dec_hits.size()) dec_hits[(size_t) l.il] = hits;   // (the SSD leg's: real reads)
             int best = -1, vin = -1;
             for (int e : hits) {
                 bool filling = false;   // (a recent slot's fill brings it: the swaps leave it be)
@@ -13267,6 +13268,13 @@ struct Model::Impl {
     }
     bool settle_dec_on() const { return settle_dec_n() > 0 && settle_idle_on(); }
     bool settle_ssd_on() const { return settle_ssd_n() > 0 && settle_idle_on(); }
+    // (DS4_SETTLE_DECODE_SSD_HITS=1: the pool's leg takes only experts the CPU lane read this tick - its hits - not the
+    //  hottest of the files by heat, which a stale profile keeps turning over)
+    static bool ssd_hits_on() {
+        static const bool v = std::getenv("DS4_SETTLE_DECODE_SSD_HITS") != nullptr && std::atoi(std::getenv("DS4_SETTLE_DECODE_SSD_HITS")) != 0;
+        return v;
+    }
+    std::vector<std::vector<int>> dec_hits;   // (a layer's CPU-lane hits of the last tick)
     std::vector<std::pair<int, int>> dec_dups;   // (layer, expert) in VRAM and still in the pool (a fallback's)
     int dec_inflight = 0, ssd_inflight = 0;
     int64_t dec_done = 0, dec_said = 0, dec_refilled = 0, dec_true = 0, dec_true_said = 0, ssd_done = 0, ssd_said = 0;
@@ -13412,6 +13420,7 @@ struct Model::Impl {
         dec_bufs_tried = true;
         size_t need = 0;
         dec_mark.assign(L.size(), {});
+        dec_hits.assign(L.size(), {});
         for (const Layer& l : L)
             if (xch_layer(l)) {
                 need = std::max(need, l.blob);
@@ -13599,6 +13608,14 @@ struct Model::Impl {
                 } else if (!mk[(size_t) e] && (fhot < 0 || h > l.heat[(size_t) fhot])) {
                     fhot = e;
                 }
+            }
+            if (ssd && ssd_hits_on()) {   // (only what the CPU lane read)
+                fhot = -1;
+                for (int e : dec_hits[(size_t) l.il])
+                    if (e >= 0 && e < l.n_exp && l.slot[(size_t) e] < 0 && l.helper[(size_t) e] == nullptr &&
+                        !mk[(size_t) e] && (fhot < 0 || l.heat[(size_t) e] > l.heat[(size_t) fhot]))
+                        fhot = e;
+                dec_hits[(size_t) l.il].clear();
             }
             if (ssd && fhot >= 0 && pcold >= 0 && l.heat[(size_t) fhot] > l.heat[(size_t) pcold] * sm + c_bonus)
                 c.push_back({l.heat[(size_t) fhot] - l.heat[(size_t) pcold], l.il, fhot, pcold, true});
