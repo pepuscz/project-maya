@@ -3994,6 +3994,41 @@ void project_out(float* y, const float* r, float scale, int dim, int T, cudaStre
 void hc_mix_scale(const float* h, int hcdim, int n_mix, int T, float eps, float* mixes, cudaStream_t s) {
     pdl_launch(hc_mix_scale_kernel, T, kThreads, 0, s, h, hcdim, n_mix, eps, mixes);
 }
+// (DS4_HC_MIX_ROWS) a chunk's hc_mix, a block a token: its row of h read once for all kMix mixes, each mix's sum and
+// the square sum in hc_mix_value's own order and reduction - hc_mix_kernel's bits (the decode path's), without its
+// kMix reads of the row
+template <int kMix>
+__global__ void __launch_bounds__(kThreads) hc_mix_rows_kernel(const float* __restrict__ h, const float* __restrict__ fn,
+                                                               int hcdim, float eps, float* __restrict__ mixes) {
+    pdl_wait();
+    pdl_trigger();
+    const int t = blockIdx.x;
+    const float* x = h + (size_t) t * hcdim;
+    float acc[kMix], ss = 0.0f;
+#pragma unroll
+    for (int m = 0; m < kMix; ++m) acc[m] = 0.0f;
+    for (int k = threadIdx.x * 4; k < hcdim; k += kThreads * 4) {
+        const float4 hv = *(const float4*) (x + k);
+#pragma unroll
+        for (int m = 0; m < kMix; ++m) {
+            const float4 wv = *(const float4*) (fn + (size_t) m * hcdim + k);
+            acc[m] += hv.x * wv.x + hv.y * wv.y + hv.z * wv.z + hv.w * wv.w;
+        }
+        ss += hv.x * hv.x + hv.y * hv.y + hv.z * hv.z + hv.w * hv.w;
+    }
+    ss = block_sum(ss);
+    const float inv = rsqrtf(ss / (float) hcdim + eps);
+#pragma unroll
+    for (int m = 0; m < kMix; ++m) {
+        const float v = block_sum(acc[m]);
+        if (threadIdx.x == 0) mixes[(size_t) t * 32 + m] = v * inv;
+    }
+}
+bool hc_mix_rows(const float* h, const float* fn, int hcdim, int n_mix, int T, float eps, float* mixes, cudaStream_t s) {
+    if (n_mix != 24 || hcdim % 4 != 0) return false;   // (hc 4: (2 + 4) * 4 mixes)
+    if (T > 0) pdl_launch(hc_mix_rows_kernel<24>, T, kThreads, 0, s, h, fn, hcdim, eps, mixes);
+    return true;
+}
 void hc_split_pre_norm(const HcFuse& a, cudaStream_t s, int T) {
     hc_split_pre_norm_kernel<<<dim3(2, (unsigned) std::max(1, T)), 1024, 0, s>>>(a);
 }
@@ -4049,6 +4084,13 @@ void moe_combine(float* acc, const float* y, const int* pos, const float* w, int
 
 void light_gather(float* hx, const float* x, const int* row_tok, const int* prow, int n, int dim, cudaStream_t s) {
     if (n > 0) light_gather_kernel<<<dim3(cdiv(dim, kThreads * 4), n), kThreads, 0, s>>>(hx, x, row_tok, prow, dim);
+}
+__global__ void light_xtok_kernel(int* xtok, const int* __restrict__ row_tok, const int* __restrict__ prow, int n) {
+    const int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p < n) xtok[p] = row_tok[prow[p]];
+}
+void light_xtok(int* xtok, const int* row_tok, const int* prow, int n, cudaStream_t s) {
+    if (n > 0) light_xtok_kernel<<<cdiv(n, kThreads), kThreads, 0, s>>>(xtok, row_tok, prow, n);
 }
 void light_add(float* acc, const float* hy, const int* lidx, const int* pos, const float* w, int T, int k, int dim,
                cudaStream_t s) {

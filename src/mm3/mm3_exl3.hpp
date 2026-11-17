@@ -153,6 +153,7 @@ struct WinArgs {
     const int* cpu_flag = nullptr;                  // [T]
     const float* x = nullptr;
     size_t x_stride = 0;
+    const int* x_row = nullptr;                     // (rows) given: an entry's input row is x_row[entry], not the entry
     float* h = nullptr;
     float* part = nullptr;
     const float* sh_out = nullptr;                  // [T][n_embd] or null

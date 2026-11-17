@@ -765,6 +765,7 @@ struct Chunk {
     cudaEvent_t lt_g = nullptr, lt_h = nullptr;
     uint16_t* lt_hh = nullptr;
     int* lt_ident = nullptr;
+    int* lt_xtok = nullptr;   // (DS4_LIGHT_X_ONCE: pinned, mapped) packed row -> the chunk's row of its token
     // (DS4_LIGHT_WIN) the window launch's groups (pinned, mapped: blob addresses, bounds, rows, the count) and on the
     // helper its F32 gate / up values, a row each
     unsigned long long* lt_wgp = nullptr;
@@ -5855,9 +5856,19 @@ struct Model::Impl {
         }
         return true;
     }
-    // hc_mix over a chunk: the dots by an F32 GEMM, then the rms scale
+    // hc_mix over a chunk: the dots by an F32 GEMM, then the rms scale.  DS4_HC_MIX_ROWS=1 (opt-in): one launch
+    // instead, a block a token reading its row once for all its mixes - the decode path's hc_mix bits (the GEMM's
+    // M = 24 by K = 16,384 leaves a few workgroups busy: ~0.7-0.9 ms a call at 129-513 rows, twice a layer)
+    static bool hc_mix_rows_on() {
+        static const bool on = [] {
+            const char* v = ds4_env("DS4_HC_MIX_ROWS");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
+        return on;
+    }
     bool hc_mix_chunk(Dev& d, Chunk& c, const float* h, const float* fn, int T, float* mixes, std::string& err) {
         const int hcd = g.hc * g.dim, n_mix = (2 + g.hc) * g.hc;
+        if (hc_mix_rows_on() && hc_mix_rows(h, fn, hcd, n_mix, T, g.eps, mixes, d.st)) return true;
         const float one = 1.0f, zero = 0.0f;
         if (cublasSgemm(c.blas, CUBLAS_OP_T, CUBLAS_OP_N, n_mix, T, hcd, &one, fn, hcd, h, hcd, &zero, mixes, 32) !=
             CUBLAS_STATUS_SUCCESS) {
@@ -6852,6 +6863,29 @@ struct Model::Impl {
         }();
         return r;
     }
+    // DS4_PROMPT_LIGHT_SMALL=<r> (opt-in; with DS4_PROMPT_LIGHT): a chunk of at most DS4_PROMPT_LIGHT_SMALL_MAX
+    // (1024) tokens takes the light cut r - its experts of more than r rows copied to the members, not computed on
+    // the helper (in a small read the helper is the expert stage's critical path; in a large one the copies are)
+    static int prompt_light_for(int T) {
+        static const int r = [] {
+            const char* v = ds4_env("DS4_PROMPT_LIGHT_SMALL");
+            return v != nullptr ? std::max(0, std::atoi(v)) : 0;
+        }();
+        static const int n = [] {
+            const char* v = ds4_env("DS4_PROMPT_LIGHT_SMALL_MAX");
+            return v != nullptr ? std::max(1, std::atoi(v)) : 1024;
+        }();
+        return r > 0 && T <= n ? std::min(r, prompt_light()) : prompt_light();
+    }
+    // DS4_LIGHT_X_ONCE=1 (opt-in): the light rows' input as the chunk's rows, each token's once, and a packed row ->
+    // token table (light_xtok) the helper's kernels index - not a row a pick.  The same values in: the same bits
+    static bool light_x_once() {
+        static const bool on = [] {
+            const char* v = ds4_env("DS4_LIGHT_X_ONCE");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
+        return on;
+    }
     static int light_cap() {
         static const int n = [] {
             const char* v = ds4_env("DS4_PROMPT_LIGHT_CAP");
@@ -6957,7 +6991,17 @@ struct Model::Impl {
         c.lt_hb[lv.size()] = p;
         CK(cudaMemcpyAsync(c.lt_dprow, c.lt_prow, (size_t) p * 4, cudaMemcpyHostToDevice, s));
         CK(cudaMemcpyAsync(c.lt_dlidx, c.lt_lidx, (size_t) nr * 4, cudaMemcpyHostToDevice, s));
-        light_gather(c.lt_hx, c.x, c.row_tok, c.lt_dprow, p, D, s);
+        const bool x_once = light_x_once() && T <= cap &&
+                            (c.lt_xtok != nullptr || cudaHostAlloc((void**) &c.lt_xtok, (size_t) cap * 4,
+                                                                   cudaHostAllocMapped | cudaHostAllocPortable) ==
+                                                         cudaSuccess);
+        if (x_once) {   // (DS4_LIGHT_X_ONCE) the chunk's rows, each token's once, and packed row -> its token's row
+            light_xtok(c.lt_xtok, c.row_tok, c.lt_dprow, p, s);
+            CK(cudaMemcpyAsync(c.lt_hx, c.x, (size_t) T * D * 4, cudaMemcpyDeviceToHost, s));
+        } else {
+            light_gather(c.lt_hx, c.x, c.row_tok, c.lt_dprow, p, D, s);
+        }
+        const int* xrow = x_once ? c.lt_xtok : c.lt_ident;   // (the helper's kernels: packed row -> its input row)
         CK(cudaEventRecord(c.lt_g, s));
         CK(cudaEventSynchronize(c.lt_g));   // (the rows are in host memory: the helper reads them there)
         const int e0 = x3::launch_errors();
@@ -7017,7 +7061,7 @@ struct Model::Impl {
                 ok = false;
                 break;
             }
-            x3::set_gate_up(sa, c.lt_hx, D, c.lt_ident + sa.row0, c.lt_hh, g.ff, c.lt_st);
+            x3::set_gate_up(sa, c.lt_hx, D, xrow + sa.row0, c.lt_hh, g.ff, c.lt_st);
             x3::set_down(sa, c.lt_hh, g.ff, c.lt_hy + (size_t) sa.row0 * D, D, c.lt_st);
         }
         if (ok && nw > 0) {   // (DS4_LIGHT_WIN) one launch pair for those: an entry a packed row, out at lt_hy's row
@@ -7030,6 +7074,7 @@ struct Model::Impl {
             w.n_groups = c.lt_wng;
             w.x = c.lt_hx;
             w.x_stride = D;
+            w.x_row = x_once ? c.lt_xtok : nullptr;
             w.h = c.lt_wh;
             w.u = c.lt_wu;
             w.part = c.lt_hy;
@@ -19154,7 +19199,7 @@ struct Model::Impl {
         std::vector<char> lmask;
         std::vector<int> lv;   // their virtual slots, in slot order
         if (light_ok(L0) && S.skips(wp.k) && !S.spec(wp.k) && !xsum) {
-            const int R = prompt_light(), cap = light_cap();
+            const int R = prompt_light_for(T), cap = light_cap();
             int rows = 0;
             for (size_t j = 0; j < L0.host_list.size(); ++j) {
                 const int v = L0.pv_n + (int) j, n = b[(size_t) v + 1] - b[(size_t) v];

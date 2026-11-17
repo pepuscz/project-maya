@@ -115,6 +115,9 @@ void project_out(float* y, const float* r, float scale, int dim, int T, cudaStre
 /// A chunk's hc_mix: the dots of each row with the n_mix weights already in mixes (a GEMM's, rows 32 apart), times
 /// rsqrt(mean(h_row^2) + eps) - hc_mix's value up to the dots' summation order.
 void hc_mix_scale(const float* h, int hcdim, int n_mix, int T, float eps, float* mixes, cudaStream_t s);
+/// (DS4_HC_MIX_ROWS) a chunk's hc_mix in one launch, a block a token (its row of h read once for its mixes): hc_mix's
+/// bits, rows 32 apart.  false: not this shape (n_mix 24 only) - the caller's GEMM path then
+bool hc_mix_rows(const float* h, const float* fn, int hcdim, int n_mix, int T, float eps, float* mixes, cudaStream_t s);
 
 /// y[t][r] = alpha * sum_k W[r][k] x[t][k], W F16 bits [n][k] (the indexer's weights_proj).
 void gemv_f16(const uint16_t* W, const float* x, int n, int k, int T, float alpha, float* y, cudaStream_t s);
@@ -444,6 +447,9 @@ void moe_combine(float* acc, const float* y, const int* pos, const float* w, int
 /// (DS4_PROMPT_LIGHT) a chunk's light experts' rows for the helper: hx[p] = x[row_tok[prow[p]]] for p < n (F32 rows
 /// of dim; hx host memory the helper reads)
 void light_gather(float* hx, const float* x, const int* row_tok, const int* prow, int n, int dim, cudaStream_t s);
+/// (DS4_LIGHT_X_ONCE) the light rows' tokens instead of their rows: xtok[p] = row_tok[prow[p]] for p < n (xtok host
+/// memory the helper reads: packed row p's input is the chunk's row xtok[p], each token's row sent once)
+void light_xtok(int* xtok, const int* row_tok, const int* prow, int n, cudaStream_t s);
 /// (DS4_PROMPT_LIGHT) the helper's rows back: acc[t] += w[t][i] * hy[lidx[pos[t][i]]] for each pick of t (in pick order)
 /// whose sorted row is a light expert's (lidx >= 0) - moe_combine's sum, its rows packed by lidx
 void light_add(float* acc, const float* hy, const int* lidx, const int* pos, const float* w, int T, int k, int dim,

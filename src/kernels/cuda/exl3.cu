@@ -1055,6 +1055,7 @@ struct KWin {
     const float* x;
     size_t x_stride;
     int x_shift;         // an entry's input row: e >> x_shift (3: a window's e = t * 8 + i; 0: rows, WinArgs::rows)
+    const int* x_row;    // (WinArgs::x_row) given: an entry's input row is x_row[e] instead
     int tok_rows;        // the most entries a group holds (win_tok's blocks: a window's T; rows: WinArgs::max_rows)
     float* h;            // [T * 8][n_ff]: the gate's values, then the swiglu
     float* u;            // [T * 8][n_ff]: the up's values
@@ -1091,7 +1092,10 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) win_gu_kernel(const KWin a) {
     for (int mm = m0; mm < m1; mm += Tok) {
         const int nc = min(Tok, m1 - mm);
         Xin x;
-        if (warp < nc) x.f = a.x + (size_t) (a.grp_ent[mm + warp] >> a.x_shift) * a.x_stride;
+        if (warp < nc) {
+            const int e = a.grp_ent[mm + warp];
+            x.f = a.x + (size_t) (a.x_row != nullptr ? a.x_row[e] : e >> a.x_shift) * a.x_stride;
+        }
 #if defined(EXL3_SEP_DEV)
         block_gemv<K2, cb, Xin, 0, Tok>((const uint32_t*) (blob + a.tr[r]), a.n_ff / 16, g * 8, sp * a.gkr,
                           min(a.n_embd, (sp + 1) * a.gkr), x, (const uint16_t*) (blob + a.suh[r]), nc, sm);
@@ -1419,7 +1423,10 @@ __global__ void EXL3_BOUNDS(2) win_gu_mix_kernel(const KWin a, const KMix mx) {
     for (int mm = m0; mm < m1; mm += kTok) {
         const int nc = min(kTok, m1 - mm);
         Xin x;
-        if (warp < nc) x.f = a.x + (size_t) (a.grp_ent[mm + warp] >> a.x_shift) * a.x_stride;
+        if (warp < nc) {
+            const int e = a.grp_ent[mm + warp];
+            x.f = a.x + (size_t) (a.x_row != nullptr ? a.x_row[e] : e >> a.x_shift) * a.x_stride;
+        }
         mix_gemv<cb>(k2, (const uint32_t*) (blob + mx.tr[c][r]), a.n_ff / 16, g * 8, 0, a.n_embd, x,
                      (const uint16_t*) (blob + mx.suh[c][r]), nc, sm);
         if (warp < nc)
@@ -3376,6 +3383,7 @@ bool win_experts(const WinArgs& a, cudaStream_t s) {
     w.x = a.x;
     w.x_stride = a.x_stride;
     w.x_shift = a.rows ? 0 : 3;
+    w.x_row = a.rows ? a.x_row : nullptr;
     w.tok_rows = a.rows ? (a.max_rows > 0 ? a.max_rows : kTok) : groups / a.k;   // (a window's: its T)
     w.h = a.h;
     w.u = a.rows ? a.u : sc->u;
