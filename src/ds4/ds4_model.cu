@@ -12192,7 +12192,9 @@ struct Model::Impl {
                     cudaSetDevice(cur);
                 }
                 if (!from_pool) parts_to_blob(l, l.hh[(size_t) sw.in], B.a);
-                if (l.nm == 1) {
+                if (sw.dec && !gateq.empty() && file_experts) {   // (DS4_SETTLE_DECODE_GATE)
+                    if (!gate_copy(l, sw, B)) return;
+                } else if (l.nm == 1) {
                     const Dev& d = devs[(size_t) l.dev];
                     cudaSetDevice(d.id);
                     cudaStream_t cs = B.st[(size_t) l.dev];
@@ -12224,7 +12226,7 @@ struct Model::Impl {
                 // (DS4_SETTLE_DECODE_OUT_FILE=1: `out`'s blob from its file - its pages, off the cards' links, which
                 //  the decode's all-reduces share)
                 static const bool out_file = env_f("DS4_SETTLE_DECODE_OUT_FILE", 0) != 0;
-                if (sw.dec && sw.buf >= 0 && out_file && file_experts) {
+                if (sw.dec && sw.buf >= 0 && (out_file || !gateq.empty()) && file_experts) {
                     const std::array<uint8_t*, 4> fp = {file_part(l, sw.out), nullptr, nullptr, nullptr};
                     parts_to_blob(l, fp, dec_buf[sw.buf]);
                     sw.ob_ok = true;
@@ -12739,8 +12741,14 @@ struct Model::Impl {
         hr_tick(T);   // (DS4_HELPER_RECENT: before the swaps, whose queue takes this window's CPU-lane hits)
         swap_tick(T);
         tick_flush();
-        if (settle_dec_on() || settle_ssd_on()) win_time(T, t_in);
+        if (win_time_on()) win_time(T, t_in);
     }
+    bool win_time_on() const {   // (DS4_WIN_TIME=1: the same with DS4_SETTLE_DECODE off too)
+        static const bool v = std::getenv("DS4_WIN_TIME") != nullptr;
+        return v || settle_dec_on() || settle_ssd_on();
+    }
+    double wt_gap_ms = 0;
+    int64_t wt_gaps = 0;
     // (DS4_SETTLE_DECODE) the windows' time a token, by what was under way while they ran: nothing, the decode's moves,
     // only the cache's own, only the pool's writes - the moves' cost on the critical path, said with the settle line
     double wt_last = 0;
@@ -12749,11 +12757,14 @@ struct Model::Impl {
     int64_t wt_tok[4] = {}, wt_n[4] = {};
     void win_time(int T, double t_in) {
         const double t = now_ms();
-        if (wt_last > 0 && t - wt_last < 1000.0) {   // (a gap over a second: a request's start, not a window)
+        if (wt_last > 0 && t - wt_last < 1000.0) {   // (a gap over a second: counted apart)
             wt_ms[wt_state] += t - wt_last;
             wt_tick[wt_state] += t - t_in;
             wt_tok[wt_state] += T;
             ++wt_n[wt_state];
+        } else if (wt_last > 0) {
+            wt_gap_ms += t - wt_last;
+            ++wt_gaps;
         }
         wt_last = t;
         bool pool = false;
@@ -12774,7 +12785,11 @@ struct Model::Impl {
             wt_tok[i] = wt_n[i] = 0;
         }
         wt_last = 0;
-        if (!s.empty()) std::fprintf(stderr, "ds4: decode settle: windows by what was under way - %s\n", s.c_str());
+        if (!s.empty())
+            std::fprintf(stderr, "ds4: decode settle: windows by what was under way - %s; %lld gaps over a second (%.0f ms)\n",
+                         s.c_str(), (long long) wt_gaps, wt_gap_ms);
+        wt_gaps = 0;
+        wt_gap_ms = 0;
     }
     // (DS4_COPY_SWAP) the moves read in, switched while nothing reads the copies (between windows)
     void cs_switch() {
@@ -13267,6 +13282,122 @@ struct Model::Impl {
     std::vector<std::vector<uint8_t>> dec_mark;   // (layer, expert): entering a pool place now - no other move takes it
     std::mutex dec_mu;
     std::vector<PoolW> dec_pw;
+    // DS4_SETTLE_DECODE_GATE=1 (with DS4_SETTLE_DECODE): a decode move's copy into the cards only while they wait for the
+    // helper - the move's halves in pieces of DS4_SETTLE_DECODE_GATE_KB (1024), each member's in its device's queue;
+    // each layer of a window takes at most one piece, started on a stream of its own when the layer's experts start
+    // (after the shared expert: the routing published), and the layer's all-reduce waits for it - no piece meets an
+    // all-reduce on the links they share, which slowed each ~6x.  `out` is read from its file (no copy out of the
+    // cards).  No window for 200 ms (idle, a prompt) or a lend's flush: the copy thread copies its pieces itself
+    struct GatePiece {
+        uint8_t* dst;
+        const uint8_t* src;
+        size_t n;
+        std::atomic<int>* left;
+    };
+    struct GateQ {
+        std::mutex mu;
+        std::deque<GatePiece> q;
+        std::atomic<int> n{0};
+        cudaStream_t cs = nullptr;
+        cudaEvent_t ev0 = nullptr, ev1 = nullptr;
+    };
+    std::vector<std::unique_ptr<GateQ>> gateq;   // (a device's)
+    std::atomic<int64_t> gate_pieces{0}, gate_self{0};
+    static bool gate_on() {
+        static const bool v = std::getenv("DS4_SETTLE_DECODE_GATE") != nullptr && std::atoi(std::getenv("DS4_SETTLE_DECODE_GATE")) != 0;
+        return v;
+    }
+    static size_t gate_bytes() {
+        static const size_t v = (size_t) std::max(64.0f, env_f("DS4_SETTLE_DECODE_GATE_KB", 1024.0f)) * 1024;
+        return v;
+    }
+    static void gate_done(void* p) { ((std::atomic<int>*) p)->fetch_sub(1, std::memory_order_acq_rel); }
+    // (a device's forward, a layer: its experts about to start) one piece started: true - the all-reduce waits for it
+    bool gate_issue(int di, cudaStream_t s) {
+        if (gateq.empty()) return false;
+        GateQ& g = *gateq[(size_t) di];
+        if (g.n.load(std::memory_order_acquire) == 0) return false;
+        GatePiece c;
+        {
+            std::lock_guard<std::mutex> lk(g.mu);
+            if (g.q.empty()) return false;
+            c = g.q.front();
+            g.q.pop_front();
+            g.n.fetch_sub(1, std::memory_order_acq_rel);
+        }
+        cudaEventRecord(g.ev0, s);
+        cudaStreamWaitEvent(g.cs, g.ev0, 0);
+        cudaMemcpyAsync(c.dst, c.src, c.n, cudaMemcpyHostToDevice, g.cs);
+        cudaEventRecord(g.ev1, g.cs);
+        cudaLaunchHostFunc(g.cs, gate_done, c.left);
+        gate_pieces.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+    void gate_before_ar(int di, cudaStream_t s) { cudaStreamWaitEvent(s, gateq[(size_t) di]->ev1, 0); }
+    // (a copy thread) `in`'s halves (B.a joined -> B.h / B.b) into the spare slot through the windows' gates; false: quitting
+    bool gate_copy(const Layer& l, const Swap& sw, SwapBufs& B) {
+        std::atomic<int> left{0};
+        std::vector<std::pair<int, GatePiece>> mine;
+        const size_t C = gate_bytes();
+        for (int m = 0; m < l.nm; ++m) {
+            const Layer& x = l.nm == 1 ? l : member(l, m);
+            const size_t nb = l.nm == 1 ? l.blob : x.hblob;
+            const uint8_t* src = B.a;
+            if (l.nm > 1) {
+                uint8_t* h = m == 0 ? B.h : B.b;
+                blob_to_half(l, B.a, m, h);
+                src = h;
+            }
+            uint8_t* dst = sat(l, x, l.spare_vram, nb);
+            for (size_t o = 0; o < nb; o += C) mine.push_back({x.dev, {dst + o, src + o, std::min(C, nb - o), &left}});
+        }
+        left.store((int) mine.size(), std::memory_order_release);
+        for (auto& [di, c] : mine) {
+            GateQ& g = *gateq[(size_t) di];
+            std::lock_guard<std::mutex> lk(g.mu);
+            g.q.push_back(c);
+            g.n.fetch_add(1, std::memory_order_acq_rel);
+        }
+        unsigned w0 = win_now.load(std::memory_order_acquire);
+        double t0 = now_ms();
+        while (left.load(std::memory_order_acquire) > 0) {
+            const unsigned w = win_now.load(std::memory_order_acquire);
+            if (w != w0) {
+                w0 = w;
+                t0 = now_ms();
+            }
+            const bool self = quit.load() || copy_flush.load(std::memory_order_acquire) || now_ms() - t0 > 200.0;
+            if (self) {   // (no window to take them: this thread's own pieces back, copied here)
+                std::vector<std::pair<int, GatePiece>> back;
+                for (size_t di = 0; di < gateq.size(); ++di) {
+                    GateQ& g = *gateq[di];
+                    std::lock_guard<std::mutex> lk(g.mu);
+                    for (auto it = g.q.begin(); it != g.q.end();) {
+                        if (it->left == &left) {
+                            back.push_back({(int) di, *it});
+                            it = g.q.erase(it);
+                            g.n.fetch_sub(1, std::memory_order_acq_rel);
+                        } else {
+                            ++it;
+                        }
+                    }
+                }
+                for (auto& [di, c] : back) {
+                    cudaSetDevice(devs[(size_t) di].id);
+                    cudaMemcpyAsync(c.dst, c.src, c.n, cudaMemcpyHostToDevice, B.st[(size_t) di]);
+                    cudaStreamSynchronize(B.st[(size_t) di]);
+                    left.fetch_sub(1, std::memory_order_acq_rel);
+                    gate_self.fetch_add(1, std::memory_order_relaxed);
+                }
+                if (quit.load()) {
+                    while (left.load(std::memory_order_acquire) > 0) std::this_thread::sleep_for(std::chrono::microseconds(50));
+                    return false;
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        }
+        return true;
+    }
     bool dec_bufs() {   // (at load, when on)
         if (dec_bufs_tried) return dec_bufs_ok;
         dec_bufs_tried = true;
@@ -13287,9 +13418,21 @@ struct Model::Impl {
             ok = cudaHostAlloc((void**) &dec_buf[b], need, cudaHostAllocPortable) == cudaSuccess &&
                  cudaEventCreateWithFlags(&dec_ev[b], cudaEventDisableTiming) == cudaSuccess &&
                  cudaEventCreateWithFlags(&dec_ev0[b], cudaEventDisableTiming) == cudaSuccess;
+        if (ok && gate_on() && settle_dec_on())
+            for (size_t di = 0; di < devs.size() && ok; ++di) {
+                gateq.push_back(std::make_unique<GateQ>());
+                GateQ& g = *gateq.back();
+                ok = cudaSetDevice(devs[di].id) == cudaSuccess &&
+                     cudaStreamCreateWithFlags(&g.cs, cudaStreamNonBlocking) == cudaSuccess &&
+                     cudaEventCreateWithFlags(&g.ev0, cudaEventDisableTiming) == cudaSuccess &&
+                     cudaEventCreateWithFlags(&g.ev1, cudaEventDisableTiming) == cudaSuccess;
+            }
         cudaSetDevice(cur);
         if (!ok) (void) cudaGetLastError();
         dec_bufs_ok = ok;
+        if (!gateq.empty())
+            std::fprintf(stderr, "ds4: decode settle: the moves' copies into the cards gated into the helper waits, "
+                                 "%zu KB a layer (DS4_SETTLE_DECODE_GATE)\n", gate_bytes() / 1024);
         std::fprintf(stderr, "ds4: decode settle: %s %d pinned buffers of %.1f MB for the pool's side (DS4_SETTLE_DECODE%s)\n",
                      ok ? "with" : "could not get", kDecBufs, need / 1048576.0, settle_ssd_on() ? ", _SSD" : "");
         return ok;
@@ -13548,7 +13691,7 @@ struct Model::Impl {
         if (!settle_idle_on()) return false;
         if (xch_t0 == 0) {
             xch_t0 = now_ms();
-            if (settle_dec_on() || settle_ssd_on()) win_time_say();
+            if (win_time_on()) win_time_say();
         }
         tick_begin();
         cache_switch();
@@ -13563,9 +13706,10 @@ struct Model::Impl {
             dec_dups.clear();
             std::fprintf(stderr, "ds4: decode settle: %lld experts moved from the helper's pool into VRAM during decode "
                                  "(%lld exchanged with the VRAM one they replaced), %lld from the files into the pool, %lld "
-                                 "pool places refilled in %.0f ms (DS4_SETTLE_DECODE)\n",
+                                 "pool places refilled in %.0f ms (DS4_SETTLE_DECODE); gated pieces %lld, copied unwaited %lld\n",
                          (long long) (dec_done - dec_said), (long long) (dec_true - dec_true_said),
-                         (long long) (ssd_done - ssd_said), (long long) dec_refilled, now_ms() - dec_t0);
+                         (long long) (ssd_done - ssd_said), (long long) dec_refilled, now_ms() - dec_t0,
+                         (long long) gate_pieces.exchange(0), (long long) gate_self.exchange(0));
             dec_said = dec_done;
             ssd_said = ssd_done;
             dec_true_said = dec_true;
@@ -23508,6 +23652,7 @@ struct Model::Impl {
             }
             if (!shared_down(d, l, T, FF, err)) return false;
             prof_mark(d, 2);
+            const bool gated = gate_issue(l.dev, s);   // (DS4_SETTLE_DECODE_GATE: a move's piece while this layer waits)
             const x3::ExpertLayout& lay = nm > 1 ? l.hlay : l.lay;
             // (a tensor-parallel group: every member sums its own FF band, so every member adds its own part of the
             //  lane's picks and every member waits for the answer - the lane writes a part a member)
@@ -23635,6 +23780,7 @@ struct Model::Impl {
             }
             if (mi == 0) st.experts += (int64_t) T * l.k_exp;
             if (mi == 0 && l.mtp) st.draft_experts += (int64_t) T * l.k_exp;
+            if (gated) gate_before_ar(l.dev, s);   // (the piece done before the links carry the all-reduce)
             if (nm > 1) allreduce(d.moe_out, T * D, ag, mi, ++d.ar_seq, d.xcnt, s);
             if (hs) CK(cudaStreamWaitEvent(s, d.hc_done, 0));
             ablate(d, d.moe_out, T, wp, s);
