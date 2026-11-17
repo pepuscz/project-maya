@@ -766,6 +766,10 @@ struct Chunk {
     uint16_t* lt_hh = nullptr;
     int* lt_ident = nullptr;
     int* lt_xtok = nullptr;   // (DS4_LIGHT_X_ONCE: pinned, mapped) packed row -> the chunk's row of its token
+    // (DS4_LIGHT_F16) the rows out and back as FP16 (pinned, mapped) and, on the helper, their F32 copies
+    uint16_t *lt_hx16 = nullptr, *lt_hy16 = nullptr;
+    float *lt_hxf = nullptr, *lt_hyf = nullptr;
+    bool lt_f16 = false;      // (this layer's light rows went FP16: light_add16)
     // (DS4_LIGHT_WIN) the window launch's groups (pinned, mapped: blob addresses, bounds, rows, the count) and on the
     // helper its F32 gate / up values, a row each
     unsigned long long* lt_wgp = nullptr;
@@ -785,6 +789,8 @@ struct Chunk {
     // (a group's Engram rows read once, Impl::eg_src_dev: the seq of the chunk last read into each slot - the reader's
     //  - and of the chunk whose copies out of the slot this device last issued)
     std::atomic<unsigned> eg_read_seq[2] = {}, eg_copied_seq[2] = {};
+    // (DS4_EG_LATE) the seq of the chunk whose rows of Engram table i the reader last put in each slot
+    std::atomic<unsigned> eg_layer_seq[2][8] = {};
     // where this device's thread is in a run of chunks (Model::where: the serve watchdog's report of a run that stopped
     // moving, #539 / #494 - which device waits for what)
     std::atomic<int> at_k{-1}, at_il{-1};
@@ -1099,6 +1105,7 @@ struct WinPlan {
     int snap_n = 0;
     int snap_t[kSnapN] = {}, snap_ix[kSnapN] = {};
     int eg_slot = -1;       // (a run of chunks, layer-major) the Engram rows' slot (-1: k % 2)
+    bool eg_late = false;   // (DS4_EG_LATE) an Engram layer waits for its own table's rows (eg_layer_seq), not the chunk
     unsigned vl = 0;        // (a window) bit t: token t is inside a picture's span (routed with the image bias)
     // (--parallel, Impl::step_multi) rows of nrow conversations instead of a window of one: row t is conversation
     // rseq[t]'s token at position rpos[t] (0: a window of the bound conversation from p0)
@@ -6886,6 +6893,26 @@ struct Model::Impl {
         }();
         return on;
     }
+    // DS4_LIGHT_F16=1 (opt-in; with DS4_LIGHT_X_ONCE): the light rows over the link as FP16 both ways, as the
+    // all-reduce sends its sums - the lead's rows out as FP16 (the helper widens them to F32), the helper's rows back
+    // as FP16 (light_add16).  Not bit for bit: the rows rounded to FP16
+    static bool light_f16() {
+        static const bool on = [] {
+            const char* v = ds4_env("DS4_LIGHT_F16");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
+        return on;
+    }
+    // DS4_EG_LATE=1 (opt-in): a run of one chunk does not wait for all its Engram rows before its first layer - each
+    // Engram layer waits for its own table's rows (the reader puts them out table by table, the first layer's first),
+    // so the layers before it run while the rest are read (a small read's start: ~35 rows a token from the SSD)
+    static bool eg_late_on() {
+        static const bool on = [] {
+            const char* v = ds4_env("DS4_EG_LATE");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
+        return on;
+    }
     static int light_cap() {
         static const int n = [] {
             const char* v = ds4_env("DS4_PROMPT_LIGHT_CAP");
@@ -6991,21 +7018,42 @@ struct Model::Impl {
         c.lt_hb[lv.size()] = p;
         CK(cudaMemcpyAsync(c.lt_dprow, c.lt_prow, (size_t) p * 4, cudaMemcpyHostToDevice, s));
         CK(cudaMemcpyAsync(c.lt_dlidx, c.lt_lidx, (size_t) nr * 4, cudaMemcpyHostToDevice, s));
-        const bool x_once = light_x_once() && T <= cap &&
+        const bool x_once = (light_x_once() || light_f16()) && T <= cap &&
                             (c.lt_xtok != nullptr || cudaHostAlloc((void**) &c.lt_xtok, (size_t) cap * 4,
                                                                    cudaHostAllocMapped | cudaHostAllocPortable) ==
                                                          cudaSuccess);
-        if (x_once) {   // (DS4_LIGHT_X_ONCE) the chunk's rows, each token's once, and packed row -> its token's row
+        if (x_once && light_f16() && c.lt_hx16 == nullptr) {   // (once: DS4_LIGHT_F16's rows)
+            bool ok = cudaHostAlloc((void**) &c.lt_hx16, (size_t) cap * D * 2, cudaHostAllocMapped | cudaHostAllocPortable) ==
+                          cudaSuccess &&
+                      cudaHostAlloc((void**) &c.lt_hy16, (size_t) cap * D * 2, cudaHostAllocMapped | cudaHostAllocPortable) ==
+                          cudaSuccess;
+            ok = ok && cudaSetDevice(helper_id) == cudaSuccess &&
+                 cudaMalloc((void**) &c.lt_hxf, (size_t) cap * D * 4) == cudaSuccess &&
+                 cudaMalloc((void**) &c.lt_hyf, (size_t) cap * D * 4) == cudaSuccess;
+            ok = cudaSetDevice(d.id) == cudaSuccess && ok;
+            if (!ok) {
+                err = "DS4_LIGHT_F16: its buffers failed";
+                return false;
+            }
+        }
+        c.lt_f16 = x_once && light_f16();
+        if (c.lt_f16) {   // (DS4_LIGHT_F16) the chunk's rows as FP16, each token's once
+            light_xtok(c.lt_xtok, c.row_tok, c.lt_dprow, p, s);
+            x3::rows_f16(c.x, D, nullptr, T, D, c.lt_hx16, s);
+        } else if (x_once) {   // (DS4_LIGHT_X_ONCE) the chunk's rows, each token's once, and packed row -> its token's row
             light_xtok(c.lt_xtok, c.row_tok, c.lt_dprow, p, s);
             CK(cudaMemcpyAsync(c.lt_hx, c.x, (size_t) T * D * 4, cudaMemcpyDeviceToHost, s));
         } else {
             light_gather(c.lt_hx, c.x, c.row_tok, c.lt_dprow, p, D, s);
         }
         const int* xrow = x_once ? c.lt_xtok : c.lt_ident;   // (the helper's kernels: packed row -> its input row)
+        const float* hx = c.lt_f16 ? c.lt_hxf : c.lt_hx;     // (their input rows: F32, the helper's copy with F16)
+        float* hy = c.lt_f16 ? c.lt_hyf : c.lt_hy;           // (their output rows: F32, the helper's with F16)
         CK(cudaEventRecord(c.lt_g, s));
         CK(cudaEventSynchronize(c.lt_g));   // (the rows are in host memory: the helper reads them there)
         const int e0 = x3::launch_errors();
         bool ok = cudaSetDevice(helper_id) == cudaSuccess;
+        if (ok && c.lt_f16) half_f32(c.lt_hxf, c.lt_hx16, (size_t) T * D, c.lt_st);   // (DS4_LIGHT_F16: the rows in)
         int nw = 0, wrows = 0, wmax = 0;   // (DS4_LIGHT_WIN: its groups, rows, most rows a group)
         int WL = WR;   // (DS4_LIGHT_WIN, this call's: 0 when the window launch would refuse it - decided up front, so
                        //  those experts take the set kernels instead of failing the request)
@@ -7061,8 +7109,8 @@ struct Model::Impl {
                 ok = false;
                 break;
             }
-            x3::set_gate_up(sa, c.lt_hx, D, xrow + sa.row0, c.lt_hh, g.ff, c.lt_st);
-            x3::set_down(sa, c.lt_hh, g.ff, c.lt_hy + (size_t) sa.row0 * D, D, c.lt_st);
+            x3::set_gate_up(sa, hx, D, xrow + sa.row0, c.lt_hh, g.ff, c.lt_st);
+            x3::set_down(sa, c.lt_hh, g.ff, hy + (size_t) sa.row0 * D, D, c.lt_st);
         }
         if (ok && nw > 0) {   // (DS4_LIGHT_WIN) one launch pair for those: an entry a packed row, out at lt_hy's row
             *c.lt_wng = nw;
@@ -7072,12 +7120,12 @@ struct Model::Impl {
             w.grp_start = c.lt_wgs;
             w.grp_ent = c.lt_went;
             w.n_groups = c.lt_wng;
-            w.x = c.lt_hx;
+            w.x = hx;
             w.x_stride = D;
             w.x_row = x_once ? c.lt_xtok : nullptr;
             w.h = c.lt_wh;
             w.u = c.lt_wu;
-            w.part = c.lt_hy;
+            w.part = hy;
             w.lay = L0.lay;
             w.T = c.lt_hb[lv.size()];   // (the entries: the packed rows, every one below it)
             w.k = 1;
@@ -7088,6 +7136,7 @@ struct Model::Impl {
             w.limit = g.lim;
             ok = x3::win_experts(w, c.lt_st);
         }
+        if (ok && c.lt_f16) x3::rows_f16(c.lt_hyf, D, nullptr, p, D, c.lt_hy16, c.lt_st);   // (DS4_LIGHT_F16: rows back)
         ok = ok && cudaEventRecord(c.lt_h, c.lt_st) == cudaSuccess && cudaGetLastError() == cudaSuccess &&
              x3::launch_errors() == e0;
         ok = cudaSetDevice(d.id) == cudaSuccess && ok;
@@ -18815,7 +18864,19 @@ struct Model::Impl {
             const int cols = (pk.eg_ngram - 1) * pk.eg_heads, ehd = pk.eg_hd;
             const size_t per = (size_t) cols * (ehd + ehd / 32);
             const int slot = wp.eg_slot >= 0 ? wp.eg_slot : wp.k % 2;   // (read ahead by the run: two in flight)
-            uint8_t* host = chunks[(size_t) eg_src_dev(l.dev)]->eg_host[slot] + (size_t) l.eg * c.C * per;
+            Chunk& src = *chunks[(size_t) eg_src_dev(l.dev)];
+            if (wp.eg_late) {   // (DS4_EG_LATE) this table's rows of the chunk: the reader puts them out table by table
+                const double te = now_ms();
+                while ((int) (src.eg_layer_seq[slot][l.eg].load(std::memory_order_acquire) - wp.win) < 0) {
+                    if (eg_abort.load(std::memory_order_acquire) || halt.load(std::memory_order_acquire)) {
+                        err = "the Engram rows' reader stopped";
+                        return false;
+                    }
+                    std::this_thread::sleep_for(std::chrono::microseconds(20));
+                }
+                if (mi == 0) st.engram_ms += now_ms() - te;
+            }
+            uint8_t* host = src.eg_host[slot] + (size_t) l.eg * c.C * per;
             CK(cudaMemcpyAsync(c.eg_rows, host, (size_t) T * per, cudaMemcpyHostToDevice, s));
             CK(cudaEventRecord(c.eg_ev[slot], s));
             for (int s0 = 0; s0 < T; s0 += 256) {
@@ -19257,7 +19318,8 @@ struct Model::Impl {
                 err = "the helper's light experts of layer " + std::to_string(L0.il) + " failed (DS4_PROMPT_LIGHT)";
                 return false;
             }
-            light_add(c.acc, c.lt_hy, c.lt_dlidx, c.pos, c.rw, T, l.k_exp, D, s);
+            if (c.lt_f16) light_add16(c.acc, c.lt_hy16, c.lt_dlidx, c.pos, c.rw, T, l.k_exp, D, s);
+            else light_add(c.acc, c.lt_hy, c.lt_dlidx, c.pos, c.rw, T, l.k_exp, D, s);
         }
         if (xsum) moe_x_finish(c.acc, c.acc64, (size_t) T * D, s);
         if (nm > 1) chunk_allreduce(d, c, ab, mi, T * D, s);
@@ -19823,6 +19885,7 @@ struct Model::Impl {
                 if (eg_pf != nullptr) eg_pf->wait_unit(li, k);
                 engram_rows(run.p0[(size_t) k], run.T[(size_t) k], li, c.eg_host[sl] + (size_t) li * c.C * eg_per);
                 if (eg_pf != nullptr) eg_pf->finish_unit(li, k);
+                if (li < 8) c.eg_layer_seq[sl][li].store(run.seq[(size_t) k], std::memory_order_release);   // (DS4_EG_LATE)
             }
             if (eg_pf != nullptr) eg_pf->finish_chunk(k);
             c.eg_read_seq[sl].store(run.seq[(size_t) k], std::memory_order_release);
@@ -19845,7 +19908,9 @@ struct Model::Impl {
             const int64_t p0 = run.p0[(size_t) k];
             const int T = run.T[(size_t) k], slot = k % 2;
             const bool last_k = k + 1 == nk;
-            if (!egs.empty()) {   // chunk k's rows ready, chunk k + 1's on their way
+            // (DS4_EG_LATE: a run of one chunk - its Engram layers wait for their own tables' rows instead)
+            const bool eg_late = !egs.empty() && eg_late_on() && nk == 1 && eg_pf == nullptr && pk.eg_layers <= 8;
+            if (!egs.empty() && !eg_late) {   // chunk k's rows ready, chunk k + 1's on their way
                 const double te = now_ms();
                 if (eg_src == di) {
                     c.at.store("reading the Engram rows", std::memory_order_relaxed);
@@ -19867,6 +19932,7 @@ struct Model::Impl {
             wp.async = true;
             wp.win = run.seq[(size_t) k];
             wp.k = k;
+            wp.eg_late = eg_late;
             run.snaps(p0, T, wp);
             bool started = false;
             std::vector<char> got(srcs.size(), 0);
@@ -19955,6 +20021,7 @@ struct Model::Impl {
             if (part_link() && L[(size_t) part_hi - 1].dev == di && !part_chunk_out(d, di, c, run, k, s, err))
                 return false;
             if (trace && !c.flow && tr_ev.size() == 3 + 2 * (size_t) k) tr_rec(s);   // (DS4_RUN_TRACE: chunk k's end)
+            if (eg_late && eg_src == di) eg_next.get();   // (DS4_EG_LATE: the reader done - every table was waited for)
             // (chunk k's copies out of its Engram slot issued, their event recorded: the reader may refill it)
             if (!egs.empty()) c.eg_copied_seq[slot].store(wp.win, std::memory_order_release);
             if (di == head_dev && (size_t) k < chunk_done.size()) {
