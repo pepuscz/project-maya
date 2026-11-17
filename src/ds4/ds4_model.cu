@@ -6096,7 +6096,8 @@ struct Model::Impl {
     bool stage_needed(const Layer& l, int e) const { return !stream_direct(l, e) || l.nm > 1; }
     // (DS4_FLOW_HELPER, an EXL3 pack in place) expert e of l in the helper's pool: its blob there - the VRAM slots'
     // layout, the bytes its file region repacks to - which the prompt's copy is staged out of instead of the files
-    // (the helper's pool: never rewritten while it holds e - DS4_SETTLE_IDLE_MS's exchanges, only while idle).  nullptr: from the files, as before
+    // (the helper's pool: never rewritten while it holds e - DS4_SETTLE_IDLE_MS's exchanges and DS4_SETTLE_POOL's
+    // moves, only while idle).  nullptr: from the files, as before
     const uint8_t* x3_pool(const Layer& l, int e) const {
         if (!flow_helper || !file_experts || l.lay.fmt == gg::kFmtMXFP4 || l.n_cls > 1 || !helper_owned(l, e) ||
             helper_dead.load(std::memory_order_relaxed))
@@ -12182,12 +12183,15 @@ struct Model::Impl {
                 //  helper's device not touched while it works)
                 static const bool dec_file = env_f("DS4_SETTLE_DECODE_FILE", 0) != 0;
                 if (sw.pool != nullptr && !(sw.dec && dec_file)) {   // (an exchange: `in`'s bytes already in memory, in the helper's pool - into
-                    int cur = 0;             //  pinned memory on a stream of its own, beside the helper's work during
-                    cudaGetDevice(&cur);     //  decode (DS4_SETTLE_DECODE): no page cache, no file read)
-                    from_pool = cudaSetDevice(helper_id) == cudaSuccess &&
-                                (B.hs != nullptr || cudaStreamCreateWithFlags(&B.hs, cudaStreamNonBlocking) == cudaSuccess) &&
-                                cudaMemcpyAsync(B.a, sw.pool, l.blob, cudaMemcpyDeviceToHost, B.hs) == cudaSuccess &&
-                                cudaStreamSynchronize(B.hs) == cudaSuccess;
+                    int cur = 0;             //  pinned memory - no page cache, no file read; a decode move's on a stream
+                    cudaGetDevice(&cur);     //  of its own, beside the helper's work (DS4_SETTLE_DECODE); an idle
+                    from_pool = cudaSetDevice(helper_id) == cudaSuccess;   // exchange's as release v5 copies it
+                    if (from_pool && sw.dec)
+                        from_pool = (B.hs != nullptr || cudaStreamCreateWithFlags(&B.hs, cudaStreamNonBlocking) == cudaSuccess) &&
+                                    cudaMemcpyAsync(B.a, sw.pool, l.blob, cudaMemcpyDeviceToHost, B.hs) == cudaSuccess &&
+                                    cudaStreamSynchronize(B.hs) == cudaSuccess;
+                    else if (from_pool)
+                        from_pool = cudaMemcpy(B.a, sw.pool, l.blob, cudaMemcpyDeviceToHost) == cudaSuccess;
                     if (!from_pool) (void) cudaGetLastError();
                     cudaSetDevice(cur);
                 }
@@ -13145,6 +13149,112 @@ struct Model::Impl {
     int64_t xch_done = 0, xch_lost = 0, xch_said = 0;
     int xch_inflight = 0;
     double xch_t0 = 0;
+    // DS4_SETTLE_POOL=1 (opt-in, with DS4_SETTLE_IDLE_MS; unset / 0: off): the idle settle's third leg.  Where VRAM and
+    // the helper's pool together do not hold every expert of a layer (a pool smaller than what VRAM leaves over: a
+    // larger quant, less RAM) the rest are read from the files by the CPU lane, at about 1.2 ms a pick, and which of
+    // them the pool holds is the profile's choice at load - only VRAM followed the work.  While idle, each layer's
+    // hottest expert on the files takes the pool place of its coldest pool expert, by the same heat and rule as the
+    // exchanges (DS4_CACHE_MARGIN / _BONUS), and that one goes back to its file (its CPU-lane parts are its file's
+    // pages already, as for every expert outside VRAM).  A move (pool_move) is synchronous on the engine thread: the
+    // expert's region read from its file (resident, mostly: the CPU lane just read it), repacked as the load filled the
+    // pool, written over the pool expert's blob once the helper's table lost that one, then the table gains the new
+    // one.  Nothing reads either table or that region meanwhile: no request runs (settle_idle_end), the helper is
+    // synchronized, and a layer with an exchange under way is left for a later step (its pool place is the copy's
+    // source).  Moves in a step stop once DS4_SETTLE_POOL_MS (8) have passed, so a request waits about that and one
+    // move at most.  Not bit for bit: an expert's sums on the helper and on the CPU lane differ in the last bits
+    static bool settle_pool_on() {
+        static const bool v = [] {
+            const char* e = ds4_env("DS4_SETTLE_POOL");
+            return e != nullptr && std::atoi(e) != 0;
+        }();
+        return v;
+    }
+    static double settle_pool_ms() {
+        static const double v = [] {
+            const char* e = ds4_env("DS4_SETTLE_POOL_MS");
+            return e != nullptr ? std::max(0.5, std::atof(e)) : 8.0;
+        }();
+        return v;
+    }
+    std::vector<uint8_t> pool_reg;
+    int64_t pool_done = 0, pool_lost = 0, pool_said = 0;
+    // (the third leg, the engine thread, idle) `in` from its file into the pool place of `out`, which goes back to its
+    // file.  false: a CUDA step failed - helper_dead (the table and the pool may disagree: the CPU lane takes every
+    // pool pick from now on); a file read that failed changes nothing (true, counted in pool_lost)
+    bool pool_move(Layer& l, int in, int out) {
+        uint8_t* const region = l.helper[(size_t) out];
+        if (region == nullptr || !xch_room(l)) return true;
+        pool_reg.resize(l.region_bytes[(size_t) in]);
+        const bool filed = in < (int) l.esplit.size() && l.esplit[(size_t) in]
+                               ? read_split(l, in, pool_reg.data())
+                               : pk.read_at(l.region_file[(size_t) in], l.region_off[(size_t) in],
+                                            l.region_bytes[(size_t) in], pool_reg.data());
+        if (!filed) {
+            ++pool_lost;
+            return true;
+        }
+        repack(l, in, pool_reg.data(), xch_pin);
+        int cur = 0;
+        cudaGetDevice(&cur);
+        const unsigned long long zero = 0ull, at = (unsigned long long) region;
+        bool ok = cudaSetDevice(helper_id) == cudaSuccess && cudaDeviceSynchronize() == cudaSuccess &&
+                  cudaMemcpy(l.helper_tab + out, &zero, 8, cudaMemcpyHostToDevice) == cudaSuccess;
+        l.helper[(size_t) out] = nullptr;   // (from here the helper never takes `out`: the CPU lane reads its file)
+        ok = ok && cudaMemcpy(region, xch_pin, l.blob, cudaMemcpyHostToDevice) == cudaSuccess;
+        if (ok && check_swaps) {   // (DS4_CHECK_SWAPS: the pool's new blob read back - into pinned memory - as written)
+            ok = cudaMemcpy(xch_half, region, l.blob, cudaMemcpyDeviceToHost) == cudaSuccess &&
+                 pieces_equal(l, xch_half, xch_pin);
+            std::fprintf(stderr, "ds4 settle: layer %d expert %d from its file into the helper's pool, %d back to its "
+                                 "file: %s\n",
+                         l.il, in, out, ok ? "the pool's copy matches the model file" : "the pool's copy DIFFERS");
+        }
+        ok = ok && cudaMemcpy(l.helper_tab + in, &at, 8, cudaMemcpyHostToDevice) == cudaSuccess;
+        cudaSetDevice(cur);
+        if (!ok) {
+            (void) cudaGetLastError();
+            st.helper_dead = 1;
+            if (!helper_dead.exchange(true))
+                std::fprintf(stderr, "ds4: idle settle: moving expert %d from its file into the helper's pool failed - "
+                                     "the CPU lane takes its picks from now on\n", in);
+            return false;
+        }
+        l.helper[(size_t) in] = region;
+        ++pool_done;
+        return true;
+    }
+    // (the third leg) the moves of one step, the largest heat gain first, one a layer, until DS4_SETTLE_POOL_MS: true
+    // while any layer has one to make
+    bool settle_pool_step() {
+        struct Cand {
+            float gain;
+            int layer, in, out;
+        };
+        std::vector<Cand> c;
+        for (const Layer& l : L) {
+            if (!xch_layer(l) || l.swap_pending) continue;
+            int hot = -1, cold = -1;
+            for (int e = 0; e < l.n_exp; ++e) {
+                const float h = l.heat[(size_t) e];
+                if (l.helper[(size_t) e] != nullptr) {
+                    if (cold < 0 || h < l.heat[(size_t) cold]) cold = e;
+                } else if (l.slot[(size_t) e] < 0 && !held_out(l, e) && (hot < 0 || h > l.heat[(size_t) hot])) {
+                    hot = e;
+                }
+            }
+            if (hot >= 0 && cold >= 0 && l.heat[(size_t) hot] > l.heat[(size_t) cold] * c_margin + c_bonus)
+                c.push_back({l.heat[(size_t) hot] - l.heat[(size_t) cold], l.il, hot, cold});
+        }
+        std::sort(c.begin(), c.end(), [](const Cand& a, const Cand& b) { return a.gain > b.gain; });
+        const double t0 = now_ms();
+        int made = 0;   // (none made - every read failed: no more this quiet spell, rather than trying again and again)
+        for (const Cand& x : c) {
+            if (now_ms() - t0 >= settle_pool_ms() || helper_dead.load(std::memory_order_relaxed)) break;
+            const int64_t d0 = pool_done;
+            if (!pool_move(L[(size_t) x.layer], x.in, x.out)) break;
+            made += pool_done != d0;
+        }
+        return made > 0;
+    }
     // the three pieces of each matrix of two blobs equal (what the swap checks compare; the rest is padding)
     static bool pieces_equal(const Layer& l, const uint8_t* a, const uint8_t* b) {
         for (int r = 0; r < 3; ++r)
@@ -13609,11 +13719,24 @@ struct Model::Impl {
                     fhot = e;
                 }
             }
+            // (the pool's leg leaves the VRAM rule its expert: one hot enough for the cache's own file -> VRAM move
+            //  (cache_queue: hotter than the coldest slot by DS4_CACHE_MARGIN / _BONUS) goes there, not to the pool -
+            //  the leg takes the hottest the VRAM rule does not want)
+            const float vthr = l.spare_vram >= 0 && cold >= 0 ? l.heat[(size_t) cold] * c_margin + c_bonus
+                                                               : 1e30f;
+            if (ssd && fhot >= 0 && l.heat[(size_t) fhot] > vthr) {
+                fhot = -1;
+                for (int e = 0; e < l.n_exp; ++e)
+                    if (l.slot[(size_t) e] < 0 && l.helper[(size_t) e] == nullptr && !mk[(size_t) e] &&
+                        l.heat[(size_t) e] <= vthr && (fhot < 0 || l.heat[(size_t) e] > l.heat[(size_t) fhot]))
+                        fhot = e;
+            }
             if (ssd && ssd_hits_on()) {   // (only what the CPU lane read)
                 fhot = -1;
                 for (int e : dec_hits[(size_t) l.il])
                     if (e >= 0 && e < l.n_exp && l.slot[(size_t) e] < 0 && l.helper[(size_t) e] == nullptr &&
-                        !mk[(size_t) e] && (fhot < 0 || l.heat[(size_t) e] > l.heat[(size_t) fhot]))
+                        !mk[(size_t) e] && l.heat[(size_t) e] <= vthr &&
+                        (fhot < 0 || l.heat[(size_t) e] > l.heat[(size_t) fhot]))
                         fhot = e;
                 dec_hits[(size_t) l.il].clear();
             }
@@ -13782,27 +13905,41 @@ struct Model::Impl {
                 more = true;
             }
             if (!c.empty()) sw_cv.notify_all();
+            if (settle_pool_on() && settle_pool_step()) more = true;   // (DS4_SETTLE_POOL: the files' leg)
         }
         if (!more && xch_t0 > 0) {   // (a quiet spell's work done: one line)
             if (xch_done != xch_said)
                 std::fprintf(stderr, "ds4: idle settle: %lld experts moved from the helper's pool into VRAM in %.0f ms "
                                      "(%lld in all, DS4_SETTLE_IDLE_MS)\n",
                              (long long) (xch_done - xch_said), now_ms() - xch_t0, (long long) xch_done);
+            pool_said_line();
             xch_said = xch_done;
             xch_t0 = 0;
         }
         return more;
     }
+    void pool_said_line() {   // (DS4_SETTLE_POOL: the spell's moves from the files, one line)
+        if (pool_done == pool_said) return;
+        std::fprintf(stderr, "ds4: idle settle: %lld experts moved from the files into the helper's pool in %.0f ms "
+                             "(%lld in all, %lld reads failed, DS4_SETTLE_POOL)\n",
+                     (long long) (pool_done - pool_said), now_ms() - xch_t0, (long long) pool_done,
+                     (long long) pool_lost);
+        pool_said = pool_done;
+    }
 
     // before a request: the exchanges under way waited for and switched in while still idle (a few ms at most)
     void settle_idle_end() {
-        if (xch_inflight <= 0) return;
+        if (xch_inflight <= 0) {
+            pool_said_line();   // (the files' leg has nothing under way: its moves are synchronous)
+            return;
+        }
         cache_drain();
         xch_inflight = 0;   // (every swap reaches the switch: none is under way now)
         if (xch_t0 > 0 && xch_done != xch_said)
             std::fprintf(stderr, "ds4: idle settle: %lld experts moved from the helper's pool into VRAM in %.0f ms (%lld "
                                  "in all, DS4_SETTLE_IDLE_MS)\n",
                          (long long) (xch_done - xch_said), now_ms() - xch_t0, (long long) xch_done);
+        pool_said_line();
         xch_said = xch_done;
         xch_t0 = 0;
     }
