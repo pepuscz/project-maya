@@ -39,6 +39,11 @@ struct Key {
 struct Pick {
     bool ok = false;
     hipblasLtMatmulAlgo_t algo{};
+    // the bucket's row counts this algo was checked at (index t - the bucket's lowest t; 1: it takes them, 2: refused
+    // - hipBLAS for that t). hipblasLtMatmul launches the solution it is given on any problem: it checks the workspace,
+    // not the solution's own size conditions, which only the heuristic and matmulIsAlgoSupported evaluate. A pick is
+    // chosen at the first t of its bucket, so every other t of the bucket is checked once before the algo runs on it.
+    std::vector<unsigned char> fit;
 };
 struct Dev {
     std::mutex mu;                 // this device's handle, workspace and picks
@@ -215,6 +220,22 @@ bool gemm(void* stream, const uint16_t* W, int n, int k, const uint16_t* x, int 
         it = d.picks.emplace(key, pick).first;
     }
     if (!it->second.ok) return false;
+    {
+        Pick& pk = it->second;
+        const int lo = key.tb == kMinRows ? kMinRows : key.tb / 2 + 1;   // (bucket(t) == key.tb for t in [lo, key.tb])
+        if (pk.fit.empty()) pk.fit.assign((size_t) (key.tb - lo + 1), 0);
+        unsigned char& f = pk.fit[(size_t) (t - lo)];
+        if (f == 0) {
+            size_t need = 0;
+            f = hipblaslt_ext::matmulIsAlgoSupported(d.h, desc.op, &alpha, desc.a, desc.b, &beta, desc.c, desc.c, pk.algo,
+                                                     need) == HIPBLAS_STATUS_SUCCESS && need <= kWorkspace ? 1 : 2;
+            if (f == 2 && std::getenv("DS4_LT_VERBOSE") != nullptr)
+                std::fprintf(stderr, "ds4 gemm: hipBLASLt n %d k %d ldx %d ldy %d rows <= %d: the pick (solution %d) "
+                                     "does not take %d rows - hipBLAS for them\n",
+                             n, k, ldx, ldy, key.tb, hipblaslt_ext::getIndexFromAlgo(pk.algo), t);
+        }
+        if (f == 2) return false;
+    }
     if (hipblasLtMatmul(d.h, desc.op, &alpha, W, desc.a, x, desc.b, &beta, y, desc.c, y, desc.c, &it->second.algo, d.ws,
                         kWorkspace, s) == HIPBLAS_STATUS_SUCCESS)
         return true;
