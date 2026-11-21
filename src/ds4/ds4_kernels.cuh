@@ -425,6 +425,9 @@ struct RoutePair {
 bool route_pair(const RoutePair& a, cudaStream_t s);
 /// Waits (one thread, on the device) until *seq_ptr == seq.
 void wait_seq(const unsigned* seq_ptr, unsigned seq, cudaStream_t s);
+/// DS4_MOE_LATE_PART: out[t] += part[t] (part rows `stride` floats apart) for every t < T with flag[t] != 0 - the host's
+/// answer added after a group's all-reduce, the same F32 add on every member
+void add_part_rows(float* out, int T, int dim, const float* part, size_t stride, const int* flag, cudaStream_t s);
 /// The helper GPU's share of request seq (DS4_HELPER): waits on the device until req holds it - or a later one, or
 /// *quit: nothing taken - then its T tokens' picks the helper holds (tab[expert] its blob, 0: not held; n experts) into
 /// plan[t][i] (rows kPicks apart, every other entry 0) with their weights w[t][i], the tokens' x (dim floats each, rows

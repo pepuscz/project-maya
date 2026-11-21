@@ -4614,6 +4614,9 @@ struct Model::Impl {
                                                        " in one launch, the other member's rows read 16 bytes a lane; "
                                                        "the sums bit for bit");
         }
+        if (moe_late_part())
+            std::fprintf(stderr, "ds4: DS4_MOE_LATE_PART: a tensor-parallel group's decode MoE partials summed before the "
+                                 "host's answer, which every member then adds (F32)\n");
         if (ar2() > 0) {
             std::string on;
             for (const Group& G : groups)
@@ -18781,6 +18784,19 @@ struct Model::Impl {
         }();
         return v;
     }
+    // DS4_MOE_LATE_PART=1 (unset / 0: as before): a tensor-parallel group's decode MoE sums its members' partials
+    // (VRAM experts + the shared expert's band) before the host's answer is in, then every member waits for that answer
+    // and adds it (out += part, F32) - where the lead used to wait first, add the answer to its own partial and only then
+    // join the all-reduce, the other member spinning there meanwhile.  The answer's read and the members' exchange stop
+    // following each other, and the answer is no longer rounded with the lead's partial (DS4_AR2_DECODE=2).  Not with
+    // the per-pick lane answers (lane_picks) or MAYA_MIXED_HELPER's lead (their own answer paths)
+    static bool moe_late_part() {
+        static const bool on = [] {
+            const char* e = ds4_env("DS4_MOE_LATE_PART");
+            return e != nullptr && std::atoi(e) != 0;
+        }();
+        return on;
+    }
     static int ar2_decode() {   // (DS4_AR2_DECODE 0 / 1 / 2: see the groups' setup; another value -1, the load refuses)
         static const int v = [] {
             const char* e = ds4_env("DS4_AR2_DECODE");
@@ -23356,6 +23372,8 @@ struct Model::Impl {
             // (a tensor-parallel group: every member sums its own FF band, so every member adds its own part of the
             //  lane's picks and every member waits for the answer - the lane writes a part a member)
             const bool lane_m = lane_par && nm > 1 && lane_picks != nullptr;
+            // (DS4_MOE_LATE_PART: the host's answer added after the all-reduce - a layer with a mailbox, a group)
+            const bool late = moe_late_part() && nm > 1 && sq != 0 && lane_picks == nullptr && !rh_lead;
             // (DS4_RHELPER_LATE: a single token's layer the helper answers goes the window's way too - its combine
             //  waits for the helper's sums after this GPU's own experts, not before them; the same sums, WinArgs'
             //  contract)
@@ -23369,8 +23387,8 @@ struct Model::Impl {
                 x3::MoeArgs ma;
                 ma.plan_ptr = d.plan_ptr;
                 ma.plan_w = d.rw;
-                ma.cpu_part = lead && !zc_nowait ? resps[slot].part[0] : nullptr;
-                ma.cpu_flag = lead && !zc_nowait ? &resps[slot].cpu[0] : nullptr;
+                ma.cpu_part = lead && !zc_nowait && !late ? resps[slot].part[0] : nullptr;
+                ma.cpu_flag = lead && !zc_nowait && !late ? &resps[slot].cpu[0] : nullptr;
                 if ((lead || lane_m) && !zc_nowait && lane_picks != nullptr) {
                     ma.cpu_picks = lane_pick_member(slot, mi);
                     ma.cpu_pick_stride = (size_t) D;
@@ -23398,7 +23416,7 @@ struct Model::Impl {
                     gg::moe_gate_up(m2, d.x, d.xg, s);
                 }
                 const bool rhd = rh_lead && lead && rh_direct_on(l);
-                if ((lead || lane_m) && !zc_nowait && !rhd) wait_seq(&resps[slot].seq, sq, s);
+                if ((lead || lane_m) && !zc_nowait && !rhd && !late) wait_seq(&resps[slot].seq, sq, s);
                 if (rh_lead && lead) {   // (MAYA_MIXED_HELPER's lead: the answer in by DMA, read from this GPU)
                     if (!(rhd ? rh_help_in(slot, sq, T, s, err) : rh_resp_in(slot, T, s, err))) return false;
                     ma.cpu_part = rh_dresp->part[0];
@@ -23432,15 +23450,15 @@ struct Model::Impl {
                 wa.n_groups = d.n_groups;
                 wa.plan_ptr = d.plan_ptr;
                 wa.plan_w = d.rw;
-                wa.cpu_part = lead ? &resps[slot].part[0][0] : nullptr;
+                wa.cpu_part = lead && !late ? &resps[slot].part[0][0] : nullptr;
                 wa.cpu_stride = kMaxDim;
-                wa.cpu_flag = lead ? resps[slot].cpu : nullptr;
+                wa.cpu_flag = lead && !late ? resps[slot].cpu : nullptr;
                 if ((lead || lane_m) && lane_picks != nullptr) {
                     wa.cpu_picks = lane_pick_member(slot, mi);
                     wa.cpu_pick_stride = (size_t) D;
                     wa.cpu_pmask = resps[slot].pmask;
                 }
-                wa.wait_ptr = lead || lane_m ? &resps[slot].seq : nullptr;
+                wa.wait_ptr = (lead && !late) || lane_m ? &resps[slot].seq : nullptr;
                 wa.wait_val = sq;
                 if (rh_lead && lead) {   // (MAYA_MIXED_HELPER's lead: the answer waited for, in by DMA, read here)
                     const bool rhd = rh_direct_on(l);
@@ -23480,6 +23498,10 @@ struct Model::Impl {
             if (mi == 0) st.experts += (int64_t) T * l.k_exp;
             if (mi == 0 && l.mtp) st.draft_experts += (int64_t) T * l.k_exp;
             if (nm > 1) allreduce(d.moe_out, T * D, ag, mi, ++d.ar_seq, d.xcnt, s);
+            if (late) {   // (DS4_MOE_LATE_PART: every member, the answer's rows onto the group's sums)
+                wait_seq(&resps[slot].seq, sq, s);
+                add_part_rows(d.moe_out, T, D, resps[slot].part[0], kMaxDim, resps[slot].cpu, s);
+            }
             if (hs) CK(cudaStreamWaitEvent(s, d.hc_done, 0));
             ablate(d, d.moe_out, T, wp, s);
             hc_post(d.moe_out, d.h, d.f_post, d.f_comb, D, H, T, d.h2, s);

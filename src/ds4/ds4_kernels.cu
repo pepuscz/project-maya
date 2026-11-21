@@ -3925,6 +3925,19 @@ bool route_pair(const RoutePair& a, cudaStream_t s) {
     return cudaGetLastError() == cudaSuccess;
 }
 void wait_seq(const unsigned* seq_ptr, unsigned seq, cudaStream_t s) { pdl_launch(wait_seq_kernel, 1, 32, 0, s, seq_ptr, seq); }
+// DS4_MOE_LATE_PART: a row's host answer (the CPU lane's / helper's weighted sum) added after the group's all-reduce,
+// where the combine added it to the lead's partial before it - out[t] += part[t] for every row the answer flags, one
+// F32 add, so every member that runs it on the same sums keeps the same bits
+__global__ void add_part_rows_kernel(float* out, int dim, const float* part, size_t stride, const int* flag) {
+    pdl_wait();
+    pdl_trigger();
+    const int t = blockIdx.y, r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= dim || ((volatile const int*) flag)[t] == 0) return;
+    out[(size_t) t * dim + r] = __fadd_rn(out[(size_t) t * dim + r], ((volatile const float*) part)[(size_t) t * stride + r]);
+}
+void add_part_rows(float* out, int T, int dim, const float* part, size_t stride, const int* flag, cudaStream_t s) {
+    if (T > 0) pdl_launch(add_part_rows_kernel, dim3(cdiv(dim, kThreads), T), kThreads, 0, s, out, dim, part, stride, flag);
+}
 void helper_take(const Req* req, unsigned seq, int k, int dim, const unsigned long long* tab, int n,
                  unsigned long long* plan, float* w, float* x, unsigned* ack, const unsigned* quit, cudaStream_t s) {
     helper_take_kernel<<<1, 256, 0, s>>>(req, seq, k, dim, tab, n, plan, w, x, ack, quit);
