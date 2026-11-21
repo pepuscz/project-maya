@@ -3928,15 +3928,27 @@ void wait_seq(const unsigned* seq_ptr, unsigned seq, cudaStream_t s) { pdl_launc
 // DS4_MOE_LATE_PART: a row's host answer (the CPU lane's / helper's weighted sum) added after the group's all-reduce,
 // where the combine added it to the lead's partial before it - out[t] += part[t] for every row the answer flags, one
 // F32 add, so every member that runs it on the same sums keeps the same bits
-__global__ void add_part_rows_kernel(float* out, int dim, const float* part, size_t stride, const int* flag) {
+// (the answer is read as the combine kernels read it after their wait: plain loads - wait_seq_kernel's system fence
+//  came first - 16 bytes a lane, the row's flag once a block: the reads cross the link, so their count is what costs)
+__global__ void add_part_rows_kernel(float* out, int n4, const float* part, size_t stride, const int* flag) {
     pdl_wait();
     pdl_trigger();
-    const int t = blockIdx.y, r = blockIdx.x * blockDim.x + threadIdx.x;
-    if (r >= dim || ((volatile const int*) flag)[t] == 0) return;
-    out[(size_t) t * dim + r] = __fadd_rn(out[(size_t) t * dim + r], ((volatile const float*) part)[(size_t) t * stride + r]);
+    const int t = blockIdx.y;
+    __shared__ int on;
+    if (threadIdx.x == 0) on = flag[t];
+    __syncthreads();
+    if (on == 0) return;
+    float4* o = reinterpret_cast<float4*>(out) + (size_t) t * n4;
+    const float4* p = reinterpret_cast<const float4*>(part + (size_t) t * stride);
+    for (int q = blockIdx.x * blockDim.x + threadIdx.x; q < n4; q += gridDim.x * blockDim.x) {
+        const float4 a = o[q], b = p[q];
+        o[q] = make_float4(__fadd_rn(a.x, b.x), __fadd_rn(a.y, b.y), __fadd_rn(a.z, b.z), __fadd_rn(a.w, b.w));
+    }
 }
 void add_part_rows(float* out, int T, int dim, const float* part, size_t stride, const int* flag, cudaStream_t s) {
-    if (T > 0) pdl_launch(add_part_rows_kernel, dim3(cdiv(dim, kThreads), T), kThreads, 0, s, out, dim, part, stride, flag);
+    // (dim and stride multiples of 4, out and part 16-byte aligned: a decode row's [D] floats, Resp's part rows)
+    if (T > 0) pdl_launch(add_part_rows_kernel, dim3(std::max(1, cdiv(dim / 4, kThreads)), T), kThreads, 0, s, out, dim / 4,
+                          part, stride, flag);
 }
 void helper_take(const Req* req, unsigned seq, int k, int dim, const unsigned long long* tab, int n,
                  unsigned long long* plan, float* w, float* x, unsigned* ack, const unsigned* quit, cudaStream_t s) {
